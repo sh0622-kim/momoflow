@@ -36,7 +36,7 @@ Codex is the coding agent, and OpenAI Symphony is the initial execution engine.
 
 The bootstrap runs upstream Symphony directly and uses its built-in web dashboard. Scheduling,
 workspace isolation, retries, and Codex app-server sessions belong to Symphony.
-The only upstream patch adds expiring token-file authentication. GitHub App key custody and
+Small upstream patches add expiring token-file authentication and optional sequential role sessions. GitHub App key custody and
 token renewal belong to the isolated github-auth service; see README.md before changing auth.
 Use GitHub Issues → PR → CI/review → merge → evidence-backed next issue. Start with one goal,
 one execution, and one PR. Waiting is not executable work; merge is not deployment.

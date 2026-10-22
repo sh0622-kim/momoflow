@@ -11,6 +11,9 @@ docker run --detach --name "$container_name" --network none \
   --cap-drop ALL --security-opt no-new-privileges \
   --security-opt "seccomp=$repository_root/security/codex-seccomp.json" \
   --mount "type=bind,src=$repository_root/scripts/smoke-sandbox.mjs,dst=/checks/smoke-sandbox.mjs,readonly" \
+  --mount "type=bind,src=$repository_root/scripts,dst=/checks/scripts,readonly" \
+  --mount "type=bind,src=$repository_root/engine,dst=/checks/engine,readonly" \
+  --mount "type=bind,src=$repository_root/patches,dst=/checks/patches,readonly" \
   --mount "type=bind,src=$repository_root/WORKFLOW.md,dst=/config/WORKFLOW.md,readonly" \
   --env GITHUB_REPO=smoke/fixture --env GITHUB_TOKEN=smoke-not-a-credential \
   "${MOMOFLOW_IMAGE:-momoflow-symphony}" >/dev/null
@@ -35,3 +38,5 @@ docker exec "$container_name" node --input-type=module -e '
 ' || { docker logs --tail 60 "$container_name"; exit 1; }
 docker exec "$container_name" codex --version
 docker exec "$container_name" node /checks/smoke-sandbox.mjs
+
+docker exec "$container_name" sh /checks/scripts/test-role-flow.sh

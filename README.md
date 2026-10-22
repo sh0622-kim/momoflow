@@ -162,8 +162,8 @@ docker compose down
 ## 기반 버전과 개발 원칙
 
 - Symphony: `be10a1b79df723d6d7612b5651c8522704dafb2e`에 고정.
-  `patches/github-token-file.patch` 하나만 적용한다. 고정 토큰만 지원하는 upstream의 관찰된 한계를
-  보완해 요청마다 유효기간이 있는 토큰 파일을 읽는다. 스케줄러·실행 엔진은 변경하지 않는다.
+  `patches/github-token-file.patch`와 `patches/role-flow.patch`를 적용한다. 고정 토큰만 지원하는 upstream의 관찰된 한계를
+  보완해 요청마다 유효기간이 있는 토큰 파일을 읽는다. 역할 패치는 기존 세션 API를 사용하며 스케줄러·워크스페이스 소유권은 Symphony에 유지한다.
 - Codex CLI: `0.163.0`에 고정.
 - upstream 소스의 LICENSE와 NOTICE는 이미지의 `/opt/symphony/`에 유지된다.
 - [에이전트 개발 규칙](AGENTS.md) · [문서 지도](docs/README.md) · [GitHub 개선 흐름](docs/github-flow.md)
@@ -177,3 +177,36 @@ docker compose down
 참고: [Symphony](https://github.com/openai/symphony),
 [실행 명세](https://github.com/openai/symphony/blob/main/SPEC.md),
 [Elixir 참조 구현](https://github.com/openai/symphony/blob/main/elixir/README.md).
+
+### 역할별 순차 실행 후보 검사
+
+compose는 새 이미지에 `MOMOFLOW_ROLE_FLOW=1`을 전달한다. 적용 경계와 수동 복구 한계는
+[에이전트 정책](docs/agent-policy.md#순차-실행-mvp의-동작과-한계)에 있다. 실행 중인 엔진을
+자기 세션에서 교체하지 않는다. 다음 명령은 모델 추론이나 GitHub 변경을 하지 않는다.
+
+```sh
+SYMPHONY_ROOT=/opt/symphony sh scripts/test-role-flow.sh
+node scripts/check-codex-settings.mjs
+```
+
+첫 명령은 설치된 고정 upstream HEAD의 파일 두 개를 임시 디렉터리에 추출하고 패치를 검사한 뒤
+Elixir 계약 검사를 실행한다. 단계 executor와 Codex RPC 서버는 모의이며 실제 Git HEAD/diff
+검사를 포함한다. 설치된 prod beam 의존성이 필요하다. 엔진 소스·프로세스는 바꾸지 않는다.
+두 번째 명령은 임시 CODEX_HOME의 실제 Codex에 Sol 기본 설정으로 접속해 Astra → Sol →
+별도 Astra → Sol의 thread/start 유효 설정과 서로 다른 ID를 조회한다. turn/start는 보내지
+않으므로 모델 접근권·추론 성공·역할 코드 실행의 증거가 아니다. 설정 조회와 실제 호출은
+[공식 App Server 계약](https://learn.chatgpt.com/docs/app-server)에 따라 구분한다.
+
+Docker가 가능한 운영 호스트에서는 정확한 후보 SHA를 별도 checkout한 후 다음을 실행한다.
+운영 인증·볼륨을 복사하거나 서비스를 재시작하지 않는다.
+
+```sh
+docker compose -p gh-2-role-check config --quiet
+docker compose -p gh-2-role-check build symphony
+MOMOFLOW_IMAGE=gh-2-role-check-symphony sh scripts/smoke.sh
+
+```
+
+실제 모델 호출을 포함한 순차 실행은 위 모의/설정 검사와 별도로 검증하고, 역할별 thread·turn ID,
+유효 설정, 후보 HEAD/diff, 각 단계 검사와 게시 PR head를 기록한다. 해당 증거가 없으면
+실제 Astra 기획·독립 검토가 완료됐다고 표시하지 않는다. 검증 실패 시 기본값으로 대체하지 않는다.
