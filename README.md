@@ -147,6 +147,8 @@ docker compose down
 
 - 호스트에는 localhost 포트만 공개한다. 인증 없는 개인용 구성이므로 팀 서비스로 노출하지 않는다.
 - Docker 소켓이나 호스트 저장소를 에이전트에 마운트하지 않는다.
+- Codex의 중첩 샌드박스에는 [최소 seccomp 예외](security/README.md)를 적용한다.
+  비루트·cap-drop ALL·no-new-privileges는 유지하며 실제 명령 실행과 차단 경계를 스모크 검사한다.
 - 작업 공간과 로그는 `workspaces` 볼륨에 저장한다. 종료된 이슈의 작업 공간은 Symphony가 정리할 수 있다.
 - Codex는 `workspace-write`로 실행한다. 샌드박스 밖 권한 요청은 기본 거절된다.
 - 기본 샌드박스의 명령 네트워크 접근은 제한된다. 외부 의존성 설치가 필요하면 그 작업의

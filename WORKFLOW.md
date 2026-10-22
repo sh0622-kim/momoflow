@@ -21,12 +21,18 @@ agent:
   max_turns: 12
   max_retry_backoff_ms: 300000
 codex:
-  command: codex app-server
+  command: >-
+    codex app-server --strict-config
+    -c 'model="gpt-6.1-sol"'
+    -c 'model_reasoning_effort="medium"'
+    -c 'service_tier="default"'
   approval_policy:
-    reject:
-      sandbox_approval: true
-      rules: true
-      mcp_elicitations: true
+    granular:
+      sandbox_approval: false
+      rules: false
+      mcp_elicitations: false
+      request_permissions: false
+      skill_approval: false
   thread_sandbox: workspace-write
   turn_timeout_ms: 1800000
   stall_timeout_ms: 300000

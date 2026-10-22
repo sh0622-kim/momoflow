@@ -54,6 +54,7 @@ Then select the relevant document below; do not preload all docs or reread uncha
 | Runtime settings, dispatch, retries, budgets | [WORKFLOW.md](WORKFLOW.md); GitHub flow's current-versus-planned boundaries |
 | Role assignment, models, reasoning, Fast mode, execution preflight | [Agent policy](docs/agent-policy.md); distinguish agreed policy from enforced settings |
 | Setup, authentication, startup, recovery | [README.md](README.md) relevant section |
+| Docker sandbox failures or seccomp changes | [Sandbox boundaries](security/README.md); real sandbox smoke, not just engine health |
 | Deployment, rollback, deployment automation | [Deployment policy](docs/deployment.md); exact candidate version and validation evidence |
 | Choosing the next improvement or absorbing engine functionality | [Roadmap](docs/roadmap.md); evidence from the completed task |
 | Finding or maintaining documentation | [Documentation map](docs/README.md) |
