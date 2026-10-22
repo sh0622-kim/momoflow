@@ -1,8 +1,8 @@
 # 에이전트 역할과 실행 정책
 
-상태: 사용자와 합의한 정책. 역할별 세션 전환과 설정 강제는 아직 구현하지 않았다.
-현재 WORKFLOW.md는 단일 Codex app-server를 실행하며 모델·추론 강도를 명시하지 않는다.
-Fast OFF도 실행 환경에서 명시적으로 강제·검증된 상태로 간주하지 않는다.
+상태: 역할별 세션 전환은 아직 구현하지 않았다. 부트스트랩 WORKFLOW.md는 단일 Codex
+app-server를 Sol / medium / service_tier default로 명시해 실행한다. 사전 thread/start에서
+같은 유효 설정을 확인했다. 이는 역할별 전환·독립 Astra 검토의 구현 또는 검증을 뜻하지 않는다.
 
 ## 역할별 설정
 
