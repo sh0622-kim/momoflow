@@ -1,0 +1,36 @@
+diff --git a/elixir/lib/symphony_elixir/github/client.ex b/elixir/lib/symphony_elixir/github/client.ex
+--- a/elixir/lib/symphony_elixir/github/client.ex
++++ b/elixir/lib/symphony_elixir/github/client.ex
+@@ -24,5 +24,6 @@
+     [
+       "GITHUB_TOKEN",
++      "GITHUB_TOKEN_FILE",
+       "GH_TOKEN",
+       "GITHUB_ENTERPRISE_TOKEN",
+       "GH_ENTERPRISE_TOKEN" | env_reference_names([provider["token"]])
+@@ -288,4 +289,4 @@
+     repo = resolve_setting(provider["repo"], System.get_env("GITHUB_REPO"))
+-    token = resolve_setting(provider["token"], System.get_env("GITHUB_TOKEN"))
++    token = github_token(provider)
+
+     cond do
+@@ -300,1 +301,19 @@
++  defp github_token(provider) do
++    case System.get_env("GITHUB_TOKEN_FILE") do
++      nil ->
++        resolve_setting(provider["token"], System.get_env("GITHUB_TOKEN"))
++
++      path ->
++        with {:ok, contents} <- File.read(path),
++             {:ok, %{"token" => token, "expires_at" => expires_at}} <- Jason.decode(contents),
++             true <- is_binary(token) and is_binary(expires_at),
++             {:ok, expiry, _offset} <- DateTime.from_iso8601(expires_at),
++             :gt <- DateTime.compare(expiry, DateTime.utc_now()) do
++          normalize_string(token)
++        else
++          _ -> nil
++        end
++    end
++  end
++
+   defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
