@@ -3,7 +3,18 @@ import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, connect } from 'node:net';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
+export function assertMountDenied(mount) {
+  assert.ifError(mount.error);
+  assert.equal(mount.signal, null, 'Mount probe terminated by signal');
+  assert.ok(Number.isInteger(mount.status) && mount.status > 0,
+    'Mount probe must exit normally with a nonzero status');
+  assert.match(mount.stderr, /permission denied|operation not permitted|must be superuser/i,
+    'Mount probe failed without evidence of permission denial');
+}
+
+async function smoke() {
 const workspace = await mkdtemp('/data/workspaces/sandbox-check-');
 const outside = await mkdtemp('/home/momo/sandbox-check-');
 const canary = join(outside, 'canary');
@@ -11,8 +22,8 @@ const server = createServer(socket => { socket.on('error', () => {}); socket.end
 try {
   await writeFile(canary, 'unchanged');
   await mkdir(join(workspace, 'mount-target'));
-  const mount = spawnSync('mount', ['-t', 'tmpfs', 'tmpfs', join(workspace, 'mount-target')], { encoding: 'utf8' });
-  assert.notEqual(mount.status, 0, 'Outer container unexpectedly has mount privileges');
+  const mount = spawnSync('mount', ['-t', 'tmpfs', 'tmpfs', join(workspace, 'mount-target')], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } });
+  assertMountDenied(mount);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   await new Promise((resolve, reject) => {
@@ -49,4 +60,9 @@ try {
   server.close();
   await rm(workspace, { recursive: true, force: true });
   await rm(outside, { recursive: true, force: true });
+}
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await smoke();
 }
