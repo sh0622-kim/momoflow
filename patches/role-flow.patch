@@ -104,3 +104,17 @@ index ae3db62..6e2ac5b 100644
 
        {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
          emit_turn_event(
+--- a/elixir/lib/symphony_elixir/github/client.ex
++++ b/elixir/lib/symphony_elixir/github/client.ex
+@@ -51,6 +51,11 @@
+     with {:ok, github_settings} <- settings(tracker_settings) do
+       request_fun.(method, path, params, body, github_settings)
+     end
++  end
++
++  @doc "Resolve and validate the repository using the same settings as API requests."
++  def resolved_repo(tracker_settings) do
++    with {:ok, github_settings} <- settings(tracker_settings), do: {:ok, github_settings.repo}
+   end
+
+   @doc false

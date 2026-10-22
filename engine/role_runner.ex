@@ -60,11 +60,19 @@ defmodule SymphonyElixir.RoleRunner do
     root = Keyword.get(opts, :state_root, "/data/log/roles")
     File.mkdir_p!(root)
 
+    repo =
+      Keyword.get_lazy(opts, :repo, fn ->
+        {:ok, repo} = Client.resolved_repo(Config.settings!().tracker)
+        repo
+      end)
+
+    opts = Keyword.put(opts, :repo, repo)
+
     key =
       Base.encode16(
         :crypto.hash(
           :sha256,
-          Keyword.get_lazy(opts, :repo, fn -> Config.settings!().tracker.provider["repo"] end) <>
+          repo <>
             ":" <> issue.id
         ),
         case: :lower
@@ -91,7 +99,7 @@ defmodule SymphonyElixir.RoleRunner do
           Map.merge(state, %{"stage" => "blocked", "reason" => Exception.message(error)})
         )
 
-        Keyword.get(opts, :halt, &halt_issue/2).(
+        Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, opts) end).(
           issue,
           "#{Exception.message(error)}; shared iterations=#{inspect(state["iterations"])}/3"
         )
@@ -123,7 +131,7 @@ defmodule SymphonyElixir.RoleRunner do
       if state["issue"] != issue.id, do: halt!("Ledger issue mismatch")
       state
     else
-      used = Keyword.get(opts, :initial_count, fn -> workpad_count!(issue) end).()
+      used = Keyword.get(opts, :initial_count, fn -> workpad_count!(issue, opts) end).()
       if not is_integer(used) or used not in 0..3, do: halt!("Invalid shared iteration count")
 
       state = %{
@@ -140,7 +148,7 @@ defmodule SymphonyElixir.RoleRunner do
   end
 
   defp advance(path, state, workspace, issue, prompt, on_message, opts) do
-    :ok = Keyword.get(opts, :eligible, &eligible_issue/1).(issue)
+    :ok = Keyword.get(opts, :eligible, fn issue -> eligible_issue(issue, opts) end).(issue)
     role = state["stage"]
     count = state["iterations"] + if(role == "build", do: 1, else: 0)
     if count > 3, do: halt!("Shared three-iteration budget exhausted")
@@ -224,7 +232,7 @@ defmodule SymphonyElixir.RoleRunner do
     save(path, state)
 
     if next == "done" do
-      Keyword.get(opts, :halt, &halt_issue/2).(
+      Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, opts) end).(
         issue,
         "Role flow complete; shared iterations=#{count}/3; PR checks/reviews and deployment remain separate. Ledger: #{path}"
       )
@@ -299,10 +307,22 @@ defmodule SymphonyElixir.RoleRunner do
       |> Enum.map(fn p ->
         full = Path.join(workspace, p)
 
-        value =
-          if File.lstat!(full).type == :symlink, do: File.read_link!(full), else: File.read!(full)
+        stat = File.lstat!(full)
 
-        {p, value}
+        {mode, value} =
+          case stat.type do
+            :symlink ->
+              {"120000", File.read_link!(full)}
+
+            :regular ->
+              mode = if Bitwise.band(stat.mode, 0o100) != 0, do: "100755", else: "100644"
+              {mode, File.read!(full)}
+
+            _ ->
+              halt!("Unsupported untracked file type")
+          end
+
+        {p, mode, value}
       end)
 
     %{
@@ -345,15 +365,15 @@ defmodule SymphonyElixir.RoleRunner do
     end
   end
 
-  defp workpad_count!(issue) do
+  defp workpad_count!(issue, opts) do
     {:ok, %{status: 200, body: comments}} =
-      Client.request("GET", issue_path(issue) <> "/comments", %{"per_page" => 100}, nil)
+      request("GET", issue_path(issue, opts) <> "/comments", %{"per_page" => 100}, nil, opts)
 
     count_from_comments!(comments)
   end
 
-  defp eligible_issue(issue) do
-    {:ok, %{status: 200, body: current}} = Client.request("GET", issue_path(issue), %{}, nil)
+  defp eligible_issue(issue, opts) do
+    {:ok, %{status: 200, body: current}} = request("GET", issue_path(issue, opts), %{}, nil, opts)
 
     unless current["state"] == "open" and
              Enum.any?(current["labels"] || [], &(&1["name"] == "momoflow:ready")),
@@ -362,23 +382,36 @@ defmodule SymphonyElixir.RoleRunner do
     :ok
   end
 
-  defp issue_path(issue),
-    do: "/repos/#{Config.settings!().tracker.provider["repo"]}/issues/#{issue.id}"
+  defp repo_path(opts) do
+    repo =
+      opts
+      |> Keyword.fetch!(:repo)
+      |> String.split("/", parts: 2)
+      |> Enum.map_join("/", &URI.encode(&1, fn c -> URI.char_unreserved?(c) end))
 
-  defp halt_issue(issue, reason) do
-    base = issue_path(issue)
+    "/repos/#{repo}"
+  end
+
+  defp issue_path(issue, opts), do: repo_path(opts) <> "/issues/#{issue.id}"
+
+  defp request(method, path, params, body, opts) do
+    Client.request(method, path, params, body, Keyword.take(opts, [:request_fun]))
+  end
+
+  defp halt_issue(issue, reason, opts) do
+    base = issue_path(issue, opts)
 
     # Eligibility removal and read-back precede remote reporting, so reporting failure cannot dispatch more work.
-    case Client.request("DELETE", base <> "/labels/momoflow%3Aready", %{}, nil) do
+    case request("DELETE", base <> "/labels/momoflow%3Aready", %{}, nil, opts) do
       {:ok, %{status: status}} when status in [200, 404] -> :ok
       _ -> halt!("Unable to remove dispatch label; operator intervention required")
     end
 
-    {:ok, %{status: 200, body: labels}} = Client.request("GET", base <> "/labels", %{}, nil)
+    {:ok, %{status: 200, body: labels}} = request("GET", base <> "/labels", %{}, nil, opts)
     if Enum.any?(labels, &(&1["name"] == "momoflow:ready")), do: halt!("Dispatch label remains")
 
     {:ok, %{status: 200, body: comments}} =
-      Client.request("GET", base <> "/comments", %{"per_page" => 100}, nil)
+      request("GET", base <> "/comments", %{"per_page" => 100}, nil, opts)
 
     pads = Enum.filter(comments, &String.contains?(&1["body"] || "", "<!-- momoflow:workpad -->"))
 
@@ -388,17 +421,23 @@ defmodule SymphonyElixir.RoleRunner do
     case pads do
       [pad] when length(comments) < 100 ->
         path =
-          "/repos/#{Config.settings!().tracker.provider["repo"]}/issues/comments/#{pad["id"]}"
+          repo_path(opts) <> "/issues/comments/#{pad["id"]}"
 
         {:ok, %{status: 200}} =
-          Client.request("PATCH", path, %{}, %{"body" => pad["body"] <> note})
+          request("PATCH", path, %{}, %{"body" => pad["body"] <> note}, opts)
 
       [] when length(comments) < 100 ->
         {:ok, %{status: 201}} =
-          Client.request("POST", base <> "/comments", %{}, %{
-            "body" =>
-              "<!-- momoflow:workpad -->\n## 현재 상태\n개입 필요; 누적 반복은 보존 ledger에서 확인.\n" <> note
-          })
+          request(
+            "POST",
+            base <> "/comments",
+            %{},
+            %{
+              "body" =>
+                "<!-- momoflow:workpad -->\n## 현재 상태\n개입 필요; 누적 반복은 보존 ledger에서 확인.\n" <> note
+            },
+            opts
+          )
 
       _ ->
         halt!("Cannot identify single workpad for stop evidence; label already removed")

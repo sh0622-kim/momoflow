@@ -202,6 +202,152 @@ defmodule RoleFlowTest do
     assert ledger(c)["events"] == []
   end
 
+  test "snapshot detects untracked executable mode changes", c do
+    file = Path.join(c.workspace, "new-script")
+    File.write!(file, "target")
+    File.chmod!(file, 0o644)
+    before = R.snapshot!(c.workspace)
+    File.chmod!(file, 0o755)
+    refute before == R.snapshot!(c.workspace)
+    File.chmod!(file, 0o644)
+    assert before == R.snapshot!(c.workspace)
+  end
+
+  test "snapshot detects same-content regular file becoming a symlink", c do
+    file = Path.join(c.workspace, "new-link")
+    File.write!(file, "target")
+    before = R.snapshot!(c.workspace)
+    File.rm!(file)
+    File.ln_s!("target", file)
+    refute before == R.snapshot!(c.workspace)
+  end
+
+  defp github_workflow(c, repo) do
+    old_env = Map.new(~w(GITHUB_REPO GITHUB_TOKEN_FILE), &{&1, System.get_env(&1)})
+    System.put_env("GITHUB_REPO", "fixture/repo")
+    System.delete_env("GITHUB_TOKEN_FILE")
+
+    config = %{
+      "tracker" => %{
+        "kind" => "github",
+        "active_states" => ["open"],
+        "terminal_states" => ["closed"],
+        "provider" => %{"repo" => repo, "token" => "fixture-not-a-credential"}
+      }
+    }
+
+    path = Path.join(c.root, "WORKFLOW.md")
+    File.write!(path, "---\n#{Jason.encode!(config)}\n---\nfixture")
+    SymphonyElixir.Workflow.set_workflow_file_path(path)
+
+    on_exit(fn ->
+      SymphonyElixir.Workflow.clear_workflow_file_path()
+
+      Enum.each(old_env, fn {key, value} ->
+        if value, do: System.put_env(key, value), else: System.delete_env(key)
+      end)
+    end)
+  end
+
+  for repo <- ["fixture/repo", "$GITHUB_REPO", nil, " fixture/repo "] do
+    for outcome <- [:complete, :ineligible, :failure, :no_workpad] do
+      @tag repo: repo, outcome: outcome
+      test "default GitHub paths #{inspect(repo)} / #{outcome}", c do
+        github_workflow(c, c.repo)
+        pad = %{"id" => 42, "body" => "<!-- momoflow:workpad -->\n| 누적 반복 | 0/3 |"}
+        comments = if c.outcome == :no_workpad, do: [], else: [pad]
+
+        transport = fn method, path, params, body, settings ->
+          assert settings.repo == "fixture/repo"
+          send(self(), {:request, method, path, params, body})
+
+          case {method, path} do
+            {"GET", "/repos/fixture/repo/issues/1/comments"} ->
+              assert params == %{"per_page" => 100}
+              {:ok, %{status: 200, body: comments}}
+
+            {"GET", "/repos/fixture/repo/issues/1"} ->
+              labels = if c.outcome == :ineligible, do: [], else: [%{"name" => "momoflow:ready"}]
+              {:ok, %{status: 200, body: %{"state" => "open", "labels" => labels}}}
+
+            {"DELETE", "/repos/fixture/repo/issues/1/labels/momoflow%3Aready"} ->
+              {:ok, %{status: 200, body: []}}
+
+            {"GET", "/repos/fixture/repo/issues/1/labels"} ->
+              {:ok, %{status: 200, body: []}}
+
+            {"PATCH", "/repos/fixture/repo/issues/comments/42"} ->
+              assert body["body"] =~ pad["body"]
+              assert body["body"] =~ "Ready removal verified"
+              {:ok, %{status: 200, body: %{}}}
+
+            {"POST", "/repos/fixture/repo/issues/1/comments"} ->
+              assert body["body"] =~ "<!-- momoflow:workpad -->"
+              {:ok, %{status: 201, body: %{}}}
+
+            other ->
+              flunk("Unexpected request: #{inspect(other)}")
+          end
+        end
+
+        exec =
+          if c.outcome in [:ineligible, :failure] do
+            fn _, _, _, _, _ -> raise "fixture stage failure" end
+          else
+            executor(fn _, _ -> "complete" end)
+          end
+
+        # Keep all default workpad, eligibility, halt and comment-update functions.
+        opts =
+          c.opts
+          |> Keyword.drop([:repo, :initial_count, :eligible, :halt])
+          |> Keyword.merge(request_fun: transport, run_stage: exec)
+
+        assert :ok == R.run(c.workspace, %{id: "1"}, "fixture", fn _ -> :ok end, opts)
+
+        assert ledger(c)["stage"] ==
+                 if(c.outcome in [:ineligible, :failure], do: "blocked", else: "done")
+
+        key = Base.encode16(:crypto.hash(:sha256, "fixture/repo:1"), case: :lower)
+        assert File.exists?(Path.join(c.root, "ledger/#{key}.json"))
+        assert_receive {:request, "GET", "/repos/fixture/repo/issues/1/comments", _, _}
+        assert_receive {:request, "GET", "/repos/fixture/repo/issues/1", _, _}
+
+        assert_receive {:request, "DELETE",
+                        "/repos/fixture/repo/issues/1/labels/momoflow%3Aready", _, _}
+
+        assert_receive {:request, "GET", "/repos/fixture/repo/issues/1/labels", _, _}
+        assert_receive {:request, "GET", "/repos/fixture/repo/issues/1/comments", _, _}
+
+        if c.outcome == :no_workpad do
+          assert_receive {:request, "POST", "/repos/fixture/repo/issues/1/comments", _, _}
+        else
+          assert_receive {:request, "PATCH", "/repos/fixture/repo/issues/comments/42", _, _}
+        end
+
+        if c.outcome == :ineligible, do: assert(ledger(c)["events"] == [])
+      end
+    end
+  end
+
+  test "invalid repo is rejected before any transport or role starts", c do
+    github_workflow(c, "owner/repo/extra")
+
+    opts =
+      c.opts
+      |> Keyword.drop([:repo, :initial_count, :eligible, :halt])
+      |> Keyword.merge(
+        request_fun: fn _, _, _, _, _ -> flunk("invalid repo request") end,
+        run_stage: fn _, _, _, _, _ -> flunk("invalid repo role") end
+      )
+
+    assert_raise ArgumentError, fn ->
+      R.run(c.workspace, %{id: "1"}, "fixture", fn _ -> :ok end, opts)
+    end
+
+    assert Path.wildcard(Path.join(c.root, "ledger/*.json")) == []
+  end
+
   test "settings reject missing effort, Fast tier, approvals and network changes" do
     for role <- ~w(plan build review publish) do
       base = effective(role)
