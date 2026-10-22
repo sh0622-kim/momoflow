@@ -124,6 +124,34 @@ defmodule RoleFlowTest do
     assert_receive {:halt, _}
   end
 
+  test "every role explains composite fingerprint without bypassing tree checks", c do
+    exec = executor(fn _, _ -> "complete" end)
+
+    inspect_prompt = fn w, issue, role, prompt, cb ->
+      assert prompt =~ "engine-owned composite fingerprint, NOT a plain git diff SHA-256"
+      assert prompt =~ "ordered untracked {path, Git mode, content or symlink target} tuples"
+      assert prompt =~ "excluding .momoflow-role-result.json"
+      assert prompt =~ "Do not compare it with sha256sum of git diff"
+      assert prompt =~ "still rejects unauthorized tree changes"
+      assert prompt =~ "this candidate's compiled module in the same workspace"
+      assert prompt =~ "SymphonyElixir.RoleRunner.snapshot!(workspace)"
+      exec.(w, issue, role, prompt, cb)
+    end
+
+    run(c, inspect_prompt)
+    assert ledger(c)["stage"] == "done"
+    assert Enum.map(ledger(c)["events"], & &1["role"]) == ~w(plan build review publish)
+  end
+
+  test "clean tree fingerprint uses Erlang composite rather than plain diff hash", c do
+    snapshot = R.snapshot!(c.workspace)
+    hash = fn bytes -> Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) end
+    assert snapshot["diff_sha256"] == hash.(:erlang.term_to_binary({"", []}))
+    refute snapshot["diff_sha256"] == hash.("")
+    File.write!(Path.join(c.workspace, ".momoflow-role-result.json"), "reserved")
+    assert R.snapshot!(c.workspace) == snapshot
+  end
+
   test "shared budget survives restart and never permits fourth build", c do
     exec =
       executor(fn role, _ -> if role == "review", do: "changes_requested", else: "complete" end)

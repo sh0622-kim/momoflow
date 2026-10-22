@@ -287,6 +287,11 @@ defmodule SymphonyElixir.RoleRunner do
     Shared implementation/validation/review iterations used: #{state["iterations"]}/3.
     Never reset this count. Fast remains OFF. Do not spawn other agents or change settings.
     Target tree: #{Jason.encode!(snapshot)}
+    Target tree diff_sha256 is an engine-owned composite fingerprint, NOT a plain git diff SHA-256.
+    It hashes Erlang term_to_binary({raw git diff --binary HEAD output, ordered untracked {path, Git mode, content or symlink target} tuples}), excluding .momoflow-role-result.json.
+    Do not compare it with sha256sum of git diff (even for a clean tree), or infer corruption from that comparison.
+    Inspect the actual HEAD/diff/files for your task; the engine recomputes and compares snapshots itself and still rejects unauthorized tree changes.
+    If exact recomputation is needed, an operator must call SymphonyElixir.RoleRunner.snapshot!(workspace) using this candidate's compiled module in the same workspace; do not approximate its Erlang serialization with shell hashing.
     Prior role evidence (including independent review findings): #{Jason.encode!(state["events"])}
     Planning and review are sequential, separate sessions, not parallel delegation.
     Write a JSON result to #{result_path} before ending:
