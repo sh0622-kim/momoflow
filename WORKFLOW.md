@@ -49,6 +49,11 @@ Description:
 ## Operating principles
 
 Read AGENTS.md and docs/constitution.md from the repository before implementation.
+Read docs/agent-policy.md for the approved role/model/reasoning policy and bootstrap exception.
+Fast mode must remain OFF. Do not enable it or silently substitute model/reasoning settings.
+Role switching is not implemented by this prompt: do not claim a separate Astra planning or
+review session ran without actual session evidence. If the required effective settings cannot
+be verified, record the blocker and follow the escalation procedure rather than assume defaults.
 Work autonomously within the goal and its acceptance criteria. Prefer the smallest working
 change. Do not ask for approval of routine implementation choices. Do not add infrastructure,
 abstraction layers, services, or dependencies solely for hypothetical future needs.

@@ -29,6 +29,8 @@ Codex is the coding agent, and OpenAI Symphony is the initial execution engine.
 - Fix concrete review findings and rerun affected checks before handing off.
 - Do not lower checks, widen permissions, or increase budgets just to complete an iteration.
 - Do not claim mock tests are live Codex or Symphony validation.
+- Fast mode is OFF for every role; never enable it or change model/reasoning/budget policy
+  autonomously. Follow [agent policy](docs/agent-policy.md) before any issue execution.
 
 ## Current boundaries
 
@@ -50,6 +52,7 @@ Then select the relevant document below; do not preload all docs or reread uncha
 | --- | --- |
 | Issue execution, PR, CI, review, merge, loop diagnosis | [GitHub flow](docs/github-flow.md); the current issue/workpad and PR head |
 | Runtime settings, dispatch, retries, budgets | [WORKFLOW.md](WORKFLOW.md); GitHub flow's current-versus-planned boundaries |
+| Role assignment, models, reasoning, Fast mode, execution preflight | [Agent policy](docs/agent-policy.md); distinguish agreed policy from enforced settings |
 | Setup, authentication, startup, recovery | [README.md](README.md) relevant section |
 | Deployment, rollback, deployment automation | [Deployment policy](docs/deployment.md); exact candidate version and validation evidence |
 | Choosing the next improvement or absorbing engine functionality | [Roadmap](docs/roadmap.md); evidence from the completed task |
