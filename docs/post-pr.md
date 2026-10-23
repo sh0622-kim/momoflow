@@ -273,3 +273,80 @@ Docker build, 기존 sandbox/readiness smoke와 전체 계약 검사를 수행�
 publication→host exact-head→병합/보존/종료를 관찰한다. 자연 코드 실패가 없으면 실제
 모델 수정 재개는 미관찰로 남긴다. 이 PR의 모의 상태 전이 검사와 실제 설정 조회를 새 버전의
 live Docker/GitHub/모델 통합 증거로 바꾸어 쓰지 않는다.
+
+## 외부 완료된 중단 실행의 정리 (GH-22 후보, 별도 설치 필요)
+
+`reconcile-external.mjs`는 원본 실행을 성공으로 바꾸지 않고, 외부 복구·검증·병합·배포가
+완료된 중단 기록에 별도 `externally-reconciled` receipt를 연결한다. 최초 지원 범위는
+GH20의 원본 Symphony 3/3과 외부 복구 4회다. `ledger`, enrollment, events, active_session,
+in_flight, 원본 `launch.json` 및 controller journal 바이트는 그대로 남는다. 이 기능의
+리뷰·배포 여부와 실제 운영 정리 성공은 별도 근거로 확인해야 한다.
+
+운영자가 깨끗한 고정 checkout을 설치한 뒤 **별도의 private 설정 파일**을 준비한다.
+기존 host config의 repo/issue/base, trustedRoot/controllerVersion, stateRoot/inboxRoot/
+ledgerRoot/tokenFile/engineURL, authority와 check/reviewer 필드를 사용한다. 여기에 다음을
+명시한다. 파일은 candidate checkout 및 `/data/workspaces` 밖에 있어야 한다.
+
+| 설정 | 값과 근거 |
+| --- | --- |
+| `authority.reconcile`, `hold` | 명시적으로 `true`, `false`; label/comment는 권한 아님 |
+| `launchRoot`, `gateRoot` | 현재 운영 launch/admission bind source의 canonical host 경로 |
+| `pr`, `head`, `tree`, `merge` | 외부 완료 PR과 정확한 head/tree/merge SHA |
+| `originalIterations`, `externalIterations` | 원본 3과 외부 4를 별도로 기록; 합치거나 초기화하지 않음 |
+| `engineContainer`, `engineImage`, `productionProject` | 현재 healthy engine의 전체 container ID, immutable image ID, project |
+| `operatorContainer`, `operatorImage`, `operatorSocketGroup` | container에서 실행할 때 실제 독립 helper 전체 ID, 고정 image, 기존 Docker socket group `1001` |
+| `evidence` | 아래 8개 `{path, hash}`; hash는 **원본 파일 바이트 SHA-256** |
+
+`evidence`의 고정 이름은 `ledger`, `enrollment`, `manifest`, `launchJournal`,
+`controllerJournal`, `gate`, `recovery`, `validation`이다. 앞의 여섯 경로는 해당 scope의
+기존 설치 경로와 정확히 일치해야 한다. controller journal이 없으면 그 경로와 `hash:null`로
+부재 자체를 고정한다. 나머지는 원본 hash가 필수다. `recovery`는 GH20 외부 복구 완료
+record (`fourth-complete-validated`, 정확한 PR/head/tree, 사용 횟수, Docker tests)를,
+`validation`은 해당 merge/image의 실제 배포 검증 record (`status:deployed`)를 가리킨다.
+원본 파일을 재직렬화해서 hash를 만들지 않는다. token 파일 내용은 이 evidence에 넣지 않는다.
+
+```sh
+node /operator/pinned/scripts/reconcile-external.mjs /operator/reconcile-gh20.json --check
+node /operator/pinned/scripts/reconcile-external.mjs /operator/reconcile-gh20.json --apply
+```
+
+설치된 ledgerRoot가 `/engine-data/log/roles`이면 기존 외부 operator helper의 **실제 named
+volume을 read-only로 연결**해 실행한다. host에 과거 ledger를 복사하거나 token을 복제하지
+않는다. helper는 clean controller/config를 RO, state/inbox/launch/admission을 RW로 연결하고,
+recovery/validation 원본 두 파일을 같은 absolute 경로에 각각 RO로 연결한다. 기존 `/tmp`와
+Docker socket RW bind도 유지한다. mount 추가·중복은 거부한다. engine의 `/data`와 같은 live
+named volume을 `/engine-data:ro`에, engine의 auth volume을 `/run/momoflow-auth:ro`에 연결한다.
+tokenFile은 `/run/momoflow-auth/token.json`이다. bind 및 named-volume 대응은 fresh kernel
+mount/stat metadata로 확인한다. helper는 현재 engine과 다른 전체 ID·실제 hostname,
+controller service label, 고정 image/default Env, user `1000:1000`, socket group, read-only root,
+cap-drop ALL/no-new-privileges 및 현재 engine의 container network 연결을 검증한다. coding
+engine 자체나 확인할 수 없는 helper는 거부한다. 새 권한·engine mount 변경은 필요 없다.
+필요하면 `docker create`의 idle node helper ID를 config에 먼저 고정하고 start 후 `docker exec`로
+위 CLI를 실행한다. command가 watch일 필요는 없으며 host 실행도 live ledger를 직접 볼 때만
+가능하다. 설치/권한 검사를 생략하는 container flag는 없다.
+host `/tmp`에 `.X11-unix` 등의 하위 mount가 있으면 helper의 `/tmp` bind에
+`bind-recursive=disabled`를 지정해 상속하지 않는다. nested mount 검사를 완화하지 않는다.
+
+`--check`는 파일·GitHub·worker·engine 상태를 읽고 적격성/이유를 제시하며 lock, archive,
+manifest, admission 또는 원격 상태를 쓰지 않는다. `--apply`는 기존 launch/watch/deploy와
+같은 `stateRoot/controller.lock`을 잡고 같은 검사를 다시 수행한다. Codex 또는 알 수 없는
+engine child process, 불완전한 process 조회, running/retrying/claimed/blocked/pending 작업,
+다른 unfinished owner나 stale lock이 있으면 중단한다. process 이름은 기존 init/BEAM/OTP
+보조 프로세스만 허용한다. `docker top <engineID> -eo pid,comm`의 `PID COMMAND` 형식과
+양의 고유 PID를 검사하고 전후 engine identity도 다시 확인한다. 일시적인 healthcheck `node`도 불확실한 상태로 거부하며 권한을
+넓히거나 임의로 worker를 종료하지 않는다.
+
+원본들은 `stateRoot/<scopeKey>/external-reconciliation/<evidenceId>/`에 exclusive 생성으로
+보관하고, `external-reconciliation-intent.json`을 남긴다. idle admission fence가 engine에
+확인된 뒤 원격 PR과 원본 바이트를 재검사하고, 정확히 일치하는 이전 `active.json`만
+퇴역시킨다. engine의 manifest 부재까지 확인한 후 기존 admission gate를 원본 바이트로
+복원·확인하고 `external-reconciliation.json`을 완료한다. 중단되면 같은 config/evidence로만
+재개한다. manifest 부재와 미완료 receipt는 새 launch를 승인하지 않는다. crash가 남긴
+shared lock은 자동 만료·삭제하지 않으며 운영자 확인 대상이다.
+
+후속 **다른 이슈**의 trusted launch는 이 receipt와 archive 및 현재 원본 ledger/enrollment/
+journal/외부 근거 hash를 다시 확인한 경우에만 해당 과거 owner를 조정된 기록으로 인정한다.
+같은 이슈의 기존 ledger 채택·재실행은 여전히 거부한다. 자동 ready·새 manifest·후속 dispatch는
+없다. 외부 근거 파일도 완료 후 불변으로 보존해야 한다. 일반 배포의 `controllersIdle` 및
+`deploymentOwnersIdle`은 변경하지 않으므로 원본 interrupted owner는 여전히 배포를 막는다.
+배포 lifecycle 예외를 이 receipt로 우회하지 않는다.

@@ -1,10 +1,11 @@
 // Trusted operator entrypoint. Symphony still selects/claims/workers; this CLI only prepares one explicit scope.
-import { access, lstat, readdir, readFile, realpath } from 'node:fs/promises';
+import { access, lstat, readFile, realpath } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { config, json, digest, atomic, keyFor, github, list, verifyInstall, withControllerLock, runConnected } from './post-pr.mjs';
 import { validateComposeImage } from './post-pr-docker.mjs';
+import { foreignOwners } from './reconcile-external.mjs';
 const assert = (v, reason) => { if (!v) throw Error(reason); };
 const same = (a,b) => a && b && Object.keys(a).sort().join() === Object.keys(b).sort().join() && Object.keys(a).every(k => a[k] === b[k]);
 const optional = async path => { try { return await json(path); } catch(e) { if(e.code === 'ENOENT') return null; throw e; } };
@@ -169,19 +170,7 @@ export async function ports(c) {
       try{await f.writeFile(JSON.stringify(m));await f.sync();}finally{await f.close();}
       const d=await open(c.launchRoot,'r');try{await d.sync();}finally{await d.close();}
     },
-    controllers:async existing=>{
-      for(const file of await readdir(c.ledgerRoot)) if(/^[a-f0-9]{64}\.json$/.test(file) && file!==`${keyFor(c)}.json`) {
-        const l=await json(join(c.ledgerRoot,file));
-        const j=await optional(join(c.stateRoot,file.slice(0,-5),'journal.json'));
-        assert(!l.in_flight && (['done','blocked'].includes(l.stage)||j?.done===true), 'Other unfinished/interrupted ledger requires recovery');
-      }
-      for(const entry of await readdir(c.stateRoot,{withFileTypes:true})) if(entry.isDirectory()) {
-        const d=join(c.stateRoot,entry.name);
-        assert(!await optional(join(d,'lock')),'Existing per-issue controller lock requires recovery');
-        const j=await optional(join(d,'journal.json')), l=await optional(join(d,'launch.json'));
-        assert((!j||j.done||(existing&&entry.name===keyFor(c)))&&(!l||l.done||(existing&&entry.name===keyFor(c))),'Other controller journal requires recovery');
-      }
-    },
+    controllers:existing=>foreignOwners(c,{own:true,existing}),
     reconcile:()=>runConnected(c),sleep:()=>new Promise(r=>setTimeout(r,30000))
   };
 }
