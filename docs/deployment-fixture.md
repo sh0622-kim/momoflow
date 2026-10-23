@@ -96,9 +96,23 @@ B `61bc90707b27a2dd80917eff44d119bd2496c465`, source
 
 검토된 새 controller의 **clean 고정 checkout**을 `/operator/momoflow`에 설치한다.
 이 도구는 컨테이너 내부 실행을 거부한다. host UID1000과 Docker 접근이 필요하다. Docker
-Desktop의 daemon volume backing path는 호스트 realpath가 아닐 수 있으므로 named volume은
-`volume inspect`의 driver/options/Mountpoint로 비교한다. local 기본 volume만 허용한다.
-경로가 불확실하거나 alias/plugin 옵션이 있으면 권한·검사를 넓히지 않고 중단한다.
+Desktop의 opaque bind Source와 volume Mountpoint는 daemon namespace에 속하며 host
+realpath에 넣지 않는다. 기존 Node로 운영 engine/auth 및 fixture의 boot ID, mountinfo,
+stat만 읽고 host의 같은 커널·device·filesystem root 좌표와 비교한다. live mount 목록도
+다시 inspect해 변경을 거부한다. inode는 같은 커널/device를 확인한 뒤 동일 객체·hardlink
+검사에 사용한다. host의 prospective 경로는 canonical existing ancestor에 미생성 suffix를
+붙여 비교한다. prefix나 HostConfig/Compose의 원본 source만으로 대응을 승인하지 않는다.
+
+named volume은 local 기본 driver/options와 실제 live mount의 backing을 함께 확인한다.
+다른 커널(원격 daemon 포함), metadata 접근 불가, stacked/nested mount, stale mount,
+symlink 또는 alias/plugin 옵션처럼 검증할 수 없는 경우 구체적인 이유로 중단한다.
+사전 검사는 추가 container/helper/image/service/권한을 만들지 않는다. 이 방식의 실제 WSL metadata
+대응은 해당 host에서 확인해야 하며, 로컬 모의 Docker 회귀가 그 성공 근거는 아니다.
+
+직접 device/root 대응을 지원하는 ext2/ext3/ext4/xfs/tmpfs만 허용한다. overlay,
+btrfs subvolume, FUSE, network filesystem 등 layered/shared backing은 다른 device라는
+이유로 분리됐다고 간주하지 않고 `Isolation filesystem backing unsupported`로 중단한다.
+이 제한을 우회하기 위해 host mount나 권한을 변경하지 않는다.
 
 아래 JSON 하나만 준비한다. 실제 absolute/canonical 경로·기존 운영 container ID/project와
 비어 있는 loopback port를 넣는다. `root`는 존재하지 않아야 하며 부모는 operator 소유,
@@ -120,10 +134,28 @@ canonical, group/world write 금지여야 한다. request/bundle을 수기로 �
 
 ```sh
 # UID1000의 신뢰된 host shell. config 파일은 chmod 600.
+# 자원 생성 없는 provenance/운영 mount/host root/port 사전 검사부터 실행.
+node /operator/momoflow/scripts/deploy-fixture-install.mjs /operator/install-gh18.json --check
+# preflight-passed는 설치·sandbox·교체/복구 성공을 뜻하지 않는다.
 node /operator/momoflow/scripts/deploy-fixture-install.mjs /operator/install-gh18.json
 # 성공 출력의 plan 경로 사용. 설치 자체는 정상 배포 횟수 0.
 node /operator/momoflow/scripts/deploy-integration.mjs /operator/gh18-isolated/plan.json
 ```
+
+GH-20의 기존 host에서는 `/operator/momoflow` 대신 검토된 고정 버전의
+`.data/gh18-controller` checkout, config는 기존 `.data/gh18-install.json`의 absolute path를
+사용한다. 기존 config의 root와 A/B/provenance 경로를 재사용하고 새 계정을 만들지 않는다.
+실행 전 `git -C <controller> rev-parse HEAD` 및
+`git -C <controller> status --porcelain --untracked-files=all`로 검토된 SHA/clean을 기록한다.
+현재 build workspace는 고정 배포 버전이 아니며, 실제 게시·리뷰된 SHA는 인계 시 붙인다.
+
+`--check` 성공 출력의 controllerVersion/source/images/provenanceHash와 exit code를 보존한다.
+실패하면 installer의 stage/reason/exit/journal 유무만 기록하고 root/volume 생성 전인지
+확인한다. 이 출력은 Env·키·토큰·원본 inspect나 mountinfo를 포함하지 않는다. 원본 inspect를
+공개 댓글에 붙이지 않는다. kernel/device 대응이 확인되지 않으면 이유를 그대로 인계하고
+권한 확대나 prefix 예외로 진행하지 않는다. `--check` 다음 실제 설치는 같은 검사를 다시 한다.
+전체 `complete/complete/rolled_back`, 운영 identity/ledger 불변, 정리는 #16에서 추적한다.
+#18 및 #16의 기존 2/3·terminal 기록은 초기화하지 않는다.
 
 Docker 설정 디렉터리가 별도라면 JSON에 `dockerConfig` absolute path를 추가할 수 있다.
 이 설정은 trusted host Docker CLI에만 사용하며 후보에 mount/env로 전달하지 않는다.
@@ -148,7 +180,18 @@ installer는 고정 Compose 표면을 먼저 검사하고 실제 `compose config
 
 integration은 세 요청 전체의 chain/ID/파일·양방향 근거를 **첫 pause 전에** 검사한다.
 이후 기존 live previous와 각 배포 사전 검사를 재확인한다. 세 번째 후보만 의도적으로
-stop해 동일 verify timeout/rollback 경로를 통과시킨다. 예상 private journal phase는
+stop해 동일 verify timeout/rollback 경로를 통과시킨다.
+중단된 fixture에는 exec가 불가능하므로 **복구 경계에만** 기존 pinned A/B image의 Node를
+일회용 probe로 실행한다. 생성 전에 실패 후보의 image 및 전체 credential-free runtime
+표면(정확한 mount destination/type/RW와 volume name 포함)을 검사한다. probe는
+`--rm --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges
+--user 1000:1000 --volumes-from <failed-id>:ro --entrypoint node`로 metadata만 읽는다.
+새 image/login/App/service/host 권한은 필요 없다. 운영 mount는 이 helper로 전달하지 않는다.
+원래 후보의 mounts를 재inspect하고 inherited bind와 pinned host 객체를 다시 대조하며,
+운영 engine/auth 및 prospective bundle/control/volume 격리 검사도 다시 수행한다.
+캐시된 path 대응이나 중단된 후보의 성공 가정으로 복구를 허용하지 않는다. helper 실패,
+변경된 bind/volume, 알 수 없는 runtime 또는 unsupported backing이면 복구 교체 전에 중단해
+admission을 held로 남긴다. 실제 Desktop의 helper mount 상속도 외부 host 검증 대상이다. 예상 private journal phase는
 `complete`, `complete`, `rolled_back`이며 auth/model/githubGate는 모두 `not-exercised`다.
 일반 CLI에는 fixture/skip-auth/fault 옵션이 없다.
 

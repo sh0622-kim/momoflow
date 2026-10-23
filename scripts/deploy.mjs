@@ -1,5 +1,6 @@
 // Install this CLI from a reviewed, pinned checkout OUTSIDE the engine/candidate workspace.
 // There is deliberately no build, pull, shell command hook, policy editor or ledger writer.
+import { fixtureMountSources } from './deploy-mount-identity.mjs';
 import { readFile, readdir, lstat, realpath, mkdir, open, rm, copyFile } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -362,6 +363,50 @@ export async function connectedFixture(c,requestFile,preflight=false,{isolatedSt
   require(c.fixtureSource && c.fixtureRepository && c.integration, 'Explicit isolated fixture scope required');
   return connect(c,requestFile,preflight,{isolatedStop,fixture:true});
 }
+export async function integrationIsolation(c,live,docker,{fixture=false,recovery=false}={}) {
+  const inspect=async id=>JSON.parse(await docker(['inspect',id]))[0];
+  require(c.integration && /^momoflow-deploy-test-[a-z0-9-]+$/.test(c.project) && c.integration.productionEngine && c.integration.productionProject!==c.project,'Explicit isolated test/production identities required');
+  const production=await inspect(c.integration.productionEngine);
+  require(production.State.Running && production.Config.Labels?.['com.docker.compose.project']===c.integration.productionProject,'Production identity cannot be established');
+  const auth=await inspect(c.integration.productionAuth);
+  require(auth.State.Running && auth.Config.Labels?.['com.docker.compose.project']===c.integration.productionProject && auth.Config.Labels?.['com.docker.compose.service']==='github-auth','Production auth identity cannot be established');
+  require(production.Config.Labels?.['com.docker.compose.service']==='symphony','Production engine service mismatch');
+  const recoveryProbes=new Map();
+  if(recovery && fixture && live.symphony.State.Running===false) {
+    const x=live.symphony;
+    // Validate the complete credential-free runtime surface before inheriting mounts.
+    // Source correspondence is freshly proven by the helper below.
+    const b=[c.target,c.previous].find(b=>b.image===x.Image);
+    require(b,'Unknown failed fixture image');
+    fixtureRuntime(c,b);
+    const expected=b.inspect.symphony;
+    const mounts=x.Mounts.map(m=>{
+      const e=expected.mounts.find(e=>e.destination===m.Destination && e.type===m.Type && e.rw===m.RW);
+      require(e && (m.Type==='bind' || m.Name===e.source),'Failed fixture mount authority mismatch');
+      return m.Type==='bind'?{...m,Source:e.source}:m;
+    });
+    require(same(runtimeIdentity({...x,Mounts:mounts}),expected),'Failed fixture runtime mismatch');
+    recoveryProbes.set(x.Id,x.Image);
+    // The helper must prove each inherited bind still equals its pinned host object.
+    await fixtureMountSources(x,expected,docker,{recoveryProbes});
+  }
+  await inspectIsolation(c,[production,auth],Object.values(live),docker,{fixture,recoveryProbes});
+  // Check prospective bundles as well, before Compose can mount anything.
+  await inspectIsolation(c,[production,auth],Object.values(c.target.inspect).map(x=>({Mounts:x.mounts.map(m=>({Type:m.type,Name:m.source,Source:m.source})),HostConfig:{PortBindings:x.ports}})),docker,{fixture,live:Object.values(live),recoveryProbes});
+
+}
+
+export async function replaceConnectedBundle(c,b,{files,isolation,docker,containers,isolatedStop=false}) {
+  await files(b);
+  if(isolatedStop || c.integration) await isolation(b===c.previous);
+  await docker(['compose','--project-name',c.project,'-f',b.composeFile,'up','-d','--no-build','--pull','never','--no-deps','symphony']);
+  if(isolatedStop && b===c.target) {
+    // Fixed, explicitly selected integration fault. No hooks, candidate commands or
+    // production CLI flag. The same production verify/rollback path follows.
+    await docker(['stop','--time','1',(await containers()).symphony.Id]);
+  }
+}
+
 async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false}={}) {
   deploymentConfig(c,{fixture});
   await privateFile(requestFile);
@@ -401,7 +446,10 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
   const observed=async()=>Object.fromEntries(Object.entries(await containers()).map(([k,x])=>[k,{...runtimeIdentity(x),running:x.State.Running,health:x.State.Health?.Status}]));
   const match=async b=>{
     const all=await containers();
-    for(const service of (fixture?['symphony']:['symphony','github-auth'])) require(same(runtimeIdentity(all[service]),b.inspect[service]) && all[service].State.Running && all[service].State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
+    for(const service of (fixture?['symphony']:['symphony','github-auth'])) {
+      const x=all[service], normalized=fixture?{...x,Mounts:await fixtureMountSources(x,b.inspect[service],docker)}:x;
+      require(same(runtimeIdentity(normalized),b.inspect[service]) && x.State.Running && x.State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
+    }
     return all;
   };
   const ownersIdle=async()=>{
@@ -412,19 +460,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     if(fixture) require(rows.length===0,'Credential-free fixture must not contain role ledgers');
     return deploymentOwnersIdle(c,rows);
   };
-  const isolation=async()=>{
-    require(c.integration && /^momoflow-deploy-test-[a-z0-9-]+$/.test(c.project) && c.integration.productionEngine && c.integration.productionProject!==c.project,'Explicit isolated test/production identities required');
-    const production=await inspect(c.integration.productionEngine);
-    require(production.State.Running && production.Config.Labels?.['com.docker.compose.project']===c.integration.productionProject,'Production identity cannot be established');
-    const auth=await inspect(c.integration.productionAuth);
-    require(auth.State.Running && auth.Config.Labels?.['com.docker.compose.project']===c.integration.productionProject && auth.Config.Labels?.['com.docker.compose.service']==='github-auth','Production auth identity cannot be established');
-    require(production.Config.Labels?.['com.docker.compose.service']==='symphony','Production engine service mismatch');
-    const live=await containers();
-    await inspectIsolation(c,[production,auth],Object.values(live),docker,{fixture});
-    // Check prospective bundles as well, before Compose can mount anything.
-    await inspectIsolation(c,[production,auth],Object.values(c.target.inspect).map(x=>({Mounts:x.mounts.map(m=>({Type:m.type,Name:m.source,Source:m.source})),HostConfig:{PortBindings:x.ports}})),docker,{fixture});
-
-  };
+  const isolation=async(recovery=false)=>integrationIsolation(c,await containers(),docker,{fixture,recovery});
   const fixtureState=async()=>{
     const all=await containers();
     const network=JSON.parse(await docker(['network','inspect',`${c.project}_default`]))[0];
@@ -472,7 +508,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     load:()=>optional(join(dir,'journal.json')),
     save:async j=>{await atomic(join(dir,`event-${String(j.events.length).padStart(4,'0')}.json`),j);await atomic(join(dir,'journal.json'),j);},
     observe:observed,
-    preReplace:async()=>{await files(c.target);await files(c.previous);await match(c.previous);},
+    preReplace:async()=>{if(c.integration) await isolation();await files(c.target);await files(c.previous);await match(c.previous);},
     backup:async()=>{
       await mkdir(join(dir,'bundle'),{recursive:true,mode:0o700});
       for(const b of [c.previous,c.target]) for(const [path,hash] of Object.entries(b.files)) {
@@ -487,16 +523,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
         '--mount',`type=volume,src=${c.dataVolume},dst=/snapshot,readonly`,'--mount',`type=bind,src=${dir},dst=/backup`,
         '--entrypoint','tar',c.previous.image,'-cf','/backup/data.tar','-C','/snapshot','.']);
     },
-    replace:async b=>{
-      await files(b);
-      if(isolatedStop || c.integration) await isolation();
-      await docker(['compose','--project-name',c.project,'-f',b.composeFile,'up','-d','--no-build','--pull','never','--no-deps','symphony']);
-      if(isolatedStop && b===c.target) {
-        // Fixed, explicitly selected integration fault. No hooks, candidate commands or
-        // production CLI flag. The same production verify/rollback path follows.
-        await docker(['stop','--time','1',(await containers()).symphony.Id]);
-      }
-    },
+    replace:b=>replaceConnectedBundle(c,b,{files,isolation,docker,containers,isolatedStop}),
     verify:async(b,paused)=>{
       const deadline=Date.now()+c.verifyMs; operationDeadline=deadline;
       try { while(true) {

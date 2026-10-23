@@ -1,5 +1,6 @@
 // External host only. Prepare ONE fresh, credential-free installation and three requests.
 // Existing images/logs are revalidated; no build, login, App creation or production writes.
+import { fixtureMountSources } from './deploy-mount-identity.mjs';
 import { mkdir, writeFile, readFile, realpath, lstat, rename } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -41,7 +42,7 @@ export async function installationAttempt(root,action) {
    need(r.exit===0,'External command failed');return r;
   }
  };
- try {const result=await action(d);row.status='installed-paused';await save();return result;}
+ try {const result=await action(d);row.status=result?.status==='preflight-passed'?'preflight-passed':'installed-paused';await save();return result;}
  catch(e) {
   row.status='failed';row.reason=e.safeReason || 'Validation or filesystem check failed';
   let journalSaved=false;try {await save();journalSaved=!!journalPath;} catch { /* Keep the last atomic journal. */ }
@@ -63,7 +64,7 @@ export async function pinFixtureBundle(c,b,doc,image,profileBytes,docker) {try {
  b.files=Object.fromEntries(await Promise.all(paths.map(async p=>[p,digest(await readFile(p))])));b.composeHash=b.files[b.composeFile];
  await bundleFiles(c,b,docker,{fixture:true});
 } catch(e) {if(e.safeReason) throw e;throw Object.assign(Error('Fixture Compose rendering/pinning check failed'),{safeReason:'Fixture Compose rendering/pinning check failed'});}}
-export async function install(o) {return installationAttempt(o.root,async diagnostic=>{
+export async function install(o,{checkOnly=false}={}) {return installationAttempt(o.root,async diagnostic=>{
  // This tool intentionally requires a host process, never the engine's Docker session.
  try {await lstat('/.dockerenv');need(false,'Run installer on the trusted Docker host, outside containers');} catch(e) {if(e.code!=='ENOENT') throw e;}
  need(process.getuid?.()===1000,'Installer requires host UID1000; do not widen operational permissions');
@@ -83,7 +84,8 @@ export async function install(o) {return installationAttempt(o.root,async diagno
  const proto={...c,fixtureMode:undefined,previous:e.versions?.[0],target:e.versions?.[1]};
  await fixtureEvidence(proto,e,docker);
  // Before creating ANY resource, compare all prospective host roots/port to production.
- await inspectIsolation(c,production,[{Mounts:[],HostConfig:{PortBindings:{'4000/tcp':[{HostPort:String(o.port)}]}}}],docker,{fixture:true});
+ await inspectIsolation(c,production,[{Mounts:[],HostConfig:{PortBindings:{'4000/tcp':[{HostPort:String(o.port)}]}}}],docker,{fixture:true,hostPaths:[o.root]});
+ if(checkOnly) return {status:'preflight-passed',controllerVersion,source:e.source,images:e.versions.map(x=>x.image),provenanceHash:digest(e),rootCreated:false,auth:'not-exercised',model:'not-exercised'};
  const allVolumes=await docker(['volume','ls','--format','{{.Name}}']);
  need(![c.dataVolume,c.codexVolume].some(v=>allVolumes.split('\n').includes(v)),'Fixture volumes must be new');
  need(!(await docker(['ps','-a','--filter',`label=com.docker.compose.project=${project}`,'-q'])),'Fixture project must be new');
@@ -110,6 +112,8 @@ export async function install(o) {return installationAttempt(o.root,async diagno
  const requests=[0,1,0].map((n,i)=>({...c,deploymentId:id(),previous:bundles[n],target:bundles[1-n]}));
  for(const [i,r] of requests.entries()) {deploymentConfig(r,{fixture:true});await fixtureEvidence(r,e,docker);await put(join(o.root,`request-${i+1}.json`),r);}
  await put(join(o.root,'plan.json'),{kind:'fixture',requests:[1,2,3].map(i=>join(o.root,`request-${i}.json`))});
+ // Refresh live production evidence at the volume-creation boundary.
+ await inspectIsolation(c,await Promise.all([c.integration.productionEngine,c.integration.productionAuth].map(inspect)),[{Mounts:bundles.flatMap(b=>b.inspect.symphony.mounts.filter(m=>m.type==='bind').map(m=>({Type:m.type,Source:m.source}))),HostConfig:{PortBindings:{}}}],docker,{fixture:true,hostPaths:[o.root]});
  for(const [i,v] of [c.dataVolume,c.codexVolume].entries()) {await diagnostic.stage('create-volume-'+i);await docker(['volume','create','--driver','local','--label',`org.momoflow.fixture.project=${project}`,v]);}
  // All fresh roots are checked before writes; only CHOWN is granted to this socketless,
  // networkless helper. The tested engine retains cap_drop ALL.
@@ -123,7 +127,7 @@ export async function install(o) {return installationAttempt(o.root,async diagno
   try {
    const result=await diagnostic.command('docker',['compose','--project-name',project,'-f',bundles[0].composeFile,'ps','-q','symphony'],{dockerConfig:o.dockerConfig});need(result.exit===0,'Fixture container lookup failed');
    const live=await inspect(result.output.toString().trim());need(live.State.Health?.Status==='healthy','Fixture not healthy');
-   need(same(runtimeIdentity(live),bundles[0].inspect.symphony),'Installed fixture identity mismatch');
+   need(same(runtimeIdentity({...live,Mounts:await fixtureMountSources(live,bundles[0].inspect.symphony,docker)}),bundles[0].inspect.symphony),'Installed fixture identity mismatch');
    await inspectIsolation(c,production,[live],docker,{fixture:true});
    need(JSON.parse(await docker(['network','inspect',project+'_default']))[0].Internal===true,'Fixture network must be internal');
    const response=await fetch(c.engineURL+'/api/v1/state',{signal:AbortSignal.timeout(5000)});need(response.ok,'Fixture state unavailable');const s=await response.json();
@@ -150,6 +154,6 @@ export async function install(o) {return installationAttempt(o.root,async diagno
  return {plan:join(o.root,'plan.json'),next:`node ${join(trustedRoot,'scripts/deploy-integration.mjs')} ${join(o.root,'plan.json')}`,auth:'not-exercised',model:'not-exercised'};
 });}
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
- try {const path=resolve(process.argv[2]);await privatePath(path);need((await lstat(path)).isFile(),'Regular installer config required');console.log(JSON.stringify(await install(await json(path))));}
+ try {need(process.argv.length===3 || (process.argv.length===4 && process.argv[3]==='--check'),'Installer accepts config and optional --check only');const path=resolve(process.argv[2]);await privatePath(path);need((await lstat(path)).isFile(),'Regular installer config required');console.log(JSON.stringify(await install(await json(path),{checkOnly:process.argv[3]==='--check'})));}
  catch(e) {console.error(e.diagnostic?e.message:'Fixture installer config failed before root creation; check private config path/JSON/permissions. No success claimed.');process.exitCode=1;}
 }
