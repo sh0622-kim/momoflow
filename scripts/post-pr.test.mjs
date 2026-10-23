@@ -337,3 +337,6 @@ test('validation independently rejects contradictory assertion evidence and miss
  const f=fixture();delete f.result.checks.find(x=>x.name==='node').failures;
  assert.throws(()=>validation(f.c,f.p,f.result),/Ambiguous/);
 });
+
+// Keep launch regressions in the fixed host harness entrypoint.
+await import('./launch.test.mjs');

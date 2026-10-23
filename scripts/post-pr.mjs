@@ -45,14 +45,27 @@ export function github(c, fetcher = fetch) {
     return r.status === 204 ? null : r.json();
   };
 }
-async function list(api, path, field) {
+export async function list(api, path, field) {
   const value = await api('GET', `${path}${path.includes('?') ? '&' : '?'}per_page=100`);
   const rows = field ? value[field] : value;
   assert(Array.isArray(rows) && rows.length < 100 && (!field || value.total_count === rows.length), `Incomplete/paginated result: ${path}`);
   return rows;
 }
+export function budget(c, ledger) {
+  const m = ledger.launch;
+  if (c.launch || m) {
+    assert(c.launch && m && Object.keys(m).sort().join() === Object.keys(c.launch).sort().join() && Object.keys(m).every(k => m[k] === c.launch[k]), 'Launch scope/limit changed or missing');
+    assert(m.v === 1 && m.repo === c.repo && m.issue === c.issue && m.base === c.base && /^[a-f0-9]{64}$/.test(m.id), 'Invalid persisted launch');
+    assert(Number.isInteger(m.limit) && m.limit >= 1 && m.limit <= 3, 'Invalid launch limit');
+  }
+  const limit = m ? m.limit : 3;
+  assert(Number.isInteger(ledger.iterations) && ledger.iterations >= 0 && ledger.iterations <= limit, 'Invalid role budget');
+  return limit;
+}
+
 export function receipt(c, ledger) {
   const p = ledger.publication;
+  budget(c, ledger);
   assert(ledger.issue === c.issue && ledger.stage === 'await_validation' && ledger.in_flight === false, 'Runner is not released for validation');
   assert(Number.isInteger(ledger.iterations) && ledger.iterations >= 1 && ledger.iterations <= 3, 'Invalid role budget');
   assert(p && p.repo === c.repo && p.issue === c.issue && p.base === c.base && Number.isSafeInteger(p.pr) && p.pr > 0 && sha(p.head) && sha(p.tree) && sha(p.base_head), 'Invalid publication scope');
@@ -220,11 +233,14 @@ export async function reconcile(c, io) {
     await io.verifyLogs?.(journal.validation);
     if (journal.validation.kind === 'code_failure') {
       assert(!pr.merged && c.authority.resume, 'Correction authority unavailable');
-      assert(ledger.iterations < 3, `Shared budget exhausted ${ledger.iterations}/3; no fourth build`);
+      const limit = budget(c, ledger);
+      assert(ledger.iterations < limit, `Shared budget exhausted ${ledger.iterations}/${limit}; no further build`);
       const guardResume = async () => {
         await io.authorize?.();
         assert(!c.hold && c.authority.resume, 'Correction authority revoked/hold');
-        assert(digest(receipt(c, await io.ledger())) === digest(p), 'Runner generation changed during validation');
+        const latestLedger = await io.ledger();
+        assert(latestLedger.iterations < budget(c, latestLedger), 'Shared budget exhausted before correction');
+        assert(digest(receipt(c, latestLedger)) === digest(p), 'Runner generation changed during validation');
         const released = await io.engine();
         assert(Array.isArray(released.running) && Array.isArray(released.retrying) && released.running.length === 0 && released.retrying.length === 0, 'Worker started during host validation');
         const latest = await current(c, p, api);
@@ -232,7 +248,7 @@ export async function reconcile(c, io) {
       };
       const envelope = { id: digest({ publication: p, failure: journal.validation }), repo: c.repo, issue: c.issue,
         publication: p, generation: ledger.events.length, kind: 'code_failure', evidence: JSON.stringify(journal.validation) };
-      await report(c, p, api, `코드 검사 실패: ${p.head}; 누적 ${ledger.iterations}/3. 같은 PR 수정 → 별도 Astra 검토 → 재검증 대기. 근거 ${journal.request}.`);
+      await report(c, p, api, `코드 검사 실패: ${p.head}; 누적 ${ledger.iterations}/${limit}. 같은 PR 수정 → 별도 Astra 검토 → 재검증 대기. 근거 ${journal.request}.`);
       await save({ resumeIntent: envelope.id });
       await guardResume();
       await io.resume(envelope); // Atomic host-owned inbox. Runner owns consumption/count.
@@ -311,16 +327,30 @@ export async function reconcile(c, io) {
   }
 }
 
-async function verifyInstall(c) {
+export async function verifyInstall(c) {
   assert(await realpath(join(c.trustedRoot, 'scripts/post-pr.mjs')) === await realpath(new URL(import.meta.url)), 'Controller must run from pinned trusted checkout');
   const head = await command('git', ['-C', c.trustedRoot, 'rev-parse', 'HEAD']);
-  const status = await command('git', ['-C', c.trustedRoot, 'status', '--porcelain', '--untracked-files=all']);
+  const status = await command('git', ['--no-optional-locks', '-C', c.trustedRoot, 'status', '--porcelain', '--untracked-files=all']);
   assert(head.exit === 0 && head.output.toString().trim() === c.controllerVersion && status.exit === 0 && status.output.length === 0, 'Controller checkout version/cleanliness mismatch');
   for (const path of [c.stateRoot, c.inboxRoot, c.ledgerRoot, c.tokenFile])
     assert(!resolve(path).startsWith(c.trustedRoot + '/'), 'Operational data must be outside controller checkout');
 }
 
+// Shared by legacy reconcile/watch and launch: ownership lasts across watch sleeps.
+export async function withControllerLock(c, action) {
+  await mkdir(c.stateRoot, { recursive: true, mode: 0o700 });
+  const path = join(c.stateRoot, 'controller.lock');
+  const lock = await open(path, 'wx', 0o600);
+  try {
+    await lock.writeFile(JSON.stringify({ pid: process.pid, repo: c.repo, issue: c.issue, version: c.controllerVersion }));
+    await lock.sync();
+    return await action();
+  } finally { await lock.close(); await rm(path); }
+}
 export async function runOnce(c) {
+  return withControllerLock(c, () => runConnected(c));
+}
+export async function runConnected(c) {
   config(c);
   const key = keyFor(c), dir = join(c.stateRoot, key);
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -331,7 +361,13 @@ export async function runOnce(c) {
   try {
     await verifyInstall(c);
     return await reconcile(c, {
-      authorize: async () => { if (c.configFile) assert(JSON.stringify(await json(c.configFile)) === JSON.stringify(c.configContents), 'Operator configuration changed; restart controller'); },
+      authorize: async () => {
+        if (c.configFile) assert(JSON.stringify(await json(c.configFile)) === JSON.stringify(c.configContents), 'Operator configuration changed; restart controller');
+        if (c.launch) {
+          const m = await json(join(c.launchRoot, 'active.json'));
+          assert(Object.keys(m).sort().join() === Object.keys(c.launch).sort().join() && Object.keys(m).every(k => m[k] === c.launch[k]), 'Trusted launch manifest changed/missing');
+        }
+      },
       api, ledger: () => json(join(c.ledgerRoot, `${key}.json`)),
       engine: async () => { const r = await fetch(`${c.engineURL}/api/v1/state`, { signal: AbortSignal.timeout(5000) }); assert(r.ok, 'Engine state unavailable'); return r.json(); },
       load: async () => { try { return await json(join(dir, 'journal.json')); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } },
@@ -355,14 +391,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     await current(c, p, api);
     console.log(JSON.stringify({ scope: `${c.repo}#${c.issue}`, head: p.head, tree: p.tree, gates: await gates(c, p, api) }));
   } else {
-    do {
+    await withControllerLock(c, async () => { do {
       try {
-        const result = await runOnce(c);
+        const result = await runConnected(c);
         console.log(JSON.stringify(result));
         if (result.done) break;
       } catch (e) { console.error(e.message); process.exitCode = 1; break; }
       if (!process.argv.includes('--watch')) break;
       await new Promise(r => setTimeout(r, 30000));
-    } while (true);
+    } while (true); });
   }
 }

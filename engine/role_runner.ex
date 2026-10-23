@@ -56,6 +56,22 @@ defmodule SymphonyElixir.RoleRunner do
     }
   end
 
+  # Enrollment survives removal of opt-in flags: never fall back to a single unbounded session.
+  def required?(issue, opts \\ []) do
+    if System.get_env("MOMOFLOW_ROLE_FLOW") == "1" or System.get_env("MOMOFLOW_LAUNCH_ROOT") do
+      true
+    else
+      case Client.resolved_repo(Config.settings!().tracker) do
+        {:ok, repo} ->
+          key = Base.encode16(:crypto.hash(:sha256, repo <> ":" <> issue.id), case: :lower)
+          File.exists?(Path.join(Keyword.get(opts, :state_root, "/data/log/roles"), key <> ".json.enrolled"))
+        _ ->
+          # Token expiry/unknown scope must not turn an enrolled execution into a single session.
+          Path.wildcard(Path.join(Keyword.get(opts, :state_root, "/data/log/roles"), "*.json.enrolled")) != []
+      end
+    end
+  end
+
   def run(workspace, issue, prompt, on_message, opts \\ []) do
     root = Keyword.get(opts, :state_root, "/data/log/roles")
     File.mkdir_p!(root)
@@ -82,6 +98,7 @@ defmodule SymphonyElixir.RoleRunner do
     # Symphony has one worker per issue. An in-flight record survives worker death/retry.
     try do
       state = load(path, issue, opts)
+      verify_launch!(state, issue, opts)
       validate_state!(state)
       state = resume!(state, workspace, issue, opts)
 
@@ -101,7 +118,7 @@ defmodule SymphonyElixir.RoleRunner do
 
         Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, opts) end).(
           issue,
-          "#{Exception.message(error)}; shared iterations=#{inspect(state["iterations"])}/3"
+          "#{Exception.message(error)}; shared iterations=#{inspect(state["iterations"])}/#{limit(state)}"
         )
 
         :ok
@@ -131,7 +148,10 @@ defmodule SymphonyElixir.RoleRunner do
       if state["issue"] != issue.id, do: halt!("Ledger issue mismatch")
       state
     else
-      used = Keyword.get(opts, :initial_count, fn -> workpad_count!(issue, opts) end).()
+      manifest = launch_manifest!(issue, opts)
+      marker = path <> ".enrolled"
+      if File.exists?(marker), do: halt!("Enrolled ledger missing; operator recovery required")
+      used = if manifest, do: 0, else: Keyword.get(opts, :initial_count, fn -> workpad_count!(issue, opts) end).()
       if not is_integer(used) or used not in 0..3, do: halt!("Invalid shared iteration count")
 
       state = %{
@@ -142,6 +162,13 @@ defmodule SymphonyElixir.RoleRunner do
         "in_flight" => false
       }
 
+      state = if manifest, do: Map.put(state, "launch", manifest), else: state
+      # Separate durable enrollment tombstone prevents a missing ledger from reseeding.
+      if manifest do
+        {:ok, marker_file} = File.open(marker, [:write, :exclusive, :sync])
+        IO.binwrite(marker_file, Jason.encode!(manifest))
+        File.close(marker_file)
+      end
       save(path, state)
       state
     end
@@ -151,8 +178,9 @@ defmodule SymphonyElixir.RoleRunner do
     :ok = Keyword.get(opts, :eligible, fn issue -> eligible_issue(issue, opts) end).(issue)
     role = state["stage"]
     count = state["iterations"] + if(role == "build", do: 1, else: 0)
-    if count > 3, do: halt!("Shared three-iteration budget exhausted")
-    if role == "plan" and count >= 3, do: halt!("No implementation budget remains")
+    verify_launch!(state, issue, opts)
+    if count > limit(state), do: halt!("Shared iteration budget exhausted")
+    if role == "plan" and count >= limit(state), do: halt!("No implementation budget remains")
     before = snapshot!(workspace)
     state = Map.merge(state, %{"iterations" => count, "in_flight" => true})
     save(path, state)
@@ -265,7 +293,7 @@ defmodule SymphonyElixir.RoleRunner do
 
       Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, waiting_opts) end).(
         issue,
-        "Role stage preserved (#{next}); shared iterations=#{count}/3; PR checks/reviews and deployment remain separate. Ledger: #{path}"
+        "Role stage preserved (#{next}); shared iterations=#{count}/#{limit(state)}; PR checks/reviews and deployment remain separate. Ledger: #{path}"
       )
     else
       advance(path, state, workspace, issue, prompt, on_message, opts)
@@ -315,7 +343,7 @@ defmodule SymphonyElixir.RoleRunner do
 
     Engine role: #{role}. #{task}
     These stage instructions narrow the general workflow above. Stop after this stage.
-    Shared implementation/validation/review iterations used: #{state["iterations"]}/3.
+    Shared implementation/validation/review iterations used: #{state["iterations"]}/#{limit(state)}.
     Never reset this count. Fast remains OFF. Do not spawn other agents or change settings.
     Target tree: #{Jason.encode!(snapshot)}
     Target tree diff_sha256 is an engine-owned composite fingerprint, NOT a plain git diff SHA-256.
@@ -421,6 +449,105 @@ defmodule SymphonyElixir.RoleRunner do
     |> then(&object("tree", &1))
   end
 
+  # Optional trusted launch mode is installed by an external operator, never by issue text.
+  defp launch_root(opts) do
+    Keyword.get_lazy(opts, :launch_root, fn ->
+      case System.get_env("MOMOFLOW_LAUNCH_ROOT") do
+        nil -> nil
+        "/run/momoflow-launch" = root -> root
+        _ -> halt!("Invalid trusted launch mount")
+      end
+    end)
+  end
+
+  def limit(state) do
+    case state["launch"] do
+      nil -> 3
+      manifest when is_map(manifest) -> manifest["limit"]
+      _ -> nil
+    end
+  end
+
+  defp launch_manifest!(issue, opts) do
+    if root = launch_root(opts) do
+      unless Keyword.has_key?(opts, :launch_root) or System.get_env("MOMOFLOW_ROLE_FLOW") == "1",
+        do: halt!("Launch requires enabled role flow; no single-session fallback")
+      m = read_launch_manifest!(root, opts[:repo])
+      unless m["issue"] == issue.id and inbox(opts), do: halt!("Launch scope/limit/inbox mismatch")
+      m
+    end
+  end
+
+  defp read_launch_manifest!(root, repo) do
+    file = Path.join(root, "active.json")
+    stat = File.lstat!(file)
+    unless stat.type == :regular and stat.size < 4096, do: halt!("Invalid launch manifest")
+    m = Jason.decode!(File.read!(file))
+    unless is_map(m) and Enum.sort(Map.keys(m)) == Enum.sort(~w(v id repo issue base limit)),
+      do: halt!("Invalid launch manifest fields")
+    unless m["v"] == 1 and m["repo"] == repo and
+             is_binary(m["issue"]) and Regex.match?(~r/^[1-9][0-9]*$/, m["issue"]) and
+             is_binary(m["id"]) and Regex.match?(~r/^[a-f0-9]{64}$/, m["id"]) and
+             is_binary(m["base"]) and Regex.match?(~r/^[\w.\/-]+$/, m["base"]) and
+             is_integer(m["limit"]) and m["limit"] in 1..3,
+      do: halt!("Launch scope/limit/inbox mismatch")
+    m
+  end
+
+  defp launch_manifest_status(nil, _repo), do: %{status: "invalid"}
+  defp launch_manifest_status(root, repo) do
+    # Report invalid state without exposing file contents or breaking observability.
+    case File.lstat(Path.join(root, "active.json")) do
+      {:error, :enoent} -> %{status: "absent"}
+      _ ->
+        try do
+          %{status: "present", value: read_launch_manifest!(root, repo)}
+        rescue
+          _ -> %{status: "invalid"}
+        end
+    end
+  end
+
+  defp verify_launch!(state, issue, opts) do
+    current = launch_manifest!(issue, opts)
+    unless current == state["launch"], do: halt!("Launch changed/missing or legacy ledger adoption forbidden")
+    unless is_integer(limit(state)) and limit(state) in 1..3 and is_integer(state["iterations"]) and state["iterations"] <= limit(state),
+      do: halt!("Invalid persisted launch budget")
+  end
+
+  defp read_only_mount?(nil), do: false
+  defp read_only_mount?(root) do
+    File.read!("/proc/self/mountinfo")
+    |> String.split("\n")
+    |> Enum.any?(fn line ->
+      case String.split(line, " ") do
+        [_, _, _, _, ^root, options | _] -> "ro" in String.split(options, ",")
+        _ -> false
+      end
+    end)
+  end
+
+  # Exposed by the existing read-only state endpoint: no secrets, no execution.
+  def launch_status(opts \\ []) do
+    settings = Config.settings!()
+    repo = case Client.resolved_repo(settings.tracker) do
+      {:ok, value} -> value
+      _ -> nil # Preserve observability when auth is unavailable; launch still fails scope validation.
+    end
+    %{
+      contract: 1,
+      source: Base.encode16(:crypto.hash(:sha256, File.read!(__ENV__.file)), case: :lower),
+      repo: repo,
+      concurrency: settings.agent.max_concurrent_agents,
+      role_flow: System.get_env("MOMOFLOW_ROLE_FLOW") == "1",
+      manifest: launch_manifest_status(launch_root(opts), repo),
+      launch_root: launch_root(opts),
+      launch_read_only: read_only_mount?(launch_root(opts)),
+      inbox_read_only: read_only_mount?(inbox(opts)),
+      inbox_root: inbox(opts)
+    }
+  end
+
   defp inbox(opts) do
     Keyword.get_lazy(opts, :inbox_root, fn ->
       case System.get_env("MOMOFLOW_POST_PR_INBOX") do
@@ -442,6 +569,7 @@ defmodule SymphonyElixir.RoleRunner do
              review["after"] == snapshot!(workspace),
            do: halt!("Missing exact reviewed publication")
 
+    if state["launch"] && p["base"] != state["launch"]["base"], do: halt!("Launch base mismatch")
     old = state["publication"]
 
     if old && (old["pr"] != p["pr"] or old["base"] != p["base"]),
@@ -484,7 +612,7 @@ defmodule SymphonyElixir.RoleRunner do
     unless stat.type == :regular and stat.size < 65536, do: halt!("Invalid resume envelope")
     r = Jason.decode!(File.read!(file))
 
-    unless not state["in_flight"] and state["iterations"] < 3 and
+    unless not state["in_flight"] and state["iterations"] < limit(state) and
              r["repo"] == opts[:repo] and r["issue"] == issue.id and r["publication"] == p and
              r["generation"] == length(state["events"]) and r["kind"] == "code_failure" and
              is_binary(r["id"]) and Regex.match?(~r/^[0-9a-f]{64}$/, r["id"]) and

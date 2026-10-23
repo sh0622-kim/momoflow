@@ -68,8 +68,11 @@ export async function materialize(api, repo, tree, dir) {
     if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) throw new Error('Escaping candidate symlink chain');
   }
 }
-export async function validateDocker(c, p, evidenceDir, api) {
+export function validateComposeImage(c) {
   if (!/^.+@sha256:[a-f0-9]{64}$/.test(c.composeImage || '')) throw new Error('Pinned trusted Compose image required');
+}
+export async function validateDocker(c, p, evidenceDir, api) {
+  validateComposeImage(c);
   const scratch = await mkdtemp('/tmp/momoflow-validate-');
   const dir = join(scratch, 'candidate');
   await mkdir(dir, { mode: 0o755 });

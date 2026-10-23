@@ -29,10 +29,12 @@ try {
     assert.equal(options.redirect, 'error');
     assert.deepEqual(JSON.parse(options.body), { repositories: ['repository'] });
     assert.ok(options.headers.Authorization.startsWith('Bearer '));
-    return { ok: true, json: async () => ({ token, expires_at: expiry }) };
+    return { ok: true, json: async () => ({ token, expires_at: expiry, permissions: {contents:'write',issues:'write',pull_requests:'write',checks:'read'} }) };
   };
   await refreshToken(config, request, now);
   assert.equal((await readToken(config.tokenFile, 60000, now)).token, 'fixture-first');
+  assert.equal((await readToken(config.tokenFile)).repository, config.repository);
+  assert.deepEqual((await readToken(config.tokenFile)).permissions, {contents:'write',issues:'write',pull_requests:'write',checks:'read'});
   assert.equal((await stat(config.tokenFile)).mode & 0o777, 0o600);
   token = 'fixture-second';
   await refreshToken(config, request, now);

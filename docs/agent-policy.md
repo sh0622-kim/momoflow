@@ -100,3 +100,12 @@ worker/claim이 해제된 경우에만 Sol 수정→별도 Astra 리뷰→Sol �
 consumption과 build count/in_flight는 함께 저장하며 중단 실행·terminal을 자동 초기화하지 않는다.
 기존 ledger의 done/blocked migration은 지원하지 않는다. 모델·Fast·승인·네트워크·동시 이슈
 설정은 바꾸지 않으며 host의 병합 권한과 모델의 기술 리뷰를 분리한다.
+
+## GH-11 후보의 작은 실행 한도
+
+선택적 trusted launch의 설치·영속 계약·복구는 [운영 계약](post-pr.md#승인된-단일-이슈-시작-gh-11-후보-별도-설치-필요)에 둔다.
+운영자가 명시한 1/2/3회 한도를 새 runner ledger에 고정하고 실제 build 진입 및 host 수정
+재개에서 같은 한도를 검사한다. 마지막 허용 build 뒤 리뷰/게시는 가능하지만 다음 build는
+차단한다. 한도 삭제/변경/재시작으로 기본3에 복귀하거나 초기화하지 않는다. legacy 기본3 및
+기존 GH-7/GH-9 예외 기록에는 소급 적용하지 않는다. 토큰·금액 lifetime 하드 한도는 아니다.
+현재 구현 세션은 배포된 기본3 계약으로 실행하며 후보 설치/live 검증은 외부 운영자의 별도 작업이다.
