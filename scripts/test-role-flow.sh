@@ -13,10 +13,13 @@ git --git-dir="$symphony_root/.git" show HEAD:elixir/lib/symphony_elixir/agent_r
 git --git-dir="$symphony_root/.git" show HEAD:elixir/lib/symphony_elixir/codex/app_server.ex > "$fixture_root/elixir/lib/symphony_elixir/codex/app_server.ex"
 git --git-dir="$symphony_root/.git" show HEAD:elixir/lib/symphony_elixir/orchestrator.ex > "$fixture_root/elixir/lib/symphony_elixir/orchestrator.ex"
 git --git-dir="$symphony_root/.git" show HEAD:elixir/lib/symphony_elixir_web/controllers/observability_api_controller.ex > "$fixture_root/elixir/lib/symphony_elixir_web/controllers/observability_api_controller.ex"
+git --git-dir="$symphony_root/.git" show HEAD:elixir/lib/symphony_elixir_web/presenter.ex > "$fixture_root/elixir/lib/symphony_elixir_web/presenter.ex"
 git -C "$fixture_root" apply --check "$repository_root/patches/role-flow.patch"
 git -C "$fixture_root" apply "$repository_root/patches/role-flow.patch"
+git -C "$fixture_root" apply --check "$repository_root/patches/admission.patch"
+git -C "$fixture_root" apply "$repository_root/patches/admission.patch"
 # Isolate mock contracts from deployment-only opt-in mounts; no running settings change.
-unset MOMOFLOW_POST_PR_INBOX MOMOFLOW_LAUNCH_ROOT
+unset MOMOFLOW_POST_PR_INBOX MOMOFLOW_LAUNCH_ROOT MOMOFLOW_ADMISSION_ROOT
 elixir -pa "$symphony_root/elixir/_build/prod/lib/*/ebin" -e '
   Code.compiler_options(ignore_module_conflict: true)
   [beam_root | files] = System.argv()
@@ -30,8 +33,10 @@ elixir -pa "$symphony_root/elixir/_build/prod/lib/*/ebin" -e '
   end)
 ' "$fixture_root/beams" "$fixture_root/elixir/lib/symphony_elixir/github/client.ex" \
   "$repository_root/engine/role_runner.ex" \
+  "$repository_root/engine/admission.ex" \
   "$fixture_root/elixir/lib/symphony_elixir/codex/app_server.ex" \
   "$fixture_root/elixir/lib/symphony_elixir/agent_runner.ex" \
   "$fixture_root/elixir/lib/symphony_elixir/orchestrator.ex" \
+  "$fixture_root/elixir/lib/symphony_elixir_web/presenter.ex" \
   "$fixture_root/elixir/lib/symphony_elixir_web/controllers/observability_api_controller.ex" \
   "$repository_root/scripts/test-role-flow.exs"

@@ -340,3 +340,6 @@ test('validation independently rejects contradictory assertion evidence and miss
 
 // Keep launch regressions in the fixed host harness entrypoint.
 await import('./launch.test.mjs');
+
+// Deployment regressions are part of the same pinned exact-head host suite.
+await import('./deploy.test.mjs');

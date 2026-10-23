@@ -241,3 +241,7 @@ ready 부여와 기존 controller 관찰을 연결한다. 명시 권한·repo/is
 read-only launch/inbox mount가 필요하며 기본 Compose에는 자동 활성화하지 않는다.
 [설치·영속 예산·부분 실패 복구·Docker Desktop/WSL named-volume·외부 live 검증 인계](docs/post-pr.md#승인된-단일-이슈-시작-gh-11-후보-별도-설치-필요)를 따른다.
 현재 세션의 엔진/controller를 교체하거나 후보로 자기 PR을 검증하지 않는다.
+
+외부 운영자의 명시 배포 CLI 후보·admission 첫 설치·실 Docker 정상2회/실패복구1회 인계는
+[배포 운영과 자동화](docs/deployment.md)를 따른다.
+현재 코딩 세션의 엔진을 교체하지 않으며 조건부 자동 승격은 켜지 않는다.
