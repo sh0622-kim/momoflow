@@ -117,6 +117,13 @@ docker compose run --rm symphony codex login --device-auth
 docker compose up -d
 ```
 
+스모크 실패 시 기동(`startup`), 상태 API(`state API`), 대시보드(`dashboard`) 단계와
+원인을 출력한다. 준비 검사는 기존대로 최대 30회 재시도하고 마지막 실패 진단과
+컨테이너 로그 60줄을 남긴 뒤 비정상 종료·정리한다. `readiness command` 오류는
+그 앞의 probe 진단 또는 Docker/Node 실행 오류를 함께 확인한다.
+Docker 없이 진단·정리 동작의 모의 회귀 검사만 실행하려면
+`node --test scripts/smoke-readiness.test.mjs`를 사용한다. 이는 실제 Docker·sandbox 검사를 대체하지 않는다.
+
 Codex 로그인은 전용 `codex-home` 볼륨에 보관된다. API 키 인증을 사용하는 경우에는
 컨테이너에서 `codex login --with-api-key`의 stdin 입력 방식으로 로그인할 수 있다.
 웹 주소는 **http://localhost:4000**이다.
