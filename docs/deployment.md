@@ -226,6 +226,9 @@ controller/launch 프로세스·journal intent/event·현재 image/mount·gate a
 
 ### 격리 실 Docker 검증 인계 (미실행)
 
+일반 적격 A/B가 없는 최초 실험은 [최초 설치와 fixture 준비](deployment-fixture.md)를 따른다.
+로컬 fixture provenance를 일반 GitHub 배포 자격으로 승격하지 않는다.
+
 로컬 `node scripts/post-pr.test.mjs`의 deployment tests는 **외부 효과를 모의한 계약**이다.
 실 Docker·Codex 인증·실 모델 실행을 증명하지 않는다. `sh scripts/test-role-flow.sh`는 실제
 patched orchestrator 코드를 컴파일하지만 worker/model은 모의한다. 아래 절차는 외부 운영자가
@@ -237,16 +240,16 @@ patched orchestrator 코드를 컴파일하지만 worker/model은 모의한다. 
 2. 승인·독립 리뷰·host 검사/merge 근거가 있는 서로 다른 이미지 A/B를 준비한다. 요청1=A→B,
    요청2=B→A, 요청3=A→B를 각 새 deploymentId와 해당 bundle/이슈/evidence로 고정한다. B의
    실패 검증은 image를 변조하거나 검사 근거를 위조하지 않고 **격리 후보 컨테이너를 stop**한다.
-3. 각 request에 `integration:{productionEngine:"<현재 운영 engine ID>",productionProject:"<운영 project>"}`를
+3. 각 request에 `integration:{productionEngine:"<현재 운영 engine ID>",productionAuth:"<운영 github-auth ID>",productionProject:"<운영 project>"}`를
    명시한다. helper에서 실제 운영 identity를 읽을 수 있어야 한다. runner는 test project 접두사,
-   생산 engine identity, 다른 named volume/control source/port를 검사한다. production CLI에는
+   운영 engine/auth identity, 다른 mount/credential source/port를 검사한다. production CLI에는
    fault injection flag가 없다.
 4. 운영자가 다음 plan JSON과 명령을 실행한다. 별도 `deploy-integration.mjs`는 같은
    production CLI 경로로 정상2회 후 세 번째 교체 직후 test candidate만 stop한다. production
    verify timeout→이전 bundle rollback→동일 auth/contract 검사→접수 재개를 실제로 수행한다.
 
    ```json
-   {"requests":["/operator/test/one.json","/operator/test/two.json","/operator/test/rollback.json"]}
+   {"kind":"github","requests":["/operator/test/one.json","/operator/test/two.json","/operator/test/rollback.json"]}
    ```
 
    ```sh

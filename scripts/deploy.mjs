@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { atomic, digest, json, receipt, validation, list, github, verifyInstall } from './post-pr.mjs';
 import { command } from './post-pr-docker.mjs';
+import { fixtureEvidence, isolatedResources } from './deploy-fixture.mjs';
 export class DeploymentError extends Error {}
 const require = (v, m) => { if (!v) throw new DeploymentError(m); };
 const reason = e => e instanceof DeploymentError ? e.message : /^GitHub (GET|POST|PATCH) \/[^\s]+: [0-9]{3}$/.test(e.message || '') ? e.message : `External I/O/auth/config parsing failed${/^E[A-Z0-9_]+$/.test(e.code || '') ? ' ('+e.code+')' : ''}; inspect operator logs privately`;
@@ -117,20 +118,25 @@ export async function deploy(c,io,{preflight=false}={}) {
     throw new DeploymentError('Interrupted/blocked deployment requires operator recovery; admission remains held');
   }
   await io.preflight(); // No intent or fence if authority/evidence/bootstrap is invalid.
-  let j={v:1,id:c.deploymentId,request:fingerprint,target:c.target,previous:c.previous,started:new Date().toISOString(),events:[],phase:'intent'};
+  let j={v:1,evidenceKind:c.fixtureSource?'isolated-fixture':'github-merged',id:c.deploymentId,request:fingerprint,target:c.target,previous:c.previous,started:new Date().toISOString(),events:[],phase:'intent'};
   const record=async(phase,extra={})=>{j={...j,...extra,phase,updated:new Date().toISOString(),events:[...j.events,{phase,at:new Date().toISOString()}]}; await io.save(j);};
   await record('intent');
   let replacement=false, resumeAttempted=false;
   try {
     await record('pause_intent'); await io.gate(true);
-    await record('draining');
+    await record('draining',{pauseAdmission:(await io.state()).admission});
     const deadline=io.now()+c.drainMs;
     while(true) {
       await io.authorize();
-      if(drained(await io.state(),c.deploymentId) && await io.ownersIdle()) break;
+      const s=await io.state(),a=s.admission;
+      require(a?.contract===1 && a.configured===true && !a.error,'Admission unavailable while waiting for acknowledgement');
+      // File publication precedes asynchronous engine acknowledgement. A valid older
+      // generation is not proof of drain; wait within the SAME deadline, then fail closed.
+      if(a.generation===c.deploymentId && a.paused===true && drained(s,c.deploymentId) && await io.ownersIdle()) break;
       require(io.now()<deadline,'Drain timeout; deployment deferred; active work was not stopped');
       await io.sleep();
     }
+    await record('drained',{drainedAdmission:(await io.state()).admission});
     await record('backup_intent'); await io.backup();
     await record('preserved');
     await io.authorize(); await io.preReplace();
@@ -336,9 +342,20 @@ async function privateFile(path) {
   require(st.isFile() && !st.isSymbolicLink() && (st.mode & 0o022)===0 && await realpath(path)===path,'Operator file must be regular, canonical and not group/world writable');
 }
 export async function connected(c,requestFile,preflight=false,{isolatedStop=false}={}) {
+  require(!c.fixtureSource && !c.fixtureRepository, 'Fixture requests require the separate isolated integration entrypoint');
+  return connect(c,requestFile,preflight,{isolatedStop});
+}
+// No fixture CLI flag or generic evidence callback. Isolation is mandatory here and
+// production authorization is never represented by local fixture provenance.
+export async function connectedFixture(c,requestFile,preflight=false,{isolatedStop=false}={}) {
+  require(c.fixtureSource && c.fixtureRepository && c.integration, 'Explicit isolated fixture scope required');
+  return connect(c,requestFile,preflight,{isolatedStop,fixture:true});
+}
+async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false}={}) {
   deploymentConfig(c);
   await privateFile(requestFile);
   const requestBytes=await readFile(requestFile), api=github(c);
+  require(same(JSON.parse(requestBytes),c),'Request bytes/config mismatch');
   let operationDeadline=null;
   const remaining=()=>operationDeadline ? Math.max(1,operationDeadline-Date.now()) : c.verifyMs;
   const docker=async args=>{
@@ -387,14 +404,14 @@ export async function connected(c,requestFile,preflight=false,{isolatedStop=fals
     require(c.integration && /^momoflow-deploy-test-[a-z0-9-]+$/.test(c.project) && c.integration.productionEngine && c.integration.productionProject!==c.project,'Explicit isolated test/production identities required');
     const production=await inspect(c.integration.productionEngine);
     require(production.State.Running && production.Config.Labels?.['com.docker.compose.project']===c.integration.productionProject,'Production identity cannot be established');
+    const auth=await inspect(c.integration.productionAuth);
+    require(auth.State.Running && auth.Config.Labels?.['com.docker.compose.project']===c.integration.productionProject && auth.Config.Labels?.['com.docker.compose.service']==='github-auth','Production auth identity cannot be established');
+    require(production.Config.Labels?.['com.docker.compose.service']==='symphony','Production engine service mismatch');
     const live=await containers();
-    const sources=new Set(production.Mounts.map(m=>m.Type==='volume'?m.Name:m.Source));
-    for(const x of Object.values(live)) for(const m of x.Mounts) {
-      // Read-only key custody/config may be shared, never data/auth/Codex or control roots.
-      if(m.Type==='volume' || ['/run/momoflow-admission','/run/momoflow-launch','/run/momoflow-resume'].includes(m.Destination)) require(!sources.has(m.Type==='volume'?m.Name:m.Source),'Integration target shares production volume/control source');
-    }
-    const ports=new Set(Object.values(production.HostConfig.PortBindings || {}).flat().map(x=>x.HostPort));
-    require(!Object.values(live.symphony.HostConfig.PortBindings || {}).flat().some(x=>ports.has(x.HostPort)),'Integration target shares production port');
+    isolatedResources(c,[production,auth],Object.values(live));
+    // Check prospective bundles as well, before Compose can mount anything.
+    isolatedResources(c,[production,auth],Object.values(c.target.inspect).map(x=>({Mounts:x.mounts.map(m=>({Type:m.type,Name:m.source,Source:m.source})),HostConfig:{PortBindings:x.ports}})));
+
   };
   let controllerOwned=false;
   const preflightCheck=async()=>{
@@ -418,7 +435,8 @@ export async function connected(c,requestFile,preflight=false,{isolatedStop=fals
     const normalize=b=>({...b.inspect.symphony,image:null,mounts:b.inspect.symphony.mounts.map(m=>m.destination==='/config/WORKFLOW.md'?{...m,source:null}:m)});
     require(same(normalize(c.previous),normalize(c.target)) && same(c.previous.inspect['github-auth'],c.target.inspect['github-auth']),'Runtime permission/auth/config shape change requires separate operation');
     await privateFile(c.evidence.path);
-    await deploymentEvidence(c,await json(c.evidence.path),api,h=>readFile(join(dirname(c.evidence.path),'logs',h)));
+    if(fixture) await fixtureEvidence(c,await json(c.evidence.path),docker);
+    else await deploymentEvidence(c,await json(c.evidence.path),api,h=>readFile(join(dirname(c.evidence.path),'logs',h)));
     await match(c.previous);
     const s=await state();
     require(s.admission?.contract===1 && s.admission.configured===true && !s.admission.error,'Admission installation/bootstrap required before automated deployment');
@@ -452,7 +470,7 @@ export async function connected(c,requestFile,preflight=false,{isolatedStop=fals
     },
     replace:async b=>{
       await files(b);
-      if(isolatedStop) await isolation();
+      if(isolatedStop || c.integration) await isolation();
       await docker(['compose','--project-name',c.project,'-f',b.composeFile,'up','-d','--no-build','--pull','never','--no-deps','symphony']);
       if(isolatedStop && b===c.target) {
         // Fixed, explicitly selected integration fault. No hooks, candidate commands or
@@ -471,11 +489,12 @@ export async function connected(c,requestFile,preflight=false,{isolatedStop=fals
           await docker(['exec',all.symphony.Id,'codex','login','status']);
           // Probe the actual engine token-file reader without printing a token/body or using a model turn.
           await docker(['exec',all.symphony.Id,'node','-e',`const fs=require('fs');const x=JSON.parse(fs.readFileSync(process.env.GITHUB_TOKEN_FILE));if(typeof x.token!=='string'||!(Date.parse(x.expires_at)>Date.now()+60000)||x.repository!==process.env.GITHUB_REPO||!['contents','issues','pull_requests'].every(k=>x.permissions?.[k]==='write')||!['read','write'].includes(x.permissions?.checks))process.exit(2);fetch('https://api.github.com/repos/'+process.env.GITHUB_REPO+'/issues?per_page=1',{headers:{Authorization:'Bearer '+x.token},signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:3)).catch(()=>process.exit(4))`]);
-          return {image:b.image,authImage:b.authImage,configHash:b.composeHash,runnerSource:b.runnerSource,paused,at:new Date().toISOString(),checks:['compose','image-config-security','dashboard','state','codex-login','github-read','launch-role-contract','admission']};
+          return {evidenceKind:fixture?'isolated-fixture':'github-merged',githubGate:fixture?'not-exercised':'passed',model:'not-exercised',admission:s.admission,image:b.image,authImage:b.authImage,configHash:b.composeHash,runnerSource:b.runnerSource,paused,at:new Date().toISOString(),checks:['compose','image-config-security','dashboard','state','codex-login','github-read','launch-role-contract','admission']};
         } catch(e) {if(Date.now()>=deadline) throw e;await sleep(Math.min(500,remaining()));}
       } } finally {operationDeadline=null;}
     },
     report:async j=>{
+      if(fixture) return; // Private journals only; never publish a fixture as a production deployment.
       const marker=`<!-- momoflow:deployment:${c.deploymentId} -->`, path=`/repos/${c.repo}/issues/${c.issue}/comments`;
       const body=`${marker}\n배포 ${j.phase}: ${c.deploymentId}\n\n대상 ${c.target.commit} / ${c.target.image} / config ${c.target.composeHash}\n이전 ${c.previous.commit} / ${c.previous.image} / config ${c.previous.composeHash}\n시각 ${j.started} → ${j.updated}; 복구 ${j.phase==='rolled_back'?'검증 완료':j.events.some(x=>x.phase==='rollback_intent')?'시도 (journal 확인)':'없음'}.\n다음 행동: ${j.next}\n${j.reason?'실패: '+j.reason:''}${j.rollbackReason?'\n복구 실패: '+j.rollbackReason:''}\n로컬 journal: ${c.deploymentId}/journal.json; 세부 검사 단계·설정/백업은 operator 저장소에 보존.`;
       const comments=await list(api,path), found=comments.filter(x=>x.body?.includes(marker));require(found.length<=1,'Duplicate deployment report');
