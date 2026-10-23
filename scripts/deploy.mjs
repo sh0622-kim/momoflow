@@ -198,8 +198,8 @@ function securityIdentity(options) {
   return options?.map(x=>x.startsWith('seccomp=') ? profileIdentity(x.slice(8)) : x.replace(/^no-new-privileges:true$/,'no-new-privileges'));
 }
 // Inspect only security/config fields, never Env (which can contain credentials).
-export function runtimeIdentity(x) {
-  return {image:x.Image,user:x.Config.User,entrypoint:x.Config.Entrypoint,command:x.Config.Cmd,
+export function runtimeIdentity(x,{fixture=false}={}) {
+  return {image:x.Image,user:x.Config.User,entrypoint:fixture?(x.Config.Entrypoint ?? null):x.Config.Entrypoint,command:x.Config.Cmd,
     mounts:x.Mounts.map(m=>({type:m.Type,source:m.Type==='volume'?m.Name:m.Source,destination:m.Destination,rw:m.RW})).sort((a,b)=>a.destination.localeCompare(b.destination)),
     privileged:x.HostConfig.Privileged,capAdd:x.HostConfig.CapAdd,capDrop:x.HostConfig.CapDrop,
     securityOpt:securityIdentity(x.HostConfig.SecurityOpt),networkMode:x.HostConfig.NetworkMode,readonly:x.HostConfig.ReadonlyRootfs,
@@ -285,7 +285,7 @@ export function composeIdentity(c,b,doc,images,profiles={}, {fixture=false}={}) 
     }));
     const expected=b.inspect[service];
     // Docker normalizes no-new-privileges:true to no-new-privileges.
-    const identity={image:image.Id,user:s.user ?? base.User,entrypoint:s.entrypoint ?? base.Entrypoint,
+    const identity={image:image.Id,user:s.user ?? base.User,entrypoint:fixture?(s.entrypoint ?? base.Entrypoint ?? null):(s.entrypoint ?? base.Entrypoint),
       command:s.command ?? (s.entrypoint?.length?null:base.Cmd),mounts,privileged:s.privileged ?? false,
       capAdd:s.cap_add?.length?s.cap_add:null,capDrop:s.cap_drop?.length?s.cap_drop:null,
       securityOpt,networkMode:network,readonly:s.read_only ?? false,ports,
@@ -366,6 +366,27 @@ export async function connectedFixture(c,requestFile,preflight=false,{isolatedSt
   require(c.fixtureSource && c.fixtureRepository && c.integration, 'Explicit isolated fixture scope required');
   return connect(c,requestFile,preflight,{isolatedStop,fixture:true});
 }
+// Real fixture HTTP on its isolated loopback; never substitute another container
+// or fall back to the host endpoint when the exact pinned runtime is unavailable.
+export const fixtureHTTPProbe=`fetch('http://127.0.0.1:4000'+process.argv[1],{signal:AbortSignal.timeout(Number(process.argv[2]))}).then(async r=>{process.stdout.write(JSON.stringify({status:r.status,...(process.argv[1]==='/api/v1/state'?{state:await r.json()}: {})}));}).catch(()=>process.exit(1));`;
+export async function fixtureHTTP(c,b,x,docker,path,timeout=5000) {
+  require(c.fixtureMode==='credential-free-v1' && c.repo==='smoke/fixture' && c.integration && [c.previous,c.target].some(v=>same(v,b)),'Explicit fixture HTTP scope required');
+  fixtureRuntime(c,b);
+  require(['/api/v1/state','/'].includes(path) && Number.isInteger(timeout) && timeout>=1 && timeout<=5000,'Fixed fixture HTTP request required');
+  require(/^[a-f0-9]{64}$/.test(x?.Id || ''),'Exact fixture container ID required');
+  const check=async()=>{
+    const live=JSON.parse(await docker(['inspect',x.Id]))[0];
+    require(live?.Id===x.Id && live.State?.Running===true && live.State.Health?.Status==='healthy' && live.Config?.Labels?.['com.docker.compose.project']===c.project && live.Config.Labels['com.docker.compose.service']==='symphony','Fixture HTTP container identity/health mismatch');
+    const normalized={...live,Mounts:await fixtureMountSources(live,b.inspect.symphony,docker)};
+    require(same(runtimeIdentity(normalized,{fixture:true}),b.inspect.symphony),'Fixture HTTP pinned runtime mismatch');
+  };
+  await check();
+  const response=JSON.parse(await docker(['exec',x.Id,'node','-e',fixtureHTTPProbe,path,String(timeout)]));
+  await check();
+  require(Number.isInteger(response.status) && response.status>=200 && response.status<300,'Fixture HTTP response unavailable');
+  if(path==='/api/v1/state') require(response.state && typeof response.state==='object' && !Array.isArray(response.state),'Fixture HTTP state invalid');
+  return response;
+}
 export async function integrationIsolation(c,live,docker,{fixture=false,recovery=false}={}) {
   const inspect=async id=>JSON.parse(await docker(['inspect',id]))[0];
   require(c.integration && /^momoflow-deploy-test-[a-z0-9-]+$/.test(c.project) && c.integration.productionEngine && c.integration.productionProject!==c.project,'Explicit isolated test/production identities required');
@@ -388,7 +409,7 @@ export async function integrationIsolation(c,live,docker,{fixture=false,recovery
       require(e && (m.Type==='bind' || m.Name===e.source),'Failed fixture mount authority mismatch');
       return m.Type==='bind'?{...m,Source:e.source}:m;
     });
-    require(same(runtimeIdentity({...x,Mounts:mounts}),expected),'Failed fixture runtime mismatch');
+    require(same(runtimeIdentity({...x,Mounts:mounts},{fixture:true}),expected),'Failed fixture runtime mismatch');
     recoveryProbes.set(x.Id,x.Image);
     // The helper must prove each inherited bind still equals its pinned host object.
     await fixtureMountSources(x,expected,docker,{recoveryProbes});
@@ -433,7 +454,13 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     }
     require(result.symphony && (fixture || result['github-auth']),'Both project services must already exist'); return result;
   };
-  const state=async()=>{const r=await fetch(`${c.engineURL}/api/v1/state`,{signal:AbortSignal.timeout(Math.min(5000,remaining()))}); require(r.ok,'State API unavailable');return r.json();};
+  const fixtureRequest=async(path,b,all)=>{
+    all ||= await containers();
+    b ||= [c.previous,c.target].find(b=>b.image===all.symphony.Image);
+    require(b,'Unknown fixture HTTP image');
+    return fixtureHTTP(c,b,all.symphony,docker,path,Math.min(5000,remaining()));
+  };
+  const state=async()=>{if(fixture) return (await fixtureRequest('/api/v1/state')).state;const r=await fetch(`${c.engineURL}/api/v1/state`,{signal:AbortSignal.timeout(Math.min(5000,remaining()))}); require(r.ok,'State API unavailable');return r.json();};
   const gate=async paused=>atomic(join(c.gateRoot,'active.json'),{v:1,generation:c.deploymentId,paused},0o644);
   const authorize=async()=>{
     require(same(await readFile(requestFile),requestBytes),'Operator request changed');
@@ -446,12 +473,12 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     } catch(e) {if(e.code!=='ENOENT') throw e;}
   };
   const files=b=>bundleFiles(c,b,docker,{fixture});
-  const observed=async()=>Object.fromEntries(Object.entries(await containers()).map(([k,x])=>[k,{...runtimeIdentity(x),running:x.State.Running,health:x.State.Health?.Status}]));
+  const observed=async()=>Object.fromEntries(Object.entries(await containers()).map(([k,x])=>[k,{...runtimeIdentity(x,{fixture}),running:x.State.Running,health:x.State.Health?.Status}]));
   const match=async b=>{
     const all=await containers();
     for(const service of (fixture?['symphony']:['symphony','github-auth'])) {
       const x=all[service], normalized=fixture?{...x,Mounts:await fixtureMountSources(x,b.inspect[service],docker)}:x;
-      require(same(runtimeIdentity(normalized),b.inspect[service]) && x.State.Running && x.State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
+      require(same(runtimeIdentity(normalized,{fixture}),b.inspect[service]) && x.State.Running && x.State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
     }
     return all;
   };
@@ -532,9 +559,10 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
       try { while(true) {
         try {
           await files(b);
-          const all=await match(b), s=await state(); activeContract(c,b,s,paused);
+          const all=await match(b), s=fixture?(await fixtureRequest('/api/v1/state',b,all)).state:await state(); activeContract(c,b,s,paused);
           if(paused) require(drained(s,c.deploymentId),'Work appeared while fenced');
-          const dashboard=await fetch(c.engineURL,{signal:AbortSignal.timeout(Math.min(5000,remaining()))});require(dashboard.ok,'Dashboard unavailable');
+          if(fixture) await fixtureRequest('/',b,all);
+          else {const dashboard=await fetch(c.engineURL,{signal:AbortSignal.timeout(Math.min(5000,remaining()))});require(dashboard.ok,'Dashboard unavailable');}
           if(fixture) {
             await isolation();
             await fixtureState();
@@ -543,7 +571,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
             // Probe the actual engine token-file reader without printing a token/body or using a model turn.
             await docker(['exec',all.symphony.Id,'node','-e',`const fs=require('fs');const x=JSON.parse(fs.readFileSync(process.env.GITHUB_TOKEN_FILE));if(typeof x.token!=='string'||!(Date.parse(x.expires_at)>Date.now()+60000)||x.repository!==process.env.GITHUB_REPO||!['contents','issues','pull_requests'].every(k=>x.permissions?.[k]==='write')||!['read','write'].includes(x.permissions?.checks))process.exit(2);fetch('https://api.github.com/repos/'+process.env.GITHUB_REPO+'/issues?per_page=1',{headers:{Authorization:'Bearer '+x.token},signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:3)).catch(()=>process.exit(4))`]);
           }
-          return {auth:fixture?'not-exercised':'passed',evidenceKind:fixture?'isolated-fixture':'github-merged',githubGate:fixture?'not-exercised':'passed',model:'not-exercised',admission:s.admission,image:b.image,authImage:b.authImage,configHash:b.composeHash,runnerSource:b.runnerSource,paused,at:new Date().toISOString(),checks:['compose','image-config-security','dashboard','state',...(fixture?['credential-free-state','internal-network']:['codex-login','github-read']),'launch-role-contract','admission']};
+          return {auth:fixture?'not-exercised':'passed',evidenceKind:fixture?'isolated-fixture':'github-merged',githubGate:fixture?'not-exercised':'passed',model:'not-exercised',...(fixture?{httpTransport:'fixture-container-loopback'}:{}),admission:s.admission,image:b.image,authImage:b.authImage,configHash:b.composeHash,runnerSource:b.runnerSource,paused,at:new Date().toISOString(),checks:['compose','image-config-security','dashboard','state',...(fixture?['credential-free-state','internal-network']:['codex-login','github-read']),'launch-role-contract','admission']};
         } catch(e) {if(Date.now()>=deadline) throw e;await sleep(Math.min(500,remaining()));}
       } } finally {operationDeadline=null;}
     },

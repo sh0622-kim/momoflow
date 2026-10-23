@@ -9,7 +9,7 @@ import { randomBytes } from 'node:crypto';
 import { command } from './post-pr-docker.mjs';
 import { digest, json, verifyInstall } from './post-pr.mjs';
 import { fixtureEvidence, fixtureEnvironmentValues, fixtureEmptyState, inspectIsolation, fixtureMode } from './deploy-fixture.mjs';
-import { runtimeIdentity, bundleFiles, composeIdentity, profileIdentity, deploymentConfig, connectedFixture, activeContract, drained } from './deploy.mjs';
+import { runtimeIdentity, bundleFiles, composeIdentity, profileIdentity, deploymentConfig, connectedFixture, activeContract, drained, fixtureHTTP } from './deploy.mjs';
 const need=(v,m)=>{if(!v) throw Object.assign(Error(m),{safeReason:m});};
 const id=()=>randomBytes(32).toString('hex');
 const trustedRoot=resolve(dirname(fileURLToPath(import.meta.url)),'..');
@@ -23,7 +23,7 @@ export function fixtureBundle(c,row,image,workflow,seccomp,composeFile,profileBy
  // Use the same Docker identity normalization as post-start verification, including
  // immutable image defaults. The independent Compose validator checks the result.
  const env=Object.fromEntries((image.Config.Env || []).map(x=>{const i=x.indexOf('=');return [x.slice(0,i),x.slice(i+1)];}));Object.assign(env,fixtureEnvironmentValues);
- const inspect=runtimeIdentity({Image:row.image,Config:{...image.Config,Env:Object.entries(env).map(([k,v])=>k+'='+v)},Mounts:mounts.map(m=>({Type:m.type,Name:m.source==='data'?c.dataVolume:c.codexVolume,Source:m.source,Destination:m.target,RW:!m.read_only})),HostConfig:{Privileged:false,CapAdd:null,CapDrop:['ALL'],SecurityOpt:['no-new-privileges','seccomp='+profileBytes.toString()],NetworkMode:c.project+'_default',ReadonlyRootfs:false,PortBindings:{'4000/tcp':[{HostIp:'127.0.0.1',HostPort:new URL(c.engineURL).port}]}}});
+ const inspect=runtimeIdentity({Image:row.image,Config:{...image.Config,Env:Object.entries(env).map(([k,v])=>k+'='+v)},Mounts:mounts.map(m=>({Type:m.type,Name:m.source==='data'?c.dataVolume:c.codexVolume,Source:m.source,Destination:m.target,RW:!m.read_only})),HostConfig:{Privileged:false,CapAdd:null,CapDrop:['ALL'],SecurityOpt:['no-new-privileges','seccomp='+profileBytes.toString()],NetworkMode:c.project+'_default',ReadonlyRootfs:false,PortBindings:{'4000/tcp':[{HostIp:'127.0.0.1',HostPort:new URL(c.engineURL).port}]}}},{fixture:true});
  return {doc,bundle:{commit:row.commit,image:row.image,runnerSource:row.runnerSource,composeFile,inspect:{symphony:inspect}}};
 }
 // Persist command intent before effects. Never save argv or raw output: even a
@@ -130,10 +130,12 @@ export async function install(o,{checkOnly=false}={}) {return installationAttemp
   try {
    const result=await diagnostic.command('docker',['compose','--project-name',project,'-f',bundles[0].composeFile,'ps','-q','symphony'],{dockerConfig:o.dockerConfig});need(result.exit===0,'Fixture container lookup failed');
    const live=await inspect(result.output.toString().trim());need(live.State.Health?.Status==='healthy','Fixture not healthy');
-   need(same(runtimeIdentity({...live,Mounts:await fixtureMountSources(live,bundles[0].inspect.symphony,docker)}),bundles[0].inspect.symphony),'Installed fixture identity mismatch');
+   need(same(runtimeIdentity({...live,Mounts:await fixtureMountSources(live,bundles[0].inspect.symphony,docker)},{fixture:true}),bundles[0].inspect.symphony),'Installed fixture identity mismatch');
    await inspectIsolation(c,production,[live],docker,{fixture:true});
    need(JSON.parse(await docker(['network','inspect',project+'_default']))[0].Internal===true,'Fixture network must be internal');
-   const response=await fetch(c.engineURL+'/api/v1/state',{signal:AbortSignal.timeout(5000)});need(response.ok,'Fixture state unavailable');const s=await response.json();
+   const scope={...c,previous:bundles[0],target:bundles[1]};
+   const s=(await fixtureHTTP(scope,bundles[0],live,docker,'/api/v1/state')).state;
+   await fixtureHTTP(scope,bundles[0],live,docker,'/');
    activeContract({...c,deploymentId:initial},bundles[0],s,true);need(drained(s,initial),'Initial fixture not drained');
    await docker(['exec',live.Id,'node','-e',fixtureEmptyState]);
    installed=live;
@@ -153,7 +155,7 @@ export async function install(o,{checkOnly=false}={}) {return installationAttemp
  const after=await Promise.all([c.integration.productionEngine,c.integration.productionAuth].map(inspect));
  need(after.every((x,i)=>x.State.Running && x.State.Health?.Status==='healthy' && same(runtimeIdentity(x),runtimeIdentity(production[i]))),'Production identity changed during installation; inspect records');
  await diagnostic.stage('record-installed');
- await put(join(o.root,'installed.json'),{status:'installed-paused',normalDeployments:0,project,at:new Date().toISOString(),sandbox:digest(await readFile(join(o.root,'sandbox.log'))),auth:'not-exercised',model:'not-exercised',githubGate:'not-exercised'});
+ await put(join(o.root,'installed.json'),{status:'installed-paused',normalDeployments:0,project,at:new Date().toISOString(),sandbox:digest(await readFile(join(o.root,'sandbox.log'))),httpTransport:'fixture-container-loopback',auth:'not-exercised',model:'not-exercised',githubGate:'not-exercised'});
  return {plan:join(o.root,'plan.json'),next:`node ${join(trustedRoot,'scripts/deploy-integration.mjs')} ${join(o.root,'plan.json')}`,auth:'not-exercised',model:'not-exercised'};
 });}
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {

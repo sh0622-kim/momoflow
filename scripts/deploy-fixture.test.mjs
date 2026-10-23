@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { command } from './post-pr-docker.mjs';
 import { fixtureSource, fixtureEvidence, fixtureLabels, integrationPlan, isolatedResources } from './deploy-fixture.mjs';
-import { connected, integrationIsolation, replaceConnectedBundle } from './deploy.mjs';
+import { connected, integrationIsolation, replaceConnectedBundle, fixtureHTTP, fixtureHTTPProbe } from './deploy.mjs';
 import { digest } from './post-pr.mjs';
 const sha=n=>String(n).repeat(40),hash=n=>String(n).repeat(64);
 async function localFixture() {
@@ -63,7 +63,7 @@ test('isolation includes production auth key/token sources and overlapping bind 
 
 import { fixtureBundle, pinFixtureBundle, installationAttempt } from './deploy-fixture-install.mjs';
 import { fixtureEnvironmentValues, fixtureEnvironment, fixtureRuntime, inspectIsolation } from './deploy-fixture.mjs';
-import { deploymentConfig, bundleFiles, safeRuntime, deploy, runtimeIdentity } from './deploy.mjs';
+import { deploymentConfig, bundleFiles, safeRuntime, deploy, runtimeIdentity, drained } from './deploy.mjs';
 import { readFile, realpath, symlink } from 'node:fs/promises';
 async function credentialFree() {
  const root=await mkdtemp('/tmp/gh20-credential-free-');
@@ -82,7 +82,7 @@ async function credentialFree() {
  for(const i of [1,2]) {
   const row={image:'sha256:'+hash(i),commit:sha(i),runnerSource:hash(3)};
   // Observed immutable A baseline inherits this harmless Elixir image default.
-  const image={Id:row.image,Config:{User:'momo',Env:['HOME=/home/momo','MIX_ENV=prod','REBAR3_VERSION=3.27.0'],Entrypoint:null,Cmd:['engine']}};images[row.image]=image;
+  const image={Id:row.image,Config:{User:'momo',Env:['HOME=/home/momo','MIX_ENV=prod','REBAR3_VERSION=3.27.0'],Cmd:['engine']}};images[row.image]=image;
   const wf=join(root,'workflow-'+i);await writeFile(wf,'workflow');
   const {doc,bundle}=fixtureBundle(c,row,image,wf,profile,join(root,'compose-'+i+'.json'),await readFile(profile));
   // Exercise normalization of explicit false as well as the generated {} form.
@@ -464,7 +464,7 @@ async function connectedNamespaceFixture() {
  let live,seq=0;const effects=[];
  const make=async b=>{
   const e=b.inspect.symphony,paths=e.mounts.map(m=>m.type==='volume'?volumePaths[m.source]:m.source);
-  const p=await n.make('candidate-'+(++seq),paths,e.mounts.map(m=>m.type));
+  const p=await n.make(hash(++seq),paths,e.mounts.map(m=>m.type));
   const probe=n.probes.get(p.Id);
   for(const [i,m] of p.Mounts.entries()) {
    const expected=e.mounts[i],old=m.Destination;
@@ -475,6 +475,8 @@ async function connectedNamespaceFixture() {
   }
   p.Image=b.image;p.State={Running:true,Health:{Status:'healthy'}};
   p.Config={...x.images[b.image].Config,Env:Object.entries({...Object.fromEntries(x.images[b.image].Config.Env.map(v=>v.split('='))),...fixtureEnvironmentValues}).map(([k,v])=>k+'='+v)};
+  p.Config.Entrypoint=null;
+  p.Config.Labels={'com.docker.compose.project':c.project,'com.docker.compose.service':'symphony'};
   p.HostConfig={Privileged:e.privileged,CapAdd:e.capAdd,CapDrop:e.capDrop,SecurityOpt:e.securityOpt,NetworkMode:e.networkMode,ReadonlyRootfs:e.readonly,PortBindings:e.ports};
   live=p;
  };
@@ -485,6 +487,7 @@ async function connectedNamespaceFixture() {
   if(a[0]==='stop') {live.State.Running=false;return '';}
   if(a[0]==='inspect' && !a.includes('--format')) return JSON.stringify([n.records.get(a[1])]);
   if(a[0]==='exec' && n.records.get(a[1]).State?.Running===false) throw Error('Docker exec: container is not running');
+  if(a[0]==='exec' && a[4]===fixtureHTTPProbe) return JSON.stringify({status:200,...(a[5]==='/api/v1/state'?{state:{admission:{contract:1,configured:true,paused:true,generation:c.deploymentId,running:[],retrying:[],claimed:[],blocked:[],pending_dispatch:false}}}:{})});
   if(a[0]==='run') {
    assert.ok(a.includes('--rm') && a.includes('--read-only'));
    for(const [flag,value] of [['--pull','never'],['--network','none'],['--cap-drop','ALL'],['--security-opt','no-new-privileges'],['--user','1000:1000'],['--entrypoint','node']]) assert.equal(a[a.indexOf(flag)+1],value);
@@ -506,16 +509,51 @@ namespaceTest('connected fixture replacement rolls back and verifies when stoppe
   const state=async()=>({admission:{contract:1,configured:true,paused,generation:x.c.deploymentId,running:[],retrying:[],claimed:[],blocked:[],pending_dispatch:false}});
   const verify=async b=>{
    const p=x.live();const mounts=await fixtureMountSources(p,b.inspect.symphony,x.docker);
-   assert.equal(p.State.Running,true);assert.deepEqual(runtimeIdentity({...p,Mounts:mounts}),b.inspect.symphony);
+   assert.equal(p.State.Running,true);assert.deepEqual(runtimeIdentity({...p,Mounts:mounts},{fixture:true}),b.inspect.symphony);
+   const s=(await fixtureHTTP(x.c,b,p,x.docker,'/api/v1/state')).state;assert.equal(drained(s,x.c.deploymentId),true);
+   await fixtureHTTP(x.c,b,p,x.docker,'/');
    await x.isolation(false);return {auth:'not-exercised',image:p.Image};
   };
   const io={load:async()=>null,authorize:async()=>{},preflight:()=>x.isolation(false),save:async j=>phases.push(j.phase),gate:async p=>{paused=p;},state,now:()=>t,sleep:async()=>{t++;},ownersIdle:async()=>true,backup:async()=>{},preReplace:()=>x.isolation(false),replace:b=>replaceConnectedBundle(x.c,b,{files:x.files,isolation:x.isolation,docker:x.docker,containers:x.containers,isolatedStop:true}),verify,report:async()=>{}};
   const j=await deploy(x.c,io,{fixture:true});
   assert.equal(j.phase,'rolled_back',JSON.stringify(j));assert.ok(phases.includes('rollback_verified'));
   assert.equal(j.rollbackVerification.image,x.c.previous.image);assert.equal(paused,false);
-  assert.ok(x.effects.some(a=>a[0]==='exec' && a[1]==='candidate-2'));
+  assert.ok(x.effects.some(a=>a[0]==='exec' && a[1]===hash(2)));
   assert.ok(x.effects.some(a=>a[0]==='run'));
   assert.equal(x.effects.filter(a=>a[0]==='compose' && a.includes('up')).length,2);
+ } finally {await x.clean();}
+});
+namespaceTest('fixture loopback HTTP verifies exact runtime and rejects stale, stopped, production and changed identities',async()=>{
+ const x=await connectedNamespaceFixture();try {
+  const p=x.live(),baseline=structuredClone(p),b=x.c.previous;
+  assert.equal(b.inspect.symphony.entrypoint,null);
+  const absent={...p,Config:{...p.Config,Entrypoint:undefined}};
+  assert.equal(runtimeIdentity(absent).entrypoint,undefined);assert.equal(runtimeIdentity(p).entrypoint,null);
+  assert.deepEqual(runtimeIdentity(absent,{fixture:true}),runtimeIdentity(p,{fixture:true}));
+  assert.equal((await fixtureHTTP(x.c,b,p,x.docker,'/api/v1/state')).state.admission.generation,x.c.deploymentId);
+  await fixtureHTTP(x.c,b,p,x.docker,'/');
+  for(const change of [
+   p=>{p.Id=hash(9);},p=>{p.State.Running=false;},p=>{p.State.Health.Status='unhealthy';},
+   p=>{p.Config.Labels['com.docker.compose.project']='prod';},p=>{p.Config.Labels['com.docker.compose.service']='github-auth';},
+   p=>{p.Image=x.c.target.image;},p=>{p.Config.Entrypoint=['different'];},p=>{p.Config.Cmd=['different'];},
+   p=>{p.Config.Env.push('OPENAI_API_KEY=private');},p=>{p.HostConfig.Privileged=true;},
+  ]) {
+   Object.assign(p,structuredClone(baseline));change(p);const before=x.effects.length;
+   await assert.rejects(fixtureHTTP(x.c,b,baseline,x.docker,'/api/v1/state'));
+   assert.ok(!x.effects.slice(before).some(a=>a[0]==='exec' && a[4]===fixtureHTTPProbe));
+  }
+  Object.assign(p,structuredClone(baseline));
+  await assert.rejects(fixtureHTTP(x.c,b,{...p,Id:undefined},x.docker,'/'));
+  await assert.rejects(fixtureHTTP(x.c,b,p,x.docker,'/arbitrary'));
+  for(const output of ['null',JSON.stringify({status:503}),JSON.stringify({status:200,state:[]})]) {
+   const docker=async a=>a[0]==='exec' && a[4]===fixtureHTTPProbe?output:x.docker(a);
+   await assert.rejects(fixtureHTTP(x.c,b,p,docker,'/api/v1/state'));
+  }
+  const stopped=async a=>{
+   if(a[0]==='exec' && a[4]===fixtureHTTPProbe) {p.State.Running=false;return JSON.stringify({status:200,state:{}});}
+   return x.docker(a);
+  };
+  await assert.rejects(fixtureHTTP(x.c,b,p,stopped,'/api/v1/state'),/identity\/health/);
  } finally {await x.clean();}
 });
 

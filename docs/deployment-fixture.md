@@ -76,6 +76,16 @@ source에서 가져와 재검사한다. 모델·추론·Fast·권한·예산을 
 재개해도 외부 통신과 trusted launch를 사용할 수 없다. 기존 role/controller/launch 소유권과
 활성 작업·generation 확인은 그대로 수행하며 ledger를 만들거나 초기화하지 않는다.
 
+fixture의 dashboard/state는 고정된 container loopback `http://127.0.0.1:4000`에 실제 HTTP로
+요청한다. 각 요청 전후에 정확한 container ID의 project/service, image, 전체 runtime과
+health를 재검사하고 Docker exec로 요청한다. 다른 container나 host endpoint로 fallback하지
+않는다. internal network에서 host published port가 연결되지 않는 Docker Desktop도 이
+fixture 검사 경로를 사용한다. 설정된 host port는 격리·runtime 계약에 남지만 이 검사가
+host 접속 성공을 의미하지는 않는다. 일반 운영 배포는 기존 host HTTP 검사를 유지한다.
+설치·배포 검증 기록의 `httpTransport: fixture-container-loopback`으로 경로를 구분한다.
+image metadata에서 생략된 entrypoint와 실제 container의 null은 fixture에서만 동일한
+진입점 없음으로 비교하며, 지정된 argv와 command 검사는 유지한다.
+
 ### 기존 A/B 근거 재사용
 
 [PR #17의 외부 근거](https://github.com/sh0622-kim/momoflow/pull/17#issuecomment-6359207440)는
