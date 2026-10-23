@@ -294,3 +294,19 @@ test('role reader rejects symlinks and unreadable existing roles',async()=>{
   fs.symlinkSync(join(root,'workspaces'),join(root,'log/roles',h(1)+'.json'));assert.throws(()=>readRoleRows(fs,root));
  } finally {await rm(root,{recursive:true,force:true});}
 });
+
+test('asynchronous gate acknowledgement waits for matching generation before drain/backup',async()=>{
+ const f=fixture(),state=f.io.state;let acknowledged=false;
+ f.io.state=async()=>{const s=await state();if(!acknowledged) {s.admission.generation=h(8);s.admission.paused=false;}return s;};
+ f.io.sleep=async()=>{assert.ok(!f.calls.includes('backup'));acknowledged=true;};
+ assert.equal((await deploy(f.c,f.io)).phase,'complete');
+ assert.equal(f.journal.pauseAdmission.generation,h(8));assert.equal(f.journal.drainedAdmission.generation,f.c.deploymentId);
+});
+test('unacknowledged generation times out without replacement and leaves admission held',async()=>{
+ const f=fixture(),state=f.io.state;
+ f.io.state=async()=>{const s=await state();s.admission.generation=h(8);return s;};
+ assert.equal((await deploy(f.c,f.io)).phase,'deferred');assert.equal(f.paused,true);assert.ok(!f.calls.includes('backup'));
+});
+
+// Include isolated provenance regressions in the existing host/CI test entrypoint.
+import './deploy-fixture.test.mjs';
