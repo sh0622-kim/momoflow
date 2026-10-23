@@ -1,7 +1,8 @@
 # 에이전트 역할과 실행 정책
 
-상태: Docker 후보에 `MOMOFLOW_ROLE_FLOW=1` 순차 실행 연동을 구현했다. 검증·별도 배포
-이후 새 실행부터 적용한다. 현재 세션이나 실행 중인 엔진을 교체하지 않는다. 모의 계약 검사와
+상태: `MOMOFLOW_ROLE_FLOW=1` 순차 실행 연동과 선택적 PR 이후 연결은 운영 배포됐다.
+관찰된 버전·설치 조건·검증 경계는 [운영 기록](post-pr.md)에 둔다.
+현재 세션이나 실행 중인 엔진을 교체하지 않는다. 모의 계약 검사와
 실제 thread/start 설정 조회는 실제 모델 호출·독립 Astra 코드 리뷰와 구분한다. 해당 PR의
 정확한 head 검증 근거를 확인해야 하며 이 문서는 실운영 통과 증거가 아니다.
 
@@ -43,7 +44,8 @@ flowchart LR
 역할별 실행 기능을 만드는 첫 작업은 기존 단일 에이전트 방식으로 수행할 수 있다.
 다만 실행 전에 구현 역할의 `gpt-6.1-sol` / `medium` / Fast OFF를 명시적으로 적용하고
 유효 설정을 확인해야 한다. 단일 세션의 자체 검토를 독립 Astra 검토로 표시하지 않는다.
-역할별 기능은 검증·배포 후 다음 실행부터 적용하며, 진행 중인 자기 엔진을 교체하지 않는다.
+이는 역할별 기능 도입 당시의 부트스트랩 예외다. 배포된 기능은 새 실행에 적용하며,
+진행 중인 자기 엔진을 교체하지 않는다.
 
 첫 구현에서는 Symphony가 실제로 지원하는 세션 설정·전환 지점을 먼저 확인한다.
 프롬프트의 역할 선언이나 미지원 설정 필드를 추가한 것만으로 모델 전환을 구현했다고
@@ -77,8 +79,9 @@ HEAD/diff를 기록한다. 실패·중단·예산 소진·완료 ledger는 자�
 
 기획·검토·게시는 HEAD/diff 변경을 발견하면 차단한다. 이는 사후 변경 감지이며 읽기 전용
 샌드박스나 GitHub 권한 분리가 아니다. 승인·네트워크 경계는 기존 설정 그대로다.
-실행 중단 시 active session과 in-flight 표시를 보존한다. 자동 checkpoint 복구나 PR 리뷰 후
-자동 재개는 구현하지 않았다. 운영자는 ledger·workpad·PR head와 남은 예산을 확인한 후
+실행 중단 시 active session과 in-flight 표시를 보존한다. 자동 checkpoint 복구나 범용 PR 리뷰
+이벤트 재개는 구현하지 않았다. 선택적 host inbox 수정 재개는 아래 운영 계약에 한정된다.
+운영자는 ledger·workpad·PR head와 남은 예산을 확인한 후
 명시적인 수동 복구를 결정하며 ledger 삭제로 예산을 초기화하지 않는다.
 
 현재 MVP는 로컬 worker 전용이며 SSH role flow를 지원하지 않는다. `max_turns`가 lifetime
@@ -86,9 +89,10 @@ HEAD/diff를 기록한다. 실패·중단·예산 소진·완료 ledger는 자�
 복원한다. 새 이미지에서 role flag를 잘못 지정해 단일 세션으로 돌아가는 것을 정상 role 검증으로
 표시하지 않는다. 역할 모드 미지정의 단일 세션 경로는 upstream 회귀용으로 보존했다.
 
-## GH-7 재개 계약 후보
+## GH-7 선택적 재개 계약
 
-미배포 선택 기능의 [운영 계약](post-pr.md)은 MOMOFLOW_POST_PR_INBOX가 있는 새 실행에만
+배포된 선택 기능의 [운영 계약](post-pr.md)은 MOMOFLOW_POST_PR_INBOX와 read-only inbox,
+운영자 설치 controller가 연결된 새 역할 실행에만
 적용한다. 게시의 repo/issue/PR/base/head를 runner가 검토 snapshot과 전체 Git tree에 대조하고
 await_validation에 머문다. trusted host가 남긴 generation/head/실패 근거가 일치하며 기존
 worker/claim이 해제된 경우에만 Sol 수정→별도 Astra 리뷰→Sol 게시로 복귀한다. 카운터는
