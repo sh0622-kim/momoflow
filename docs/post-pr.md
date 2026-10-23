@@ -1,8 +1,25 @@
-# PR 이후 호스트 조정 후보
+# PR 이후 호스트 조정
 
-상태: GH-7 후보 코드이며 **미배포·실제 호스트 통합 미검증**이다. 현재 운영 WORKFLOW와
-기존 runner는 publish에서 종료한다. 이 문서의 설치는 구현 세션 밖 운영자의 작업이다.
-이 후보를 개발 중인 세션이 자기 엔진이나 컨트롤러를 교체·기동하거나 자기 변경을 승인하지 않는다.
+상태: 2026-10-23 관찰 기준, GH-7/PR #8의 선택 기능은
+`2627ef65324530275eefb81b107607121e18e6ee`로 운영 배포되고 별도 컨트롤러도 설치됐다.
+[운영 배포·설치 기록](https://github.com/sh0622-kim/momoflow/pull/8#issuecomment-6356520917)은
+해당 SHA/tree의 실제 GitHub→Docker 검사(Compose/build/readiness/sandbox 통과,
+역할 계약 74 tests/0 failures, Node 78 tests/0 failures)를 남긴다. 이 계약 검사의 모의 모델/RPC
+경로는 실제 새 runner의 모델 게시·자동 마무리 통합 증거와 구분한다.
+
+새 runner의 publication receipt→await_validation→호스트 exact-head 검증→fresh gates→SHA 병합·
+보존·이슈 종료 및 실제 실패→inbox→모델 수정·재검증은 아직 미검증이다.
+[GH-9](https://github.com/sh0622-kim/momoflow/issues/9)가 새 실행의 통합 대상이며,
+[GH-7 최신 workpad](https://github.com/sh0622-kim/momoflow/issues/7#issuecomment-6355520773)에
+추가2회 승인과 #9의 validate/merge/close 위임, resume=false가 기록돼 있다. 설치 기록 당시의
+승인 대기·hold 상태를 최신 상태로 해석하지 않는다. 자연 실패가 없으면 수정 재개 분기는
+실제 모델 경로 미관찰로 남기며 GH-7 전체 통합 완료로 표시하지 않는다.
+
+기능은 `MOMOFLOW_ROLE_FLOW=1`, `MOMOFLOW_POST_PR_INBOX`, read-only inbox mount와
+운영자가 설치·설정한 별도 controller가 있어야 연결된다. 기본 Compose는 post-PR flag/mount나
+controller를 자동 설치하지 않으며, post-PR flag 없는 runner는 publish→done을 유지한다.
+설치·기동은 구현 세션 밖 운영자의 작업이다. 개발 중인 세션이 자기 엔진이나 컨트롤러를
+교체·기동하거나 자기 변경을 승인하지 않는다.
 
 ## 구현 범위
 
@@ -61,10 +78,10 @@ digest/head/tree와 함께 inbox→runner 수정 프롬프트에 보존한다. �
 1. 운영자는 독립 리뷰가 끝난 컨트롤러 commit을 workspace 밖 별도 checkout에 고정한다.
    이 checkout의 scripts/security/WORKFLOW를 `trustedRoot`로 사용한다. 그 디렉터리와 설정·
    journal·inbox는 후보 에이전트가 쓸 수 없어야 한다. Node 22와 Docker/Compose가 필요하다.
-2. [배포 정책](deployment.md)에 따라 다음 엔진 버전을 별도로 검증·반영한다. 이미 실행 중인
-   GH-7 세션/terminal ledger는 이 후보로 자동 migration하지 않는다. ledger 삭제·done→build
-   수동 편집은 금지한다. GH-7 자체의 exact-head 검증/병합은 기존 위임 범위의 외부 운영자가
-   수행하고 실제 통합 잔여 조건과 구분해 기록한다.
+2. 다른 설치나 다음 엔진 버전은 [배포 정책](deployment.md)에 따라 별도로 검증·반영한다.
+   기존 GH-7 세션/terminal ledger는 자동 migration하지 않는다. ledger 삭제·done→build
+   수동 편집은 금지한다. PR #8 병합·배포와 설치 검사는 위 운영 기록에 보존돼 있으며,
+   새 runner의 실제 통합 잔여 조건과 구분한다.
 3. 다음 새 실행부터 엔진에 `MOMOFLOW_POST_PR_INBOX=/run/momoflow-resume`를 지정하고,
    host inbox(디렉터리 755, 비밀 없는 envelope 644)를 해당 경로에 read-only bind mount한다. Docker socket/키/추가 capability는
    엔진에 주지 않는다. host는 기존 `/data/log/roles`를 읽기만 한다. 이 설정을 기본 compose에
@@ -139,4 +156,4 @@ open이어도 불명확한 요청을 자동 재전송하지 않는다. intent만
 정상 CI 대기는 사람 판단 요청이 아니다. 지정된 사람 리뷰 대기는 needs-review, 권한·예산·
 host 장애는 needs-decision과 PR/같은 workpad의 구체적 이유·다음 행동으로 표시한다.
 ready는 제거하고 재조회한다. 다른 보류/필수 승인 우회 권한은 없으며, 라벨을 지웠다는 사실을
-승인으로 해석하지 않는다. 후보는 자동 deployment나 목표 간 재귀를 수행하지 않는다.
+승인으로 해석하지 않는다. 이 기능은 자동 deployment나 목표 간 재귀를 수행하지 않는다.

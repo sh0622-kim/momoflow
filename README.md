@@ -185,7 +185,7 @@ docker compose down
 [실행 명세](https://github.com/openai/symphony/blob/main/SPEC.md),
 [Elixir 참조 구현](https://github.com/openai/symphony/blob/main/elixir/README.md).
 
-### 역할별 순차 실행 후보 검사
+### 역할별 순차 실행 검사
 
 compose는 새 이미지에 `MOMOFLOW_ROLE_FLOW=1`을 전달한다. 적용 경계와 수동 복구 한계는
 [에이전트 정책](docs/agent-policy.md#순차-실행-mvp의-동작과-한계)에 있다. 실행 중인 엔진을
@@ -218,11 +218,13 @@ MOMOFLOW_IMAGE=gh-2-role-check-symphony sh scripts/smoke.sh
 유효 설정, 후보 HEAD/diff, 각 단계 검사와 게시 PR head를 기록한다. 해당 증거가 없으면
 실제 Astra 기획·독립 검토가 완료됐다고 표시하지 않는다. 검증 실패 시 기본값으로 대체하지 않는다.
 
-### PR 이후 호스트 연결 후보 (GH-7)
+### PR 이후 호스트 연결 (GH-7)
 
-미배포 후보의 설치·exact-head 검증·권한·inbox·journal 복구는
-[PR 이후 호스트 조정](docs/post-pr.md)에 있다. 기본 compose/WORKFLOW는 계속 publish에서
-멈춘다. 운영자는 검토된 별도 host checkout을 고정하고 엔진에는 read-only inbox만 연결한다.
+배포된 선택 기능의 관찰 버전·실제 GitHub→Docker 검사 기록·새 실행의 미검증 통합과
+설치·exact-head 검증·권한·inbox·journal 복구는 [PR 이후 호스트 조정](docs/post-pr.md)에 있다.
+기본 Compose는 post-PR flag/read-only inbox/controller를 자동 설치하지 않으며,
+post-PR flag 없는 runner는 publish→done을 유지한다. 운영자는 검토된 별도 host checkout을
+고정하고 역할 실행 엔진에 MOMOFLOW_POST_PR_INBOX와 read-only inbox를 연결한다.
 이 구현 세션에서 엔진/컨트롤러를 교체하지 않는다. 다음 검사는 GitHub/Docker/model 외부
 효과가 없는 모의 계약 검사이며 실제 운영 통합 근거와 구분한다.
 
