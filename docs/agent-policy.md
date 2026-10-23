@@ -85,3 +85,14 @@ HEAD/diff를 기록한다. 실패·중단·예산 소진·완료 ledger는 자�
 예산을 강제한다고 표현하지 않는다. 이미지 롤백 시 기존 WORKFLOW/compose 묶음을 함께
 복원한다. 새 이미지에서 role flag를 잘못 지정해 단일 세션으로 돌아가는 것을 정상 role 검증으로
 표시하지 않는다. 역할 모드 미지정의 단일 세션 경로는 upstream 회귀용으로 보존했다.
+
+## GH-7 재개 계약 후보
+
+미배포 선택 기능의 [운영 계약](post-pr.md)은 MOMOFLOW_POST_PR_INBOX가 있는 새 실행에만
+적용한다. 게시의 repo/issue/PR/base/head를 runner가 검토 snapshot과 전체 Git tree에 대조하고
+await_validation에 머문다. trusted host가 남긴 generation/head/실패 근거가 일치하며 기존
+worker/claim이 해제된 경우에만 Sol 수정→별도 Astra 리뷰→Sol 게시로 복귀한다. 카운터는
+계속 runner만 소유한다. 3번째 구현 뒤 리뷰/게시는 마칠 수 있지만 4번째 구현은 차단한다.
+consumption과 build count/in_flight는 함께 저장하며 중단 실행·terminal을 자동 초기화하지 않는다.
+기존 ledger의 done/blocked migration은 지원하지 않는다. 모델·Fast·승인·네트워크·동시 이슈
+설정은 바꾸지 않으며 host의 병합 권한과 모델의 기술 리뷰를 분리한다.

@@ -127,3 +127,12 @@ Vincent Driessen의 정식 Git Flow는 장기 유지되는 main/master와 develo
 
 새 스케줄러나 별도 상태 저장소를 먼저 만들지 않는다. 필요가 입증되면
 [로드맵](roadmap.md)에 따라 작은 기능부터 소유한다.
+
+## GH-7 호스트 연결 후보
+
+미배포 후보의 구현·신뢰 경계·명령·복구는 [PR 이후 호스트 조정](post-pr.md)에 있다.
+운영은 여전히 publish에서 멈춘다. 선택적으로 배포한 후보 runner는 검토 snapshot과 전체
+Git tree가 원격 PR head에 일치할 때 await_validation을 기록한다. 신뢰된 host reconcile은
+검사→fresh gate→SHA 병합→보존→같은 workpad/PR 기록→종료를 연결한다. 코드 검사 실패는
+read-only inbox로 동일 PR 수정→별도 리뷰→게시를 요청하며 runner의 공유 예산을 보존한다.
+보호 규칙/merge queue 지원, 기존 terminal migration, successor dispatch는 포함하지 않는다.

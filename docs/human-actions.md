@@ -95,3 +95,12 @@ flowchart TD
 
 참고: [GitHub 이벤트 안내](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows),
 [Webhook 이벤트와 payload](https://docs.github.com/en/webhooks/webhook-events-and-payloads).
+
+## GH-7의 제한된 후보 연결
+
+[호스트 조정 후보](post-pr.md)는 자연어 승인 파서나 범용 이벤트 처리기를 구현하지 않는다.
+운영자 설정에서 위임한 한 repo/issue와 정확한 PR head만 반복 조회한다. 외부 CI 대기와
+필수 사람 리뷰 대기를 구분하고, 권한·예산·host 장애만 구체적 개입 이유로 남긴다.
+App ID가 일치하는 check, 별도 리뷰 세션/tree, 지정한 인간 리뷰어의 현재 head 승인과 권한,
+미해결 thread를 검사한다. labels·PR 본문·동일 개인계정 댓글은 승인 근거가 아니다.
+현재 엔진은 미교체이며 이 후보의 실제 GitHub/Docker/model 통합 증거는 별도 운영 검증 대상이다.
