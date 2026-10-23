@@ -1,6 +1,6 @@
 # 최초 격리 설치와 A/B 준비
 
-상태: GH-16 구현 후보. 아래 명령은 **외부 운영자용**이며 이 코딩 세션에서 실행하지 않았다.
+상태: GH-16 준비 경로와 GH-18 fixture 전용 인증 분리 후보. 아래 명령은 **외부 운영자용**이며 이 코딩 세션에서 실행하지 않았다.
 일반 배포의 GitHub 자격 검사는 [배포 정책](deployment.md)을 그대로 따른다.
 `8dc068b7cd837d734a406c48e0ca13fafe48fc84`는 정책 변경을 포함하므로 일반 배포 후보로
 승격하지 않는다. admission이 없는 운영 버전에서 이 버전으로 넘어가는 작업은 별도 설치다.
@@ -57,191 +57,167 @@ provenance에는 source, A/B commit/tree/runner 바이트 hash/image ID와 build
 검사 결과·hash만 남긴다. image label은 서명이 아니다. 신뢰 근거는 외부 운영자 소유 파일과
 검토된 preparation 실행이다. provenance 파일을 수기로 성공 근거로 만들지 않는다.
 
-## 최초 설치 (배포 성공 횟수에 포함하지 않음)
+## 인증 없는 최초 설치와 정상2·복구1 (GH-18 후보)
 
-운영자는 `momoflow-deploy-test-...` project, 아래에서 새로 만들 외부 named data/Codex/token volume,
-별도 gate/launch/inbox/state/deployment 경로와 loopback port를 준비한다. 운영 data snapshot을
-마운트하거나 ledger/count를 초기화하지 않는다. 시작 gate는 `{v:1,generation:64hex,paused:true}`,
-launch manifest는 absent다. 설치되는 WORKFLOW/권한/모델/예산은 검토된 원본을 유지한다.
-read-only launch/inbox/admission, 실제 seccomp와 auth key custody는 배포 bundle 계약을 따른다.
+이 변경은 #18에서 명시 승인한 **fixture 전용 검증 설계 변경**이다. 별도 리뷰와 고정
+controller 설치 이후 사용한다. 일반 운영 배포의 Codex login, token-file GitHub 읽기,
+두 서비스와 GitHub 자격 gate는 유지한다. 운영 배포·일반 자동 승격을 승인하지 않는다.
 
-**인증은 fixture로 대체하지 않는다.** 현재 하네스는 기존 Codex login 및 token-file GitHub 읽기
-검사를 그대로 실행한다. 별도로 승인·준비된 test Codex 인증과 test GitHub App/key custody가
-없으면 설치/실행을 중단하고 필요한 권한을 보고한다. 운영 키·token·Codex 인증을 복사하거나
-공유하지 않는다. preparation/smoke에는 인증이 필요 없다. 모델 turn을 보내지 않는다.
+| 경계 | fixture에서 실행하는 검사 | 미검사 |
+| --- | --- | --- |
+| Docker | 실제 A/B image·security·health·dashboard/state, 최초 설치의 실제 sandbox | 운영 배포 |
+| 교체/복구 | 동일 pause→drain→preserve→replace→verify→resume 및 실패 시 rollback | 실제 모델 작업 |
+| 실행 차단 | internal network, 고정 비자격 sentinel, 빈 Codex/launch/inbox, absent manifest, 빈 role ledger | GitHub dispatch·merge/review gate |
+| 인증 | 후보에 인증 mount/service/tokenFile 없음; 새 로그인·새 App 불필요 | 후보 Codex login, 실제 GitHub token 읽기·갱신 |
 
-먼저 새 자원 이름을 정한다. 같은 shell에서 아래 변수들을 유지하고, 세 이름을 A/B 양쪽
-Compose의 external volume name 및 request의 dataVolume에 반영한다. 이미지 ID는 preparation의
-A 산출물이며 이후 초기화 컨테이너도 이 고정 이미지만 사용한다.
+sentinel `smoke-not-a-credential`은 기존 smoke와 같은 비자격 값이며 실인증으로 기록하지
+않는다. `GITHUB_REPO=smoke/fixture`도 고정한다. `WORKFLOW.md`와 seccomp 바이트는 fixture
+source에서 가져와 재검사한다. 모델·추론·Fast·권한·예산을 변경하지 않는다. 후보가 접수를
+재개해도 외부 통신과 trusted launch를 사용할 수 없다. 기존 role/controller/launch 소유권과
+활성 작업·generation 확인은 그대로 수행하며 ledger를 만들거나 초기화하지 않는다.
 
-```sh
-set -eu
-fixture_nonce=$(node -e 'process.stdout.write(require("crypto").randomBytes(16).toString("hex"))')
-fixture_project="momoflow-deploy-test-$fixture_nonce"
-fixture_data="${fixture_project}-data"
-fixture_codex="${fixture_project}-codex"
-fixture_token="${fixture_project}-token"
-fixture_image=$(cat /operator/fixture-evidence/image-0.id)
-```
+### 기존 A/B 근거 재사용
 
-볼륨 생성·초기화와 최초 `compose up` 전에 운영 engine **및 github-auth**의 inspect를 메모리에서 읽고,
-계획된 A의 두 `inspect`에 있는 mount를 `isolatedResources()`와 대조한다. 예:
+[PR #17의 외부 근거](https://github.com/sh0622-kim/momoflow/pull/17#issuecomment-6359207440)는
+A `2efb7cd8a3f8750f8c37821cd36df34fed8317bc`,
+B `61bc90707b27a2dd80917eff44d119bd2496c465`, source
+`8dc068b7cd837d734a406c48e0ca13fafe48fc84`에서 build/readiness/실 sandbox/모의 role89 통과를
+보고했다. provenance digest는 `5e9bf1c860599044ccb7e9a4e096207fcadc1ae8bfd30166cef19d0f7bfa7684`다.
+이 댓글은 전체 교체·복구나 실인증 성공 근거가 아니다.
 
-```js
-import {isolatedResources} from '/operator/momoflow/scripts/deploy-fixture.mjs';
-// production: 두 실제 Docker inspect 객체 (원문 Env/키는 출력하지 않는다).
-// request: 아래의 운영자 고정 A→B request, previous는 설치할 A bundle.
-const prospective=Object.values(request.previous.inspect).map(x=>({
-  Mounts:x.mounts.map(m=>({Type:m.type,Name:m.source,Source:m.source})),
-  HostConfig:{PortBindings:x.ports}
-}));
-isolatedResources(request,production,prospective);
-```
+기존 호스트의 `.data/gh16-integration/evidence-helper/provenance.json` 및 같은 디렉터리의
+`logs/`, A/B image, 두 commit이 들어 있는 로컬 Git 저장소를 보존한다. 아래 installer는
+재빌드 없이 parent/marker/tree/runner source, immutable image ID/label, build/smoke log hash를
+다시 검사한다. 하나라도 없거나 다르면 중단한다. 수기로 provenance를 만들지 않는다.
+재사용 불가할 때에만 앞 절의 prepare로 새 근거를 만든다. 새 controller의 검사 결과와
+기존 image smoke의 소스/시점은 구분한다.
 
-bind source는 부모/자식 경로도 겹치면 거부한다. read-only 설정/키도 이 실험에서는 공유하지
-않는다. named volume은 이름을 비교한다. 서로 다른 volume이 같은 외부 저장소를 alias하는지,
-bind symlink가 같은 경로를 가리키는지도 운영자가 Docker volume inspect/canonical path로
-확인한다. 다른 daemon에서 얻은 inspect로 이 검사를 대신하지 않는다.
+### 호스트에서 실행
 
-### 빈 볼륨 초기화와 설치 전 검사
+검토된 새 controller의 **clean 고정 checkout**을 `/operator/momoflow`에 설치한다.
+이 도구는 컨테이너 내부 실행을 거부한다. host UID1000과 Docker 접근이 필요하다. Docker
+Desktop의 daemon volume backing path는 호스트 realpath가 아닐 수 있으므로 named volume은
+`volume inspect`의 driver/options/Mountpoint로 비교한다. local 기본 volume만 허용한다.
+경로가 불확실하거나 alias/plugin 옵션이 있으면 권한·검사를 넓히지 않고 중단한다.
 
-위 격리 검사를 통과한 **이번 실험의 새 allowlist 세 볼륨에만** 다음 명령을 실행한다.
-`volume.nocopy:true`를 유지하므로 Dockerfile의 소유권/디렉터리가 빈 mount로 복사되지 않는다.
-명령은 기본 local driver와 옵션 없는 새 볼륨을 만들며, 기존 이름이 하나라도 있으면 중단한다.
-실패한 명령을 기존 볼륨에 재실행하거나 운영 볼륨을 인자로 바꾸지 않는다. 부분 생성 자원은
-이름·inspect를 보존하여 조사하고 해당 실험 allowlist로만 정리한다.
-
-초기화 helper는 네트워크·인증·host bind 없이 빈 볼륨에 디렉터리와 소유권만 준비한다.
-일회용 UID 0과 CHOWN capability는 이 준비 단계에만 쓰며 engine/auth 런타임 설정은
-계속 UID/GID 1000, `cap_drop:ALL`, 기존 seccomp와 `no-new-privileges`를 유지한다.
-이미지 USER도 먼저 확인한다. 두 번째 helper는 UID/GID 1000, capability 없이 실제 쓰기를
-검사한다. 검사 로그에는 소유권·모드·성공 여부만 남기고 인증 내용은 남기지 않는다.
-
-```sh
-# Run in the same shell, after the mount/alias comparison above, with the variables above.
-set -eu
-case "$fixture_image" in sha256:*) ;; *) exit 1 ;; esac
-test "$(docker image inspect --format '{{.Config.User}}' "$fixture_image")" = momo
-# Verify daemon access before checking absence; never reuse an existing named volume.
-docker info >/dev/null
-for fixture_volume in "$fixture_data" "$fixture_codex" "$fixture_token"; do
-  if docker volume inspect "$fixture_volume" >/dev/null 2>&1; then
-    echo 'Refusing existing fixture volume' >&2
-    exit 1
-  fi
-done
-for fixture_volume in "$fixture_data" "$fixture_codex" "$fixture_token"; do
-  docker volume create --driver local --label "momoflow.fixture=$fixture_nonce" "$fixture_volume"
-done
-# Preserve this metadata privately with the exact allowlist. Driver=local, Options=null/{}.
-docker volume inspect "$fixture_data" "$fixture_codex" "$fixture_token"
-docker run --rm --pull never --network none --read-only --user 0:0 \
-  --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges:true \
-  --mount "type=volume,src=$fixture_data,dst=/fixture-data,volume-nocopy" \
-  --mount "type=volume,src=$fixture_codex,dst=/fixture-codex,volume-nocopy" \
-  --mount "type=volume,src=$fixture_token,dst=/fixture-token,volume-nocopy" \
-  --entrypoint node "$fixture_image" -e '
-const fs=require("fs");
-const roots=["/fixture-data","/fixture-codex","/fixture-token"];
-// Check ALL roots before writing; never chmod/chown existing data or authentication.
-for(const p of roots) {
-  const s=fs.lstatSync(p);
-  if(!s.isDirectory() || s.uid!==0 || s.gid!==0 || fs.readdirSync(p).length)
-    throw Error("Expected fresh empty root-owned volume");
-}
-for(const p of ["/fixture-data/log","/fixture-data/workspaces"])
-  fs.mkdirSync(p,{mode:0o700});
-// Children first: no recursive chown, symlink traversal or ledger/count creation.
-for(const p of ["/fixture-data/log","/fixture-data/workspaces",...roots]) {
-  fs.chmodSync(p,0o700); fs.chownSync(p,1000,1000);
-  console.log(p+" uid=1000 gid=1000 mode=700");
-}'
-docker run --rm --pull never --network none --read-only --user 1000:1000 \
-  --cap-drop ALL --security-opt no-new-privileges:true \
-  --mount "type=volume,src=$fixture_data,dst=/fixture-data,volume-nocopy" \
-  --mount "type=volume,src=$fixture_codex,dst=/fixture-codex,volume-nocopy" \
-  --mount "type=volume,src=$fixture_token,dst=/fixture-token,volume-nocopy" \
-  --entrypoint node "$fixture_image" -e '
-const fs=require("fs");
-for(const p of ["/fixture-data","/fixture-data/log","/fixture-data/workspaces",
-                "/fixture-codex","/fixture-token"]) {
-  const s=fs.lstatSync(p);
-  if(!s.isDirectory() || s.uid!==1000 || s.gid!==1000 || (s.mode&0o777)!==0o700)
-    throw Error("Invalid fixture ownership/mode/layout");
-  const probe=p+"/.installation-write-probe";
-  fs.writeFileSync(probe,"probe",{flag:"wx",mode:0o600}); fs.unlinkSync(probe);
-}
-if(fs.existsSync("/fixture-data/log/roles")) throw Error("Unexpected role state");
-console.log("UID1000 fixture layout/write preflight passed; roles absent");'
-```
-
-이 명령의 성공은 파일시스템 준비만 증명한다. 이후 승인된 독립 test 인증을 빈 Codex/token
-볼륨에 별도로 설치하고 auth key는 별도 test source만 read-only로 연결한다. helper에 키나
-토큰을 넣지 않는다. gate/launch/inbox 등 host bind 경로도 UID1000이 필요한 접근을 할 수
-있는지 확인하며, gate 파일의 regular-file/소유권/모드는 기존 계약을 따른다.
-그 뒤에만 A bundle을 설치하고 실제 image/config/health, paused gate ack, role/manifest
-계약을 확인한다. live data에서 기존 `readRoleRows()`가 빈 목록을 반환함을 확인한다
-(`/data/log`, `/data/workspaces`는 존재, `/data/log/roles`는 아직 없음). 초기 설치에 실패하면
-일반 배포/정상 횟수로 기록하지 않는다. 최초 설치를 `deploy.mjs`의 예외 플래그로 수행하지 않는다.
-
-## 정상 2회와 실패 복구 1회
-
-[일반 request 필드와 bundle 형식](deployment.md#운영자-요청과-후보-묶음)을 사용한다.
-각 WORKFLOW는 서로 다른 보존 파일에 두고 auth/image/runtime shape는 동일하게 유지한다.
-각 요청은 operator 소유 canonical regular JSON이며 group/world write를 허용하지 않는다.
-
-fixture 요청에 추가할 필드:
+아래 JSON 하나만 준비한다. 실제 absolute/canonical 경로·기존 운영 container ID/project와
+비어 있는 loopback port를 넣는다. `root`는 존재하지 않아야 하며 부모는 operator 소유,
+canonical, group/world write 금지여야 한다. request/bundle을 수기로 구성하지 않는다.
 
 ```json
 {
-  "fixtureSource":"8dc068b7cd837d734a406c48e0ca13fafe48fc84",
-  "fixtureRepository":"/operator/fixture-A",
+  "root":"/operator/gh18-isolated",
+  "port":4408,
+  "evidence":"/operator/gh16-integration/evidence-helper/provenance.json",
+  "repository":"/operator/fixture-A",
   "integration":{
-    "productionEngine":"<운영 engine 컨테이너 ID>",
-    "productionAuth":"<운영 github-auth 컨테이너 ID>",
-    "productionProject":"<운영 project>"
+    "productionEngine":"<기존 운영 symphony container ID>",
+    "productionAuth":"<기존 운영 github-auth container ID>",
+    "productionProject":"<기존 운영 Compose project>"
   }
 }
 ```
 
-`evidence`는 prepare의 결과다. `controllerVersion`은 설치한 **새 controller commit**이며
-fixtureSource와 다를 수 있다. `validationOrigin` 필드는 기존 request 형식상 필요하지만
-fixture를 실제 host validation receipt로 만들지 않는다. `authority.deploy:true`는 이 격리
-실험의 효과만 허용하며 운영 배포 권한이 아니다. 세 요청의 모든 bundle/manifest/control
-roots는 같다. request1=A→B, request2=B→A, request3=A→B이고 deploymentId는 각각 새 64hex다.
-
-```json
-{"kind":"fixture","requests":["/operator/test/one.json","/operator/test/two.json","/operator/test/rollback.json"]}
+```sh
+# UID1000의 신뢰된 host shell. config 파일은 chmod 600.
+node /operator/momoflow/scripts/deploy-fixture-install.mjs /operator/install-gh18.json
+# 성공 출력의 plan 경로 사용. 설치 자체는 정상 배포 횟수 0.
+node /operator/momoflow/scripts/deploy-integration.mjs /operator/gh18-isolated/plan.json
 ```
+
+Docker 설정 디렉터리가 별도라면 JSON에 `dockerConfig` absolute path를 추가할 수 있다.
+이 설정은 trusted host Docker CLI에만 사용하며 후보에 mount/env로 전달하지 않는다.
+
+installer는 효과 전에 source/images/logs, 운영 mount·port와 prospective control 경로를
+대조한다. 새 무작위 `momoflow-deploy-test-...` project와 data/Codex local volume 2개만
+생성한다. token volume, auth service, 개인 키 mount는 없다. 빈 root-owned volume 두 개를
+모두 검사한 후 network none·read-only·CHOWN만 있는 일회용 helper가 UID1000/mode700과
+`/data/log`, `/data/workspaces`를 준비한다. 기존 volume이나 운영 인증을 수정하지 않는다.
+후보 런타임은 비루트·cap_drop ALL·no-new-privileges·기존 seccomp를 유지한다.
+
+고정 source의 WORKFLOW 두 파일, seccomp, Compose 두 파일, expected runtime identity,
+고유 ID의 A→B/B→A/A→B 요청 3개와 plan을 자동 생성한다. single-service A를 최초 설치해
+paused ack/role/manifest, exact image/security/health와 실제 sandbox를 검사한다.
+sandbox probe는 일회용 `/tmp` CODEX_HOME을 사용하여 빈 인증 볼륨에 상태를 쓰지 않는다.
+`installed.json`은 최초 설치 성공만 뜻한다. image labels와 Compose가 현재 도구와
+호환되지 않으면 설치를 중단하며 과거 smoke를 현재 설치 성공으로 표시하지 않는다.
+installer는 고정 Compose 표면을 먼저 검사하고 실제 `compose config --format json`의
+결과를 다시 검사·저장한 후 해시를 고정한다. compose-go가 false 기본값을 생략한
+`bind: {}`는 fixture에서만 허용한다. host path 자동 생성(`create_host_path: true`)은
+허용하지 않으며 일반 배포의 기존 bind 검사는 유지한다.
+
+integration은 세 요청 전체의 chain/ID/파일·양방향 근거를 **첫 pause 전에** 검사한다.
+이후 기존 live previous와 각 배포 사전 검사를 재확인한다. 세 번째 후보만 의도적으로
+stop해 동일 verify timeout/rollback 경로를 통과시킨다. 예상 private journal phase는
+`complete`, `complete`, `rolled_back`이며 auth/model/githubGate는 모두 `not-exercised`다.
+일반 CLI에는 fixture/skip-auth/fault 옵션이 없다.
+
+새 root 생성 이후 실패하면 `installation.json`, 생성된 파일·자원·journal을 보존한다.
+`installation.json`은 원자적으로 갱신되는 private(mode600) 설치 journal이다.
+현재 stage와 `preparing`/`failed`/`installed-paused`, 명령별 `attempted`/`completed`/
+`failed`/`spawn-failed`, 종료값, 출력의 해시·바이트 수를 남긴다. 명령 시도는 실행 전에
+기록하므로 중단 후 `attempted`만 남으면 실제 효과를 확인해야 한다. raw inspect/Env,
+명령 인자와 출력 원문은 저장하지 않는다. stderr는 안전한 검사 이유·stage·종료값과
+journal 경로를 알린다. root 생성 전 실패는 journal이 없음을 명시하며 기존 root의
+기록을 덮어쓰지 않는다. 성공 시에도 `installed-paused`는 최초 설치이고 정상 배포 횟수는 0이다.
+같은 root에 installer나 전체 integration을 자동 재실행하지 않는다. 이미 실행된 요청의
+재호출은 기존 단일 요청 상태 머신 규칙을 따르며 새 ID로 실패를 숨기지 않는다.
+복구가 불명확하거나 작업이 활성인 경우 gate를 held로 두고 외부 운영자가 실제 상태를
+조사한다. 현재 도구에는 임의 restart/초기화·강제 정리 기능이 없다.
+
+### 기존 인증 상태가 필요한 경우의 별도 최소 읽기
+
+fixture 실행을 위한 새 로그인·App·인증 복제는 필요 없다. 기존 운영 인증 상태를
+확인해야 할 별도 이유가 있을 때에만 trusted host에서 **이미 운영 중인 서비스**를
+읽는다. 아래 probe는 키·토큰을 출력/복사하지 않고 기존 auth 서비스의 토큰 파일과
+읽기 API 한 번만 사용한다. 후보에는 파일·env·키·Codex 인증을 전달하지 않는다.
 
 ```sh
-node /operator/momoflow/scripts/deploy-integration.mjs /operator/test/plan.json
+# 위 config의 기존 운영 container ID를 production_engine/production_auth 변수로 지정한다.
+docker exec "$production_engine" codex login status
+docker exec "$production_auth" node -e '
+const fs=require("fs");
+const x=JSON.parse(fs.readFileSync("/run/momoflow-auth/token.json"));
+if(typeof x.token!=="string" || !(Date.parse(x.expires_at)>Date.now()+60000) ||
+   x.repository!==process.env.GITHUB_REPO) process.exit(2);
+fetch("https://api.github.com/repos/"+process.env.GITHUB_REPO+"/issues?per_page=1",{
+ headers:{Authorization:"Bearer "+x.token},signal:AbortSignal.timeout(5000)
+}).then(r=>process.exit(r.ok?0:3)).catch(()=>process.exit(4));'
 ```
 
-runner는 첫 효과 전에 전체 chain, 고유 ID, 두 방향 provenance/로그/image label과 bundle
-파일을 검사한다. 각 실제 배포 전에는 해당 live previous, 일반 runtime/권한/인증/계약 검사를
-다시 수행한다. 세 번째 요청에서만 격리 target engine을 stop하여 기존 verify timeout과 rollback을
-거친다. 일반 CLI에는 fault injection 옵션이 없다. 중간 실패 시 journal을 보존하고 gate를
-held로 둔다. uncertain effect를 자동 재실행하거나 ID를 바꿔 재시도하지 않는다.
+기존 호스트의 이 결과도 **운영 기존 인증 최소 읽기**로 별도 기록한다. 후보 인증·갱신,
+새 Codex 세션, 실제 모델, 일반 배포 gate 통과로 확대하지 않는다. token 갱신/키 서명 자체를
+이 probe가 검증하지 않으며 토큰이 없거나 만료됐다면 미검사/실패를 그대로 기록한다.
 
-## 증거와 정리
+## 증거, 작업 보호와 정리
 
 | 검사 | 보존할 실제 근거 |
 | --- | --- |
-| 설치/격리 | source/controller SHA, A/B parent/tree/build labels/image ID, config/file hashes, 운영 및 test runtimeIdentity, volume driver/옵션·source 분리, 새 볼륨 allowlist/초기화 UID·mode 및 UID1000 쓰기/layout 검사 로그, 포트 |
-| gate/작업 보호 | 각 deploymentId와 pauseAdmission/drainedAdmission, target/rollback/resumed admission ack, active 작업이 있는 동안 교체되지 않은 시간별 관찰, drain/timeout 결과 |
-| 교체/검증 | 세 journal `complete`, `complete`, `rolled_back`; exact image/config/security/health, readiness/dashboard, 실제 sandbox 로그 hash, 실제 auth 종류/결과 |
-| 복구 | 세 번째 target stop 시각·ID, 이전 A image/config/인증/접수 재개, ledger/count/manifest 보존 비교 |
-| 경계 | GitHub merge/review gate 미실행, 실제 GitHub token 읽기와 준비 provenance 구분, 실제 sandbox와 모의 worker 구분, 추가 실제 모델 turn 미실행 |
-| 정리 | 운영 identity/volume/port/ledger 불변 재대조; test 자원 명시 allowlist와 삭제 결과 |
+| 준비/설치 | 기존 provenance/source와 새 controller SHA, A/B image IDs, 설치 JSON, config/file hashes, sandbox.log/hash, UID1000/layout 결과, mount/volume driver/options와 독립 port |
+| 교체/복구 | 각 deploymentId의 event/journal, pause/drained/target/rollback/resumed admission과 config/image/security/health |
+| 작업 보호 | stale generation·active/in_flight/미완료 ledger·controller/launch 소유권 중 실제로 검사한 항목과 모의 항목을 구분 |
+| 운영 불변 | 설치 전 production runtimeIdentity, integration 전후 서비스 ID/runtime/role ledger 파일 hash snapshots; Env/credential 원문 없음 |
+| 인증 경계 | 후보 auth/model/GitHub gate 미검사, 별도 기존 호스트 probe 실행 여부와 종료값 |
+| 정리 | evidence 보존 위치, 정확한 test project/container/network/두 volume/control root allowlist와 삭제 결과 |
 
-단순 idle 성공으로 활성 작업 보호 실험을 대신하지 않는다. 모의 worker로 작업 보호를
-확인하면 fixture 검증으로 표시한다. 실제 모델 실행이 필요하면 별도 승인 범위를 확인한다.
-실험 전후 운영 identity는 Env 원문 없이 `runtimeIdentity()`로 보존한다.
-정리는 보존된 journal/provenance/log와 필요한 rollback artifact를 먼저 안전한 위치에 보존한 뒤
-정확한 test container/project/volume/network/control 경로 allowlist만 대상으로 한다.
-`docker system prune`, 운영 compose down, 운영 인증 삭제는 사용하지 않는다.
-복구 불명확/작업 활성 상태이면 강제로 정리하지 않는다. 정리 실패 역시 미완료로 기록한다.
+integration은 운영 engine/auth의 identity와 role ledger hash를 읽어
+`deploymentRoot/integration-before.json`, `integration-after.json`으로 보존·비교한다.
+운영에서 별도 작업이 진행돼 ledger가 달라져도 이를 자동 무시하지 않고 차이를 조사한다.
+최초 설치 이후 운영 변경이 없다는 판정과 active worker 보호는 별도다. 단순 idle 정상2·복구1을
+활성 모델 작업 보호 성공으로 표현하지 않는다. 실제 모델 호출 없이 실행할 수 있는
+controller 소유권 실험은 첫 요청 전 별도로 `stateRoot/controller.lock`을 배타 획득한 채
+`connectedFixture` preflight가 거부되는지 확인한다. 잠금 해제는 그 소유 프로세스만 수행한다.
+모의 worker/ledger 계약 결과는 로컬 회귀 검사로 표시하고 실제 운영 ledger를 편집하지 않는다.
 
-현재 구현 workspace에는 Docker CLI/socket이 없다. 실제 정상2/복구1, 활성 작업 보호와
-격리 자원 정리의 실측 결과는 외부 검증 전까지 **미실행**이다. 이 문서는 성공 영수증이 아니다.
+정리는 먼저 root 전체와 journal/image backup/provenance/log를 별도 보존한 뒤 수행한다.
+`installation.json`의 project/두 volume, 생성된 Compose/requests의 경로만 allowlist로 사용한다.
+운영 identity와 test gate/owners/ledger를 확인하고 test project의 symphony만 중지·제거한 뒤
+해당 project network와 해당 두 volume을 제거한다. 마지막으로 정확한 test root만 제거한다.
+실패·활성 작업·복구 불명확 시 자동 강제 정리하지 않는다. `docker system prune`, 운영
+compose down, 운영 인증·ledger 삭제는 금지한다. 정리 결과도 #16에 남긴다.
+
+이 코딩 환경에는 Docker CLI/socket이 없다. 실제 Compose config/build, installer/UID helper,
+readiness/sandbox·정상2/복구1·활성 작업 보호·운영 불변·allowlist 정리는 **미실행**이다.
+새로운 유료 모델 실행이나 외부 자원은 만들지 않았다. #18 구현 PR의 별도 리뷰/검사와
+#16의 실험 완료는 구분한다. #16은 실제 정상2·복구1과 나머지 조건을 확인하기 전 닫지 않으며,
+기존 2/3 및 terminal 기록은 보존하고 재실행 라벨이나 예산 초기화를 하지 않는다.

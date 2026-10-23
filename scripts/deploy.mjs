@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { atomic, digest, json, receipt, validation, list, github, verifyInstall } from './post-pr.mjs';
 import { command } from './post-pr-docker.mjs';
-import { fixtureEvidence, isolatedResources } from './deploy-fixture.mjs';
+import { fixtureEvidence, inspectIsolation, fixtureRuntime, fixtureEnvironment, fixtureEmptyState } from './deploy-fixture.mjs';
 export class DeploymentError extends Error {}
 const require = (v, m) => { if (!v) throw new DeploymentError(m); };
 const reason = e => e instanceof DeploymentError ? e.message : /^GitHub (GET|POST|PATCH) \/[^\s]+: [0-9]{3}$/.test(e.message || '') ? e.message : `External I/O/auth/config parsing failed${/^E[A-Z0-9_]+$/.test(e.code || '') ? ' ('+e.code+')' : ''}; inspect operator logs privately`;
@@ -17,20 +17,26 @@ const iid = x => /^sha256:[a-f0-9]{64}$/.test(x || '');
 const same = isDeepStrictEqual;
 const optional = async p => { try { return await json(p); } catch(e) { if(e.code === 'ENOENT') return null; throw e; } };
 const sleep = ms => new Promise(r => setTimeout(r,ms));
-export function deploymentConfig(c) {
+export function deploymentConfig(c,{fixture=false}={}) {
+  require(fixture ? c.fixtureMode==='credential-free-v1' && c.fixtureSource && c.fixtureRepository && c.integration && c.repo==='smoke/fixture' && same(c.manifest,{status:'absent'}) && c.tokenFile===undefined : !c.fixtureMode && !c.fixtureSource && !c.fixtureRepository, 'Fixture requests require the separate isolated integration entrypoint');
   require(hex(c.deploymentId) && /^[\w.-]+\/[\w.-]+$/.test(c.repo) && /^[1-9][0-9]*$/.test(c.issue), 'Explicit deployment scope required');
   require(c.authority?.deploy === true && c.hold === false && c.compatibility === 'unchanged-data' && c.exceptional === false, 'Explicit deployment authority, unchanged data and ordinary scope required; exceptional changes need separate handling');
   require(/^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/.test(c.dataVolume || ''),'Explicit data named volume required');
   require(/^[a-z0-9][a-z0-9_-]+$/.test(c.project), 'Explicit Compose project required');
-  for(const k of ['stateRoot','deploymentRoot','gateRoot','trustedRoot','tokenFile','inboxRoot','ledgerRoot']) require(typeof c[k] === 'string' && resolve(c[k]) === c[k], `Absolute operator path required: ${k}`);
+  for(const k of ['stateRoot','deploymentRoot','gateRoot','trustedRoot',...(fixture?['launchRoot']:['tokenFile']),'inboxRoot','ledgerRoot']) require(typeof c[k] === 'string' && resolve(c[k]) === c[k], `Absolute operator path required: ${k}`);
   require(Number.isInteger(c.drainMs) && c.drainMs >= 1 && c.drainMs <= 3600000 && Number.isInteger(c.verifyMs) && c.verifyMs >= 1 && c.verifyMs <= 300000, 'Bounded drain/verification deadlines required');
   require(/^http:\/\/(127\.0\.0\.1|host\.docker\.internal):[0-9]+$/.test(c.engineURL), 'Independent host-published endpoint required');
   require(sha(c.controllerVersion) && sha(c.validationOrigin), 'Pinned installer/validator versions required');
   for(const b of [c.target,c.previous]) {
-    require(b && sha(b.commit) && iid(b.image) && iid(b.authImage) && hex(b.runnerSource) && hex(b.composeHash), 'Pinned image/commit/config/source bundle required');
+    require(b && sha(b.commit) && iid(b.image) && (fixture ? b.authImage===undefined : iid(b.authImage)) && hex(b.runnerSource) && hex(b.composeHash), 'Pinned image/commit/config/source bundle required');
     require(typeof b.composeFile === 'string' && resolve(b.composeFile) === b.composeFile && b.files && Object.keys(b.files).length > 0, 'Complete operator bundle required');
     require(b.files[b.composeFile] === b.composeHash && Object.values(b.files).every(hex), 'Compose/file identity missing');
-    require(b.inspect?.symphony && b.inspect?.['github-auth'], 'Expected runtime contract required for both services');
+    require(b.inspect?.symphony && (fixture ? same(Object.keys(b.inspect),['symphony']) : b.inspect?.['github-auth']), 'Expected runtime contract required for both services');
+  }
+  if(fixture) {
+    require(/^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/.test(c.codexVolume || '') && c.codexVolume!==c.dataVolume,'Distinct fixture Codex volume required');
+    const controls=['stateRoot','deploymentRoot','gateRoot','launchRoot','inboxRoot','ledgerRoot'].map(k=>c[k]);
+    require(controls.every((p,i)=>controls.every((q,j)=>i===j || !(p===q || p.startsWith(q+'/') || q.startsWith(p+'/')))),'Fixture control roots must be disjoint');
   }
   require(c.target.image !== c.previous.image && c.target.commit !== c.previous.commit, 'A deployment must replace a version, not count a no-op as success');
   require(c.target.authImage === c.previous.authImage, 'MVP preserves isolated auth service/image; auth upgrades require separate operation');
@@ -99,8 +105,8 @@ export async function deploymentEvidence(c, e, api, log) {
 }
 
 // Real state machine, injected ports only for local contract tests. Production uses fixed ports below.
-export async function deploy(c,io,{preflight=false}={}) {
-  deploymentConfig(c);
+export async function deploy(c,io,{preflight=false,fixture=false}={}) {
+  deploymentConfig(c,{fixture});
   const fingerprint=digest(c), old=await io.load();
   await io.authorize();
   if(preflight) { await io.preflight(); return {prepared:true,id:c.deploymentId}; }
@@ -182,7 +188,7 @@ export async function deploy(c,io,{preflight=false}={}) {
 // array order and every profile value remain part of the effective identity.
 const canonical = x => Array.isArray(x) ? x.map(canonical) : x && typeof x==='object'
   ? Object.fromEntries(Object.keys(x).sort().map(k=>[k,canonical(x[k])])) : x;
-function profileIdentity(text) {
+export function profileIdentity(text) {
   const profile=JSON.parse(text);
   require(profile && typeof profile==='object' && !Array.isArray(profile),'Seccomp JSON object required');
   return 'seccomp='+JSON.stringify(canonical(profile));
@@ -198,7 +204,8 @@ export function runtimeIdentity(x) {
     securityOpt:securityIdentity(x.HostConfig.SecurityOpt),networkMode:x.HostConfig.NetworkMode,readonly:x.HostConfig.ReadonlyRootfs,
     ports:x.HostConfig.PortBindings || {},environmentHash:digest([...(x.Config.Env || [])].sort())};
 }
-export function safeRuntime(c,b) {
+export function safeRuntime(c,b,{fixture=false}={}) {
+  if(fixture) return fixtureRuntime(c,b);
   const e=b.inspect.symphony, a=b.inspect['github-auth'];
   require(e.image===b.image && a.image===b.authImage && e.user==='momo' && !e.privileged && !a.privileged && !e.capAdd?.length && !a.capAdd?.length,'Unsafe image/user/capability');
   for(const x of [e,a]) {
@@ -222,22 +229,23 @@ export function safeRuntime(c,b) {
 }
 // Only the explicitly supported Compose surface can reach `up`. Predict the effective
 // identity from the rendered service + immutable image defaults, before Docker creates it.
-export function composeIdentity(c,b,doc,images,profiles={}) {
+export function composeIdentity(c,b,doc,images,profiles={}, {fixture=false}={}) {
   const keys=(x,allowed)=>require(x && typeof x==='object' && !Array.isArray(x) && Object.keys(x).every(k=>allowed.includes(k)),'Unsupported Compose field');
   keys(doc,['name','services','volumes','networks']);
-  require(doc.name===c.project && Object.keys(doc.services).sort().join()==='github-auth,symphony','Compose project/services mismatch');
-  keys(doc.networks,['default']);keys(doc.networks.default,['name','external']);
+  require(doc.name===c.project && Object.keys(doc.services).sort().join()===(fixture?'symphony':'github-auth,symphony'),'Compose project/services mismatch');
+  keys(doc.networks,['default']);keys(doc.networks.default,['name','external',...(fixture?['internal']:[])]);
+  if(fixture) require(doc.networks.default.internal===true && !doc.networks.default.external,'Fixture network must block external traffic');
   const network=doc.networks.default.name;
   require(network===`${c.project}_default`,'Compose network mismatch');
   for(const v of Object.values(doc.volumes || {})) {keys(v,['name','external']);require(v.external===true && typeof v.name==='string','Existing external named volumes required');}
   const result={};
-  for(const service of ['symphony','github-auth']) {
+  for(const service of (fixture?['symphony']:['symphony','github-auth'])) {
     const s=doc.services[service], image=images[service], base=image.Config;
     keys(s,['image','user','entrypoint','command','environment','volumes','ports','networks','privileged','cap_add','cap_drop','security_opt','read_only','init','restart','stop_grace_period','healthcheck','depends_on']);
     require(image.Id===b.inspect[service].image && s.image===image.Id && !Object.keys(base.Volumes || {}).length,'Pinned image/default volumes mismatch');
     require(Array.isArray(s.networks) ? same(s.networks,['default']) : same(s.networks,{default:null}),'Only default project network supported');
     if(s.depends_on) {
-      require(service==='symphony','Unsupported dependency'); keys(s.depends_on,['github-auth']);keys(s.depends_on['github-auth'],['condition','required','restart']);
+      require(!fixture && service==='symphony','Unsupported dependency'); keys(s.depends_on,['github-auth']);keys(s.depends_on['github-auth'],['condition','required','restart']);
       require(s.depends_on['github-auth'].condition==='service_healthy' && s.depends_on['github-auth'].required!==false && !s.depends_on['github-auth'].restart,'Auth dependency mismatch');
     }
     if(s.healthcheck) {keys(s.healthcheck,['test','interval','timeout','start_period','start_interval','retries']);require(Array.isArray(s.healthcheck.test) && ['CMD','CMD-SHELL'].includes(s.healthcheck.test[0]),'Unsupported healthcheck');}
@@ -245,10 +253,13 @@ export function composeIdentity(c,b,doc,images,profiles={}) {
     const env=Object.fromEntries((base.Env || []).map(x=>{const i=x.indexOf('=');return [x.slice(0,i),x.slice(i+1)];}));
     require(s.environment && !Array.isArray(s.environment) && Object.values(s.environment).every(x=>typeof x==='string'),'Resolved environment required');
     Object.assign(env,s.environment);
+    if(fixture) fixtureEnvironment(c,env);
     const mounts=(s.volumes || []).map(m=>{
       keys(m,['type','source','target','read_only','bind','volume']);
       require(['bind','volume'].includes(m.type) && typeof m.source==='string' && typeof m.target==='string','Resolved mount required');
-      if(m.type==='bind') {keys(m.bind,['create_host_path']);require(m.bind.create_host_path===false,'Bind creation is outside deployment scope');}
+      // compose-go omits the false bool in config JSON. Only the dedicated fixture
+      // accepts its canonical empty bind object; true remains forbidden everywhere.
+      if(m.type==='bind') {keys(m.bind,['create_host_path']);require(m.bind.create_host_path===false || (fixture && !Object.hasOwn(m.bind,'create_host_path')),'Bind creation is outside deployment scope');}
       if(m.type==='volume') {keys(m.volume,['nocopy']);require(m.volume.nocopy===true,'Volume copying is outside deployment scope');}
       const source=m.type==='volume'?doc.volumes?.[m.source]?.name:m.source;
       require(typeof source==='string' && (m.type!=='bind' || resolve(source)===source),'Unknown mount source');
@@ -278,18 +289,18 @@ export function composeIdentity(c,b,doc,images,profiles={}) {
     require(same(identity,{...expected,securityOpt:securityIdentity(expected.securityOpt)}),'Rendered Compose/runtime contract mismatch');
     result[service]=identity;
   }
-  safeRuntime(c,{...b,inspect:result});
+  safeRuntime(c,{...b,inspect:result},{fixture});
   return result;
 }
-export async function bundleFiles(c,b,docker) {
-  safeRuntime(c,b);
+export async function bundleFiles(c,b,docker,{fixture=false}={}) {
+  safeRuntime(c,b,{fixture});
   const contents={};
   for(const [path,hash] of Object.entries(b.files)) {
     await privateFile(path);const bytes=await readFile(path);
     require(digest(bytes)===hash,'Pinned bundle file changed');contents[path]=bytes;
   }
   const doc=await json(b.composeFile), images={};
-  for(const [service,id] of [['symphony',b.image],['github-auth',b.authImage]]) images[service]=JSON.parse(await docker(['inspect',id]))[0];
+  for(const [service,id] of (fixture?[['symphony',b.image]]:[['symphony',b.image],['github-auth',b.authImage]])) images[service]=JSON.parse(await docker(['inspect',id]))[0];
   const profiles={};
   for(const service of Object.values(doc.services || {})) for(const opt of service.security_opt || []) if(opt.startsWith('seccomp=')) {
     const path=opt.slice(8);
@@ -297,15 +308,15 @@ export async function bundleFiles(c,b,docker) {
     profiles[path]=profileIdentity(contents[path].toString('utf8'));
   }
   // Validate BEFORE even rendering: no unsupported host interpolation/indirection.
-  composeIdentity(c,b,doc,images,profiles);
+  composeIdentity(c,b,doc,images,profiles,{fixture});
   for(const service of Object.values(doc.services)) {
     for(const m of service.volumes || []) if(m.type==='bind' && !m.target.includes('secrets') && !['/run/momoflow-launch','/run/momoflow-resume','/run/momoflow-admission'].includes(m.target)) require(b.files[m.source],'Unpinned bind file in Compose');
   }
   const env=doc.services.symphony.environment;
-  require(env.MOMOFLOW_ADMISSION_ROOT==='/run/momoflow-admission' && env.MOMOFLOW_ROLE_FLOW==='1' && env.GITHUB_REPO===c.repo && env.GITHUB_TOKEN_FILE==='/run/momoflow-auth/token.json' && !env.GITHUB_TOKEN,'Token-file/role/admission environment required');
+  if(!fixture) require(env.MOMOFLOW_ADMISSION_ROOT==='/run/momoflow-admission' && env.MOMOFLOW_ROLE_FLOW==='1' && env.GITHUB_REPO===c.repo && env.GITHUB_TOKEN_FILE==='/run/momoflow-auth/token.json' && !env.GITHUB_TOKEN,'Token-file/role/admission environment required');
   const rendered=JSON.parse(await docker(['compose','--project-name',c.project,'-f',b.composeFile,'config','--format','json']));
   require(same(rendered,doc),'Compose bundle must already be fully rendered');
-  composeIdentity(c,b,rendered,images,profiles);
+  composeIdentity(c,b,rendered,images,profiles,{fixture});
   return doc;
 }
 // Runs inside the already identified live data volume. Missing roles is valid only
@@ -342,7 +353,7 @@ async function privateFile(path) {
   require(st.isFile() && !st.isSymbolicLink() && (st.mode & 0o022)===0 && await realpath(path)===path,'Operator file must be regular, canonical and not group/world writable');
 }
 export async function connected(c,requestFile,preflight=false,{isolatedStop=false}={}) {
-  require(!c.fixtureSource && !c.fixtureRepository, 'Fixture requests require the separate isolated integration entrypoint');
+  require(!c.fixtureMode && !c.fixtureSource && !c.fixtureRepository, 'Fixture requests require the separate isolated integration entrypoint');
   return connect(c,requestFile,preflight,{isolatedStop});
 }
 // No fixture CLI flag or generic evidence callback. Isolation is mandatory here and
@@ -352,7 +363,7 @@ export async function connectedFixture(c,requestFile,preflight=false,{isolatedSt
   return connect(c,requestFile,preflight,{isolatedStop,fixture:true});
 }
 async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false}={}) {
-  deploymentConfig(c);
+  deploymentConfig(c,{fixture});
   await privateFile(requestFile);
   const requestBytes=await readFile(requestFile), api=github(c);
   require(same(JSON.parse(requestBytes),c),'Request bytes/config mismatch');
@@ -369,16 +380,16 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     const result={};
     for(const row of all) {
       const x=await inspect(row.ID), service=x.Config.Labels['com.docker.compose.service'];
-      require(['symphony','github-auth'].includes(service) && !result[service],'Unexpected/duplicate project container');
+      require((fixture?['symphony']:['symphony','github-auth']).includes(service) && !result[service],'Unexpected/duplicate project container');
       result[service]=x;
     }
-    require(result.symphony && result['github-auth'],'Both project services must already exist'); return result;
+    require(result.symphony && (fixture || result['github-auth']),'Both project services must already exist'); return result;
   };
   const state=async()=>{const r=await fetch(`${c.engineURL}/api/v1/state`,{signal:AbortSignal.timeout(Math.min(5000,remaining()))}); require(r.ok,'State API unavailable');return r.json();};
   const gate=async paused=>atomic(join(c.gateRoot,'active.json'),{v:1,generation:c.deploymentId,paused},0o644);
   const authorize=async()=>{
     require(same(await readFile(requestFile),requestBytes),'Operator request changed');
-    await verifyInstall(c);
+    await verifyInstall(fixture?{...c,tokenFile:join(c.stateRoot,'unused-token-path')}:c);
     try {
       await lstat('/.dockerenv');
       require(c.operatorContainer && process.env.HOSTNAME,'Container operator identity required; never execute inside the engine');
@@ -386,11 +397,11 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
       require(self.Config.Hostname===process.env.HOSTNAME && !self.HostConfig.NetworkMode.startsWith('container:') && self.HostConfig.NetworkMode!=='host' && self.Config.Labels?.['com.docker.compose.service']!=='symphony','Operator must have an independent container lifetime/network');
     } catch(e) {if(e.code!=='ENOENT') throw e;}
   };
-  const files=b=>bundleFiles(c,b,docker);
+  const files=b=>bundleFiles(c,b,docker,{fixture});
   const observed=async()=>Object.fromEntries(Object.entries(await containers()).map(([k,x])=>[k,{...runtimeIdentity(x),running:x.State.Running,health:x.State.Health?.Status}]));
   const match=async b=>{
     const all=await containers();
-    for(const service of ['symphony','github-auth']) require(same(runtimeIdentity(all[service]),b.inspect[service]) && all[service].State.Running && all[service].State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
+    for(const service of (fixture?['symphony']:['symphony','github-auth'])) require(same(runtimeIdentity(all[service]),b.inspect[service]) && all[service].State.Running && all[service].State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
     return all;
   };
   const ownersIdle=async()=>{
@@ -398,6 +409,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     require(all.symphony.Mounts.some(m=>m.Destination==='/data' && m.Type==='volume' && m.Name===c.dataVolume && m.RW),'Live data volume mismatch');
     const rows=JSON.parse(await docker(['exec',all.symphony.Id,'node','-e',
       `process.stdout.write(JSON.stringify((${readRoleRows.toString()})(require('fs'),'/data')))`]));
+    if(fixture) require(rows.length===0,'Credential-free fixture must not contain role ledgers');
     return deploymentOwnersIdle(c,rows);
   };
   const isolation=async()=>{
@@ -408,19 +420,25 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     require(auth.State.Running && auth.Config.Labels?.['com.docker.compose.project']===c.integration.productionProject && auth.Config.Labels?.['com.docker.compose.service']==='github-auth','Production auth identity cannot be established');
     require(production.Config.Labels?.['com.docker.compose.service']==='symphony','Production engine service mismatch');
     const live=await containers();
-    isolatedResources(c,[production,auth],Object.values(live));
+    await inspectIsolation(c,[production,auth],Object.values(live),docker,{fixture});
     // Check prospective bundles as well, before Compose can mount anything.
-    isolatedResources(c,[production,auth],Object.values(c.target.inspect).map(x=>({Mounts:x.mounts.map(m=>({Type:m.type,Name:m.source,Source:m.source})),HostConfig:{PortBindings:x.ports}})));
+    await inspectIsolation(c,[production,auth],Object.values(c.target.inspect).map(x=>({Mounts:x.mounts.map(m=>({Type:m.type,Name:m.source,Source:m.source})),HostConfig:{PortBindings:x.ports}})),docker,{fixture});
 
+  };
+  const fixtureState=async()=>{
+    const all=await containers();
+    const network=JSON.parse(await docker(['network','inspect',`${c.project}_default`]))[0];
+    require(network.Internal===true,'Fixture external traffic is not blocked');
+    await docker(['exec',all.symphony.Id,'node','-e',fixtureEmptyState]);
   };
   let controllerOwned=false;
   const preflightCheck=async()=>{
     await authorize();
-    for(const path of [requestFile,c.stateRoot,c.deploymentRoot,c.gateRoot,c.inboxRoot,c.ledgerRoot,c.tokenFile,c.evidence.path]) {
+    for(const path of [requestFile,c.stateRoot,c.deploymentRoot,c.gateRoot,c.inboxRoot,c.ledgerRoot,...(fixture?[c.launchRoot]:[c.tokenFile]),c.evidence.path]) {
       require(!path.startsWith(c.trustedRoot+'/') && !path.startsWith('/data/workspaces/') && !/[,\n\0]/.test(path),'Operational paths must be outside candidate/checkouts and valid Docker mount paths');
       // ledgerRoot is legacy installation metadata, never a host mirror used for drain.
       // A pristine live volume need not have log/roles yet.
-      if(path===c.ledgerRoot) continue;
+      if(path===c.ledgerRoot && !fixture) continue;
       // deploymentRoot may not exist yet: preflight must not create it.
       if(path===c.deploymentRoot) {try {await lstat(path);} catch(e) {if(e.code==='ENOENT') continue;throw e;}}
       const st=await lstat(path);
@@ -438,6 +456,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     if(fixture) await fixtureEvidence(c,await json(c.evidence.path),docker);
     else await deploymentEvidence(c,await json(c.evidence.path),api,h=>readFile(join(dirname(c.evidence.path),'logs',h)));
     await match(c.previous);
+    if(fixture) await fixtureState();
     const s=await state();
     require(s.admission?.contract===1 && s.admission.configured===true && !s.admission.error,'Admission installation/bootstrap required before automated deployment');
     activeContract({...c,deploymentId:s.admission.generation},c.previous,s,s.admission.paused);
@@ -461,7 +480,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
         await copyFile(path,join(dir,'bundle',hash));
       }
       await copyFile(c.evidence.path,join(dir,'evidence.json'));
-      await docker(['image','save','--output',join(dir,'images.tar'),c.previous.image,c.target.image,c.previous.authImage]);
+      await docker(['image','save','--output',join(dir,'images.tar'),c.previous.image,c.target.image,...(!fixture?[c.previous.authImage]:[])]);
       // Named-volume access works on Docker Desktop: mount it read-only in an independent,
       // socketless helper. Backups are evidence only; NEVER restore stale ledgers automatically.
       await docker(['run','--rm','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--user','1000:1000',
@@ -486,10 +505,15 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
           const all=await match(b), s=await state(); activeContract(c,b,s,paused);
           if(paused) require(drained(s,c.deploymentId),'Work appeared while fenced');
           const dashboard=await fetch(c.engineURL,{signal:AbortSignal.timeout(Math.min(5000,remaining()))});require(dashboard.ok,'Dashboard unavailable');
-          await docker(['exec',all.symphony.Id,'codex','login','status']);
-          // Probe the actual engine token-file reader without printing a token/body or using a model turn.
-          await docker(['exec',all.symphony.Id,'node','-e',`const fs=require('fs');const x=JSON.parse(fs.readFileSync(process.env.GITHUB_TOKEN_FILE));if(typeof x.token!=='string'||!(Date.parse(x.expires_at)>Date.now()+60000)||x.repository!==process.env.GITHUB_REPO||!['contents','issues','pull_requests'].every(k=>x.permissions?.[k]==='write')||!['read','write'].includes(x.permissions?.checks))process.exit(2);fetch('https://api.github.com/repos/'+process.env.GITHUB_REPO+'/issues?per_page=1',{headers:{Authorization:'Bearer '+x.token},signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:3)).catch(()=>process.exit(4))`]);
-          return {evidenceKind:fixture?'isolated-fixture':'github-merged',githubGate:fixture?'not-exercised':'passed',model:'not-exercised',admission:s.admission,image:b.image,authImage:b.authImage,configHash:b.composeHash,runnerSource:b.runnerSource,paused,at:new Date().toISOString(),checks:['compose','image-config-security','dashboard','state','codex-login','github-read','launch-role-contract','admission']};
+          if(fixture) {
+            await isolation();
+            await fixtureState();
+          } else {
+            await docker(['exec',all.symphony.Id,'codex','login','status']);
+            // Probe the actual engine token-file reader without printing a token/body or using a model turn.
+            await docker(['exec',all.symphony.Id,'node','-e',`const fs=require('fs');const x=JSON.parse(fs.readFileSync(process.env.GITHUB_TOKEN_FILE));if(typeof x.token!=='string'||!(Date.parse(x.expires_at)>Date.now()+60000)||x.repository!==process.env.GITHUB_REPO||!['contents','issues','pull_requests'].every(k=>x.permissions?.[k]==='write')||!['read','write'].includes(x.permissions?.checks))process.exit(2);fetch('https://api.github.com/repos/'+process.env.GITHUB_REPO+'/issues?per_page=1',{headers:{Authorization:'Bearer '+x.token},signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:3)).catch(()=>process.exit(4))`]);
+          }
+          return {auth:fixture?'not-exercised':'passed',evidenceKind:fixture?'isolated-fixture':'github-merged',githubGate:fixture?'not-exercised':'passed',model:'not-exercised',admission:s.admission,image:b.image,authImage:b.authImage,configHash:b.composeHash,runnerSource:b.runnerSource,paused,at:new Date().toISOString(),checks:['compose','image-config-security','dashboard','state',...(fixture?['credential-free-state','internal-network']:['codex-login','github-read']),'launch-role-contract','admission']};
         } catch(e) {if(Date.now()>=deadline) throw e;await sleep(Math.min(500,remaining()));}
       } } finally {operationDeadline=null;}
     },
@@ -501,8 +525,8 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
       await api(found.length?'PATCH':'POST',found.length?`/repos/${c.repo}/issues/comments/${found[0].id}`:path,{body});
     }
   };
-  if(preflight) return deploy(c,io,{preflight:true});
-  return withDeploymentLock(c,async()=>{controllerOwned=true;return deploy(c,io);});
+  if(preflight) return deploy(c,io,{preflight:true,fixture});
+  return withDeploymentLock(c,async()=>{controllerOwned=true;return deploy(c,io,{fixture});});
 }
 export async function controllersIdle(stateRoot) {
   for(const entry of await readdir(stateRoot,{withFileTypes:true})) {

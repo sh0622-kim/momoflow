@@ -231,8 +231,9 @@ controller/launch 프로세스·journal intent/event·현재 image/mount·gate a
 
 로컬 `node scripts/post-pr.test.mjs`의 deployment tests는 **외부 효과를 모의한 계약**이다.
 실 Docker·Codex 인증·실 모델 실행을 증명하지 않는다. `sh scripts/test-role-flow.sh`는 실제
-patched orchestrator 코드를 컴파일하지만 worker/model은 모의한다. 아래 절차는 외부 운영자가
-별도 Docker project/volume/port와 승인된 GitHub 읽기 인증을 준비한 뒤 실행한다.
+patched orchestrator 코드를 컴파일하지만 worker/model은 모의한다. 외부 운영자의
+일반 `kind:github` 검사는 별도 Docker project/volume/port와 승인된 GitHub 읽기 인증을 준비한 뒤 실행한다.
+인증 없는 `kind:fixture`는 아래 GH-18 예외와 전용 installer를 따른다.
 
 1. gate 지원 정상 이미지 A로 `momoflow-deploy-test-...` 프로젝트를 따로 설치한다. 별도
    data/Codex/auth volume, gate/launch/inbox 디렉터리와 포트를 사용한다. 기존 auth custody를
@@ -265,3 +266,20 @@ patched orchestrator 코드를 컴파일하지만 worker/model은 모의한다. 
 `sh scripts/smoke.sh`를 실행하지 않았다. 이 인계를 실제 성공으로 표시하거나 조건부 무인
 배포를 활성화하지 않는다. 외부 exact-head 검사·별도 리뷰·설치와 본 실험의 근거가 남아야
 자동화 전환 완료 조건을 판단할 수 있다.
+
+## GH-18: fixture 인증 분리 예외 (별도 리뷰·설치 필요)
+
+격리 Docker 교체/복구만 검증하는 fixture에서는 새 Codex 로그인이나 새 GitHub App을
+요구하지 않는다. 별도 `deploy-fixture-install.mjs` → `kind:fixture` integration 경로만
+자격 증명 없는 단일 서비스를 허용한다. 후보의 실제 image/security/readiness/sandbox와
+pause/drain/ownership/rollback 검사를 유지하고, auth/model/GitHub gate는 미검사로 기록한다.
+외부 통신 차단, 고정 비자격 sentinel, 빈 Codex/launch/inbox 및 absent manifest가 필수다.
+원본 WORKFLOW·모델·권한·예산을 변경하지 않으며 운영 인증을 후보에 복사하지 않는다.
+
+일반 `deploy.mjs`는 fixture 요청을 효과 전에 거부한다. 일반 운영 배포의 두 서비스,
+Codex login status, token-file GitHub 읽기, 자격 gate와 예외 배포 정책은 그대로다.
+필요한 기존 인증 확인은 trusted host/기존 서비스의 최소 읽기로 별도 기록하며, 이를
+후보 인증 성공으로 표시하지 않는다. [실행 명령과 증거 경계](deployment-fixture.md#인증-없는-최초-설치와-정상2복구1-gh-18-후보)를 따른다.
+
+이 정책/구현 PR의 완료는 #16의 실 Docker 실험 완료나 운영 배포 승인이 아니다.
+실제 정상2·복구1 및 나머지 조건 전에는 #16을 완료하지 않고 기존 2/3·terminal 기록을 유지한다.

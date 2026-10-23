@@ -231,6 +231,7 @@ for(const [name,change] of [
  ['command',s=>{s.command=['sh','-c','echo changed'];}],['entrypoint',s=>{s.entrypoint=['sh'];}],
  ['environment',s=>{s.environment.HOME='/root';}],['seccomp',s=>{s.security_opt=['no-new-privileges','seccomp=unconfined'];}],
  ['port',s=>{s.ports[0].host_ip='0.0.0.0';}],['bind creation',s=>{s.volumes.find(m=>m.type==='bind').bind.create_host_path=true;}],
+ ['omitted bind creation',s=>{delete s.volumes.find(m=>m.type==='bind').bind.create_host_path;}],
  ['build hook',s=>{s.build='.';}]
 ]) test(`connected bundle ${name} mismatch prevents any deployment effect`,async()=>{
  const x=await composeFixture();try {
