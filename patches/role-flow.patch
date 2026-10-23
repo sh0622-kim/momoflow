@@ -118,3 +118,30 @@ index ae3db62..6e2ac5b 100644
    end
 
    @doc false
+--- a/elixir/lib/symphony_elixir/orchestrator.ex
++++ b/elixir/lib/symphony_elixir/orchestrator.ex
+@@ -1506,6 +1506,24 @@
+   defp blocked_issue_url(_metadata), do: nil
+
+   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
++    # Usage totals are cumulative within a thread, not across role threads.
++    running_entry =
++      case update do
++        %{event: :session_started, thread_id: thread_id} when is_binary(thread_id) ->
++          if Map.get(running_entry, :codex_usage_thread_id) != thread_id do
++            Map.merge(running_entry, %{
++              codex_usage_thread_id: thread_id,
++              codex_last_reported_input_tokens: 0,
++              codex_last_reported_output_tokens: 0,
++              codex_last_reported_total_tokens: 0
++            })
++          else
++            running_entry
++          end
++
++        _ -> running_entry
++      end
++
+     token_delta = extract_token_delta(running_entry, update)
+     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
+     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)

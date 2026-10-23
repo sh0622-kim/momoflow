@@ -202,13 +202,19 @@ defmodule SymphonyElixir.RoleRunner do
 
     result = Jason.decode!(File.read!(result_path))
 
-    unless is_binary(result["summary"]) and byte_size(result["summary"]) <= 8000 and
-             is_list(result["checks"]) and length(result["checks"]) <= 30 and
-             Enum.all?(result["checks"], &(is_binary(&1) and byte_size(&1) <= 2000)) do
+    unless is_binary(result["summary"]) and String.trim(result["summary"]) != "" and
+             byte_size(result["summary"]) <= 8000 and
+             is_list(result["checks"]) and result["checks"] != [] and
+             length(result["checks"]) <= 30 and
+             Enum.all?(
+               result["checks"],
+               &(is_binary(&1) and String.trim(&1) != "" and byte_size(&1) <= 2000)
+             ) do
       halt!("Missing bounded summary or checks evidence")
     end
 
-    next = next_stage(role, result["status"])
+    next =
+      if result["status"] == "blocked", do: "blocked", else: next_stage(role, result["status"])
 
     event = %{
       "role" => role,
@@ -230,6 +236,12 @@ defmodule SymphonyElixir.RoleRunner do
       })
 
     save(path, state)
+
+    if next == "blocked" do
+      halt!(
+        "#{role} blocked: #{result["summary"]}; checks=#{Jason.encode!(result["checks"])}; Ledger: #{path}"
+      )
+    end
 
     if next == "done" do
       Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, opts) end).(
@@ -296,7 +308,7 @@ defmodule SymphonyElixir.RoleRunner do
     Planning and review are sequential, separate sessions, not parallel delegation.
     Write a JSON result to #{result_path} before ending:
     {"status":"complete|changes_requested|blocked","summary":"bounded scope/plan or concrete findings and resolution","checks":["actual checks and results; separate mock, settings query and live calls"]}
-    Only review may use changes_requested. Missing/invalid evidence stops execution.
+    Only review may use changes_requested. Every result requires a nonblank summary and at least one nonblank check describing actual evidence (planning may record inspected scope/acceptance criteria). Missing/invalid evidence stops execution.
     Do not edit engine ledger files. An exit alone is not success evidence.
     """
   end

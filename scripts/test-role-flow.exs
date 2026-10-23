@@ -101,6 +101,167 @@ defmodule RoleFlowTest do
     Jason.decode!(File.read!(path))
   end
 
+  test "actual upstream Orchestrator sums thread usage without resetting accumulated totals" do
+    alias SymphonyElixir.Orchestrator, as: O
+    entry = %{session_id: nil}
+
+    state =
+      struct(O.State,
+        running: %{"1" => entry},
+        codex_totals: %{
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          seconds_running: 0
+        }
+      )
+
+    update = fn state, message ->
+      {:noreply, state} =
+        O.handle_info(
+          {:codex_worker_update, "1", Map.put(message, :timestamp, DateTime.utc_now())},
+          state
+        )
+
+      state
+    end
+
+    start = fn thread, turn ->
+      %{event: :session_started, thread_id: thread, session_id: "#{thread}-#{turn}"}
+    end
+
+    usage = fn i, o ->
+      %{
+        event: :notification,
+        payload: %{
+          "method" => "thread/tokenUsage/updated",
+          "params" => %{
+            "tokenUsage" => %{
+              "total" => %{
+                "inputTokens" => i,
+                "outputTokens" => o,
+                "totalTokens" => i + o
+              }
+            }
+          }
+        }
+      }
+    end
+
+    state = update.(state, start.("plan", "1"))
+    state = update.(state, usage.(100, 20))
+    state = update.(state, usage.(100, 20))
+    # A new turn in the SAME thread must not reset its cumulative baseline.
+    state = update.(state, start.("plan", "2"))
+    state = update.(state, usage.(100, 20))
+    state = update.(state, start.("build", "1"))
+    state = update.(state, usage.(60, 10))
+    state = update.(state, usage.(60, 10))
+
+    assert Map.take(state.codex_totals, [:input_tokens, :output_tokens, :total_tokens]) ==
+             %{input_tokens: 160, output_tokens: 30, total_tokens: 190}
+
+    assert state.running["1"].codex_total_tokens == 190
+    state = update.(state, start.("review", "1"))
+    state = update.(state, usage.(10, 5))
+    assert state.codex_totals.total_tokens == 205
+    assert state.running["1"].codex_total_tokens == 205
+  end
+
+  for role <- ~w(plan build review publish) do
+    @blocked_role role
+    test "valid blocked #{@blocked_role} preserves evidence and stops subsequent roles", c do
+      role = @blocked_role
+      base = executor(fn _, _ -> "complete" end)
+
+      exec = fn w, issue, current, prompt, handler ->
+        {:ok, session} = base.(w, issue, current, prompt, handler)
+
+        if current == role do
+          File.write!(
+            Path.join(w, ".momoflow-role-result.json"),
+            Jason.encode!(%{
+              status: "blocked",
+              summary: "Acceptance failed: expected 42, observed 41",
+              checks: ["offline numeric check failed: 41 != 42"]
+            })
+          )
+        end
+
+        {:ok, session}
+      end
+
+      assert :ok = run(c, exec)
+      state = ledger(c)
+      assert state["stage"] == "blocked"
+      assert state["in_flight"] == false
+      event = List.last(state["events"])
+      assert event["role"] == role
+      assert event["result"]["status"] == "blocked"
+      assert event["session"]["effective_settings"] == effective(role)
+      assert event["settings"] == R.settings(role)
+      assert event["before"] == event["after"]
+      assert event["before"] == R.snapshot!(c.workspace)
+      assert is_binary(event["session"]["thread_id"])
+      assert_received {:halt, reason}
+      assert reason =~ "expected 42, observed 41"
+      assert reason =~ "offline numeric check failed: 41 != 42"
+      assert reason =~ "Ledger:"
+      assert state["reason"] =~ "expected 42, observed 41"
+
+      stages =
+        for _ <- 1..length(state["events"]) do
+          assert_receive {:stage, current, _}
+          current
+        end
+
+      assert List.last(stages) == role
+      refute_received {:stage, _, _}
+    end
+  end
+
+  for role <- ~w(plan build review publish),
+      {summary, checks, label} <- [
+        {"", ["check passed"], "empty summary"},
+        {" \n\t", ["check passed"], "blank summary"},
+        {"meaningful result", [], "empty checks"},
+        {"meaningful result", [""], "empty check item"},
+        {"meaningful result", ["check passed", " \n\t"], "blank check item"}
+      ] do
+    @invalid_role role
+    @invalid_summary summary
+    @invalid_checks checks
+    test "#{role} rejects #{label} before advancing", c do
+      base = executor(fn _, _ -> "complete" end)
+
+      exec = fn w, issue, role, prompt, handler ->
+        result = base.(w, issue, role, prompt, handler)
+
+        if role == @invalid_role do
+          File.write!(
+            Path.join(w, ".momoflow-role-result.json"),
+            Jason.encode!(%{
+              status: "complete",
+              summary: @invalid_summary,
+              checks: @invalid_checks
+            })
+          )
+        end
+
+        result
+      end
+
+      assert :ok = run(c, exec)
+      state = ledger(c)
+      assert state["stage"] == "blocked"
+      assert state["reason"] =~ "summary or checks evidence"
+      assert_received {:halt, _}
+      for _ <- 1..(length(state["events"]) + 1), do: assert_receive({:stage, _, _})
+      refute_received {:stage, _, _}
+      refute Enum.any?(state["events"], &(&1["role"] == @invalid_role))
+    end
+  end
+
   test "plan, build, distinct review, Sol correction, rereview, publish share count", c do
     exec =
       executor(fn role, n ->
@@ -278,7 +439,7 @@ defmodule RoleFlowTest do
   end
 
   for repo <- ["fixture/repo", "$GITHUB_REPO", nil, " fixture/repo "] do
-    for outcome <- [:complete, :ineligible, :failure, :no_workpad] do
+    for outcome <- [:complete, :ineligible, :failure, :no_workpad, :blocked] do
       @tag repo: repo, outcome: outcome
       test "default GitHub paths #{inspect(repo)} / #{outcome}", c do
         github_workflow(c, c.repo)
@@ -307,6 +468,14 @@ defmodule RoleFlowTest do
             {"PATCH", "/repos/fixture/repo/issues/comments/42"} ->
               assert body["body"] =~ pad["body"]
               assert body["body"] =~ "Ready removal verified"
+
+              if c.outcome == :blocked do
+                assert body["body"] =~ "plan blocked: contract evidence plan"
+                assert body["body"] =~ "mock stage, no live calls"
+                assert body["body"] =~ "Ledger:"
+                assert length(ledger(c)["events"]) == 1
+              end
+
               {:ok, %{status: 200, body: %{}}}
 
             {"POST", "/repos/fixture/repo/issues/1/comments"} ->
@@ -322,7 +491,7 @@ defmodule RoleFlowTest do
           if c.outcome in [:ineligible, :failure] do
             fn _, _, _, _, _ -> raise "fixture stage failure" end
           else
-            executor(fn _, _ -> "complete" end)
+            executor(fn _, _ -> if c.outcome == :blocked, do: "blocked", else: "complete" end)
           end
 
         # Keep all default workpad, eligibility, halt and comment-update functions.
@@ -334,7 +503,7 @@ defmodule RoleFlowTest do
         assert :ok == R.run(c.workspace, %{id: "1"}, "fixture", fn _ -> :ok end, opts)
 
         assert ledger(c)["stage"] ==
-                 if(c.outcome in [:ineligible, :failure], do: "blocked", else: "done")
+                 if(c.outcome in [:ineligible, :failure, :blocked], do: "blocked", else: "done")
 
         key = Base.encode16(:crypto.hash(:sha256, "fixture/repo:1"), case: :lower)
         assert File.exists?(Path.join(c.root, "ledger/#{key}.json"))

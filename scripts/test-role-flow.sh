@@ -11,6 +11,7 @@ git --git-dir="$symphony_root/.git" show HEAD:elixir/lib/symphony_elixir/github/
 git -C "$fixture_root" apply "$repository_root/patches/github-token-file.patch"
 git --git-dir="$symphony_root/.git" show HEAD:elixir/lib/symphony_elixir/agent_runner.ex > "$fixture_root/elixir/lib/symphony_elixir/agent_runner.ex"
 git --git-dir="$symphony_root/.git" show HEAD:elixir/lib/symphony_elixir/codex/app_server.ex > "$fixture_root/elixir/lib/symphony_elixir/codex/app_server.ex"
+git --git-dir="$symphony_root/.git" show HEAD:elixir/lib/symphony_elixir/orchestrator.ex > "$fixture_root/elixir/lib/symphony_elixir/orchestrator.ex"
 git -C "$fixture_root" apply --check "$repository_root/patches/role-flow.patch"
 git -C "$fixture_root" apply "$repository_root/patches/role-flow.patch"
 elixir -pa "$symphony_root/elixir/_build/prod/lib/*/ebin" -e '
@@ -20,4 +21,5 @@ elixir -pa "$symphony_root/elixir/_build/prod/lib/*/ebin" -e '
   "$repository_root/engine/role_runner.ex" \
   "$fixture_root/elixir/lib/symphony_elixir/codex/app_server.ex" \
   "$fixture_root/elixir/lib/symphony_elixir/agent_runner.ex" \
+  "$fixture_root/elixir/lib/symphony_elixir/orchestrator.ex" \
   "$repository_root/scripts/test-role-flow.exs"
