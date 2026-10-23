@@ -31,7 +31,10 @@ export function fixtureBundle(c,row,image,workflow,seccomp,composeFile,profileBy
 export async function installationAttempt(root,action) {
  let journalPath=null;
  const row={status:'preparing',stage:'host-preflight',commands:[]};
- const save=async()=>{if(journalPath) {const temp=journalPath+'.next';await writeFile(temp,JSON.stringify(row,null,2)+'\n',{mode:0o600});await rename(temp,journalPath);}};
+ // Concurrent read-only probes share one journal. Serialize its atomic writes;
+ // a failed save keeps the chain rejected so no later command can pass intent logging.
+ let saving=Promise.resolve();
+ const save=()=>{saving=saving.then(async()=>{if(journalPath) {const temp=journalPath+'.next';await writeFile(temp,JSON.stringify(row,null,2)+'\n',{mode:0o600});await rename(temp,journalPath);}});return saving;};
  const d={
   stage:async name=>{row.stage=name;await save();},
   createRoot:async metadata=>{await mkdir(root,{mode:0o700});journalPath=join(root,'installation.json');Object.assign(row,metadata);await save();},

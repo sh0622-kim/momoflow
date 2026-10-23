@@ -93,7 +93,7 @@ export function fixtureEnvironment(c,env) {
  need(c.fixtureMode===fixtureMode && c.repo==='smoke/fixture','Credential-free fixture scope required');
  need(Object.entries(fixtureEnvironmentValues).every(([k,v])=>env[k]===v),'Fixed noncredential fixture environment required');
  // Image defaults are included: reject inherited credentials and execution overrides too.
- const base=['PATH','HOME','CODEX_HOME','GIT_ASKPASS','GIT_TERMINAL_PROMPT','MIX_ENV','LANG','LANGUAGE','LC_ALL','NODE_VERSION','YARN_VERSION','ELIXIR_VERSION','OTP_VERSION','ERLANG_VERSION','ELIXIR_SHA256','REBAR_VERSION'];
+ const base=['PATH','HOME','CODEX_HOME','GIT_ASKPASS','GIT_TERMINAL_PROMPT','MIX_ENV','LANG','LANGUAGE','LC_ALL','NODE_VERSION','YARN_VERSION','ELIXIR_VERSION','OTP_VERSION','ERLANG_VERSION','ELIXIR_SHA256','REBAR_VERSION','REBAR3_VERSION'];
  need(Object.keys(env).every(k=>base.includes(k) || Object.hasOwn(fixtureEnvironmentValues,k)),'Unexpected fixture environment/credential');
 }
 export function fixtureRuntime(c,b) {

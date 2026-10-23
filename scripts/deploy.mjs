@@ -234,7 +234,10 @@ export function composeIdentity(c,b,doc,images,profiles={}, {fixture=false}={}) 
   const keys=(x,allowed)=>require(x && typeof x==='object' && !Array.isArray(x) && Object.keys(x).every(k=>allowed.includes(k)),'Unsupported Compose field');
   keys(doc,['name','services','volumes','networks']);
   require(doc.name===c.project && Object.keys(doc.services).sort().join()===(fixture?'symphony':'github-auth,symphony'),'Compose project/services mismatch');
-  keys(doc.networks,['default']);keys(doc.networks.default,['name','external',...(fixture?['internal']:[])]);
+  keys(doc.networks,['default']);keys(doc.networks.default,['name','external',...(fixture?['internal','ipam']:[])]);
+  // Compose emits an empty IPAM object for this fixture's default network.
+  // Accept only that serialization default; address/driver settings remain forbidden.
+  if(fixture && Object.hasOwn(doc.networks.default,'ipam')) keys(doc.networks.default.ipam,[]);
   if(fixture) require(doc.networks.default.internal===true && !doc.networks.default.external,'Fixture network must block external traffic');
   const network=doc.networks.default.name;
   require(network===`${c.project}_default`,'Compose network mismatch');

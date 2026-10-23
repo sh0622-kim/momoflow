@@ -75,11 +75,14 @@ async function credentialFree() {
  const docker=async args=>{calls.push(args);if(args[0]==='inspect')return JSON.stringify([images[args[1]]]);assert.ok(args.includes('config'));
   const d=JSON.parse(await readFile(args[args.indexOf('-f')+1],'utf8'));
   for(const m of d.services.symphony.volumes) if(m.bind?.create_host_path===false) delete m.bind.create_host_path;
+  // Observed Docker Compose default-network serialization; no IPAM settings.
+  d.networks.default.ipam={};
   return JSON.stringify(d);
  };
  for(const i of [1,2]) {
   const row={image:'sha256:'+hash(i),commit:sha(i),runnerSource:hash(3)};
-  const image={Id:row.image,Config:{User:'momo',Env:['HOME=/home/momo','MIX_ENV=prod'],Entrypoint:null,Cmd:['engine']}};images[row.image]=image;
+  // Observed immutable A baseline inherits this harmless Elixir image default.
+  const image={Id:row.image,Config:{User:'momo',Env:['HOME=/home/momo','MIX_ENV=prod','REBAR3_VERSION=3.27.0'],Entrypoint:null,Cmd:['engine']}};images[row.image]=image;
   const wf=join(root,'workflow-'+i);await writeFile(wf,'workflow');
   const {doc,bundle}=fixtureBundle(c,row,image,wf,profile,join(root,'compose-'+i+'.json'),await readFile(profile));
   // Exercise normalization of explicit false as well as the generated {} form.
@@ -97,6 +100,7 @@ test('operator bundles connect credential-free single-service contract without t
   for(const b of [x.c.previous,x.c.target]) await bundleFiles(x.c,b,x.docker,{fixture:true});
   assert.ok(x.docs[x.c.target.composeFile].services.symphony.volumes.filter(m=>m.type==='bind').every(m=>Object.keys(m.bind).length===0));
   assert.equal(x.c.target.composeHash,digest(await readFile(x.c.target.composeFile)));
+  assert.deepEqual(x.docs[x.c.target.composeFile].networks.default.ipam,{});
   assert.equal(x.c.tokenFile,undefined);assert.equal(x.c.target.authImage,undefined);
   assert.ok(x.calls.every(a=>a[0]==='inspect' || a.includes('config')));
   fixtureEnvironment(x.c,{HOME:'/home/momo',...fixtureEnvironmentValues});
@@ -114,6 +118,11 @@ for(const [name,change] of [
  ['bind auto creation',d=>{d.services.symphony.volumes.find(m=>m.type==='bind').bind.create_host_path=true;}],
  ['missing bind options',d=>{delete d.services.symphony.volumes.find(m=>m.type==='bind').bind;}],
  ['external network',d=>{d.networks.default.internal=false;}],
+ ['null IPAM',d=>{d.networks.default.ipam=null;}],
+ ['array IPAM',d=>{d.networks.default.ipam=[];}],
+ ['IPAM driver',d=>{d.networks.default.ipam={driver:'default'};}],
+ ['IPAM addresses',d=>{d.networks.default.ipam={config:[]};}],
+ ['IPAM options',d=>{d.networks.default.ipam={options:{}};}],
  ['auth service',d=>{d.services['github-auth']={};}],
  ['auth mount',d=>d.services.symphony.volumes.push({type:'volume',source:'codex',target:'/run/momoflow-auth',volume:{nocopy:true}})],
  ['privileged',d=>{d.services.symphony.privileged=true;}],
@@ -129,6 +138,18 @@ test('fixture rejects present launch, host token path, shared data/Codex volume 
   for(const change of [c=>{c.manifest={status:'present'};},c=>{c.tokenFile='/host/token';}]) {const c=structuredClone(x.c);change(c);assert.throws(()=>deploymentConfig(c,{fixture:true}));}
   x.images[x.c.target.image].Config.Env.push('GITHUB_TOKEN_FILE=/host/token');await assert.rejects(bundleFiles(x.c,x.c.target,x.docker,{fixture:true}),/environment/);
   const b=structuredClone(x.c.target);b.inspect.symphony.mounts.find(m=>m.destination==='/data').source='production-data';assert.throws(()=>fixtureRuntime(x.c,b),/volume/);
+ } finally {await rm(x.root,{recursive:true,force:true});}
+});
+test('inherited REBAR3_VERSION baseline pins successfully without accepting credential or execution overrides',async()=>{
+ const x=await credentialFree();try {
+  for(const b of [x.c.previous,x.c.target]) await bundleFiles(x.c,b,x.docker,{fixture:true});
+  const image=x.images[x.c.target.image],baseline=[...image.Config.Env];
+  for(const extra of ['AWS_SECRET_ACCESS_KEY=private','OPENAI_API_KEY=private','NODE_OPTIONS=--inspect','BASH_ENV=/override','REBAR3_VERSION_EXTRA=unknown']) {
+   image.Config.Env=[...baseline,extra];
+   await assert.rejects(bundleFiles(x.c,x.c.target,x.docker,{fixture:true}),{message:'Unexpected fixture environment/credential'});
+  }
+  image.Config.Env=baseline.map(v=>v.startsWith('REBAR3_VERSION=')?'REBAR3_VERSION=changed':v);
+  await assert.rejects(bundleFiles(x.c,x.c.target,x.docker,{fixture:true}),/runtime|identity|environment/i);
  } finally {await rm(x.root,{recursive:true,force:true});}
 });
 test('fixture state machine preserves drain and verified rollback; fixture data cannot enter ordinary deploy',async()=>{
@@ -184,6 +205,40 @@ test('installer pre-root failure reports stage/exit without claiming a journal e
    await d.command(process.execPath,['-e','process.exit(17)']);
   }),e=>{assert.equal(e.diagnostic.stage,'production-and-provenance-preflight');assert.equal(e.diagnostic.exit,17);assert.equal(e.diagnostic.journal,null);assert.match(e.message,/not created or unavailable/);return true;});
   await assert.rejects(fs.promises.stat(root),{code:'ENOENT'});
+ } finally {await rm(parent,{recursive:true,force:true});}
+});
+test('concurrent installer commands serialize journal writes and persist intent before effects',async t=>{
+ const parent=await mkdtemp('/tmp/install-concurrent-'),root=join(parent,'new');
+ const original=fsPromises.writeFile;let writing=false;
+ t.mock.method(fsPromises,'writeFile',async(path,...args)=>{
+  if(path!==join(root,'installation.json.next')) return original(path,...args);
+  assert.equal(writing,false,'journal temporary file has overlapping writers');writing=true;
+  try {await new Promise(done=>setTimeout(done,10));return await original(path,...args);} finally {writing=false;}
+ });syncBuiltinESMExports();
+ t.after(()=>{t.mock.restoreAll();syncBuiltinESMExports();});
+ try {
+  await installationAttempt(root,async d=>{
+   await d.createRoot({});await d.stage('concurrent-production-inspect');
+   await Promise.all([0,1].map(i=>d.command(process.execPath,['-e',`const fs=require('fs'),j=JSON.parse(fs.readFileSync(process.argv[1]));if(j.commands[Number(process.argv[2])].status!=='attempted')process.exit(91);fs.writeFileSync(process.argv[3],'effect');`,join(root,'installation.json'),String(i),join(root,'effect-'+i)])));
+  });
+  const j=JSON.parse(await readFile(join(root,'installation.json')));
+  assert.equal(j.status,'installed-paused');assert.deepEqual(j.commands.map(e=>[e.status,e.exit]),[['completed',0],['completed',0]]);
+  for(const i of [0,1]) assert.equal(await readFile(join(root,'effect-'+i),'utf8'),'effect');
+ } finally {await rm(parent,{recursive:true,force:true});}
+});
+test('installer journal save failure blocks command effects and preserves last atomic journal',async t=>{
+ const parent=await mkdtemp('/tmp/install-save-failure-'),root=join(parent,'new'),original=fsPromises.writeFile;
+ t.mock.method(fsPromises,'writeFile',async(path,data,...args)=>{
+  if(path===join(root,'installation.json.next') && JSON.parse(data).commands.length) throw Object.assign(Error('private filesystem failure'),{code:'EIO'});
+  return original(path,data,...args);
+ });syncBuiltinESMExports();
+ t.after(()=>{t.mock.restoreAll();syncBuiltinESMExports();});
+ try {
+  await assert.rejects(installationAttempt(root,async d=>{
+   await d.createRoot({});await Promise.all([0,1].map(i=>d.command(process.execPath,['-e',"require('fs').writeFileSync(process.argv[1],'effect')",join(root,'effect-'+i)])));
+  }),e=>{assert.equal(e.diagnostic.journal,null);assert.doesNotMatch(e.message,/private filesystem/);return true;});
+  const j=JSON.parse(await readFile(join(root,'installation.json')));assert.deepEqual(j.commands,[]);
+  for(const i of [0,1]) await assert.rejects(lstat(join(root,'effect-'+i)),{code:'ENOENT'});
  } finally {await rm(parent,{recursive:true,force:true});}
 });
 test('installer validation failure after an effect hides arbitrary errors; success finalizes journal',async()=>{
