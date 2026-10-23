@@ -3,8 +3,9 @@ import { readFile, lstat, realpath } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { isDeepStrictEqual as same } from 'node:util';
 import { digest } from './post-pr.mjs';
+import { mountContext, identitiesOverlap } from './deploy-mount-identity.mjs';
 import { command } from './post-pr-docker.mjs';
-const need=(v,m)=>{if(!v) throw Error(m);};
+const need=(v,m)=>{if(!v) throw Object.assign(Error(m),{safeReason:m});};
 export const fixtureLabels=(source,commit,tree)=>({
  'org.momoflow.fixture.source':source,'org.momoflow.fixture.commit':commit,
  'org.momoflow.fixture.tree':tree,'org.momoflow.fixture.scope':'isolated-deployment-only'
@@ -79,7 +80,7 @@ export function integrationPlan(requests) {
 export function isolatedResources(c,production,test,{fixture=false}={}) {
  need(c.integration?.productionProject!==c.project && production.length===2 && test.length===(fixture?1:2),'Both production/test services required');
  const sources=production.flatMap(x=>x.Mounts.map(m=>({type:m.Type,source:m.Type==='volume'?m.Name:m.Source})));
- const overlap=(a,b)=>a===b || a.startsWith(b+'/') || b.startsWith(a+'/');
+ const overlap=(a,b)=>a===b || a.startsWith(b==='/'?'/':b+'/') || b.startsWith(a==='/'?'/':a+'/');
  for(const x of test) for(const m of x.Mounts) need(!sources.some(s=>s.type===m.Type && (m.Type==='volume'?s.source===m.Name:overlap(s.source,m.Source))),'Integration shares production mount/credential source');
  const ports=new Set(production.flatMap(x=>Object.values(x.HostConfig.PortBindings || {}).flat().map(p=>p.HostPort)));
  need(test.every(x=>!Object.values(x.HostConfig.PortBindings || {}).flat().some(p=>ports.has(p.HostPort))),'Integration shares production port');
@@ -92,7 +93,7 @@ export function fixtureEnvironment(c,env) {
  need(c.fixtureMode===fixtureMode && c.repo==='smoke/fixture','Credential-free fixture scope required');
  need(Object.entries(fixtureEnvironmentValues).every(([k,v])=>env[k]===v),'Fixed noncredential fixture environment required');
  // Image defaults are included: reject inherited credentials and execution overrides too.
- const base=['PATH','HOME','CODEX_HOME','GIT_ASKPASS','GIT_TERMINAL_PROMPT','MIX_ENV','LANG','LANGUAGE','LC_ALL','NODE_VERSION','YARN_VERSION','ELIXIR_VERSION','OTP_VERSION','ERLANG_VERSION','ELIXIR_SHA256','REBAR_VERSION'];
+ const base=['PATH','HOME','CODEX_HOME','GIT_ASKPASS','GIT_TERMINAL_PROMPT','MIX_ENV','LANG','LANGUAGE','LC_ALL','NODE_VERSION','YARN_VERSION','ELIXIR_VERSION','OTP_VERSION','ERLANG_VERSION','ELIXIR_SHA256','REBAR_VERSION','REBAR3_VERSION'];
  need(Object.keys(env).every(k=>base.includes(k) || Object.hasOwn(fixtureEnvironmentValues,k)),'Unexpected fixture environment/credential');
 }
 export function fixtureRuntime(c,b) {
@@ -120,21 +121,26 @@ if(fs.existsSync('/data/log/roles') && fs.readdirSync('/data/log/roles').length)
 
 // Inspect the backing paths, not just volume names: two local volume names can alias
 // a bind or plugin source. Reject drivers/options rather than guessing their semantics.
-export async function inspectIsolation(c,production,test,docker,{fixture=false}={}) {
+export async function inspectIsolation(c,production,test,docker,{fixture=false,live=[],hostPaths=[],recoveryProbes=new Map()}={}) {
  isolatedResources(c,production,test,{fixture});
+ need(production.every(x=>x.Id),'Isolation production container identity required');
+ const context=await mountContext(docker,[...production,...test,...live],{recoveryProbes});
  const expand=async xs=>Promise.all(xs.flatMap(x=>x.Mounts).map(async m=>{
-  let path=m.Source;
+  need(['volume','bind'].includes(m.Type),'Unsupported isolation mount');
   if(m.Type==='volume') {
-   const v=JSON.parse(await docker(['volume','inspect',m.Name]))[0];
-   need(v.Driver==='local' && !Object.keys(v.Options || {}).length && typeof v.Mountpoint==='string','Unverifiable volume alias/driver');path=v.Mountpoint;
-  } else need(m.Type==='bind','Unsupported isolation mount');
-  if(m.Type==='bind') need(resolve(path)===path && await realpath(path)===path,'Noncanonical isolation bind');
-  return path;
+   let v;try {v=JSON.parse(await docker(['volume','inspect',m.Name]))[0];} catch {need(false,'Isolation volume metadata unavailable');}
+   need(v && v.Name===m.Name && v.Driver==='local' && !Object.keys(v.Options || {}).length && typeof v.Mountpoint==='string','Unverifiable volume alias/driver');
+   if(context.mounted.has(m)) need(v.Mountpoint===m.Source,'Isolation volume backing changed');
+   const identity=context.mounted.get(m) || context.volumes.get(m.Name);
+   need(identity,'Isolation volume backing correspondence unavailable');return identity;
+  }
+  // Live Source belongs to the daemon namespace. Prospective sources belong to host.
+  return context.mounted.get(m) || await context.host(m.Source);
  }));
  const prod=await expand(production),candidate=await expand(test);
- const overlap=(a,b)=>a===b || a.startsWith(b+'/') || b.startsWith(a+'/');
- for(const path of candidate) need(!prod.some(p=>overlap(p,path)),'Integration aliases production mount/credential source');
- if(fixture) for(const path of [c.stateRoot,c.deploymentRoot,c.gateRoot,c.launchRoot,c.inboxRoot,c.ledgerRoot]) {
-  need(typeof path==='string' && resolve(path)===path && !prod.some(p=>overlap(p,path)),'Fixture control path overlaps production');
+ for(const identity of candidate) need(!prod.some(p=>identitiesOverlap(p,identity)),'Integration aliases production mount/credential source');
+ if(fixture) for(const path of [c.stateRoot,c.deploymentRoot,c.gateRoot,c.launchRoot,c.inboxRoot,c.ledgerRoot,...hostPaths]) {
+  const identity=await context.host(path);
+  need(!prod.some(p=>identitiesOverlap(p,identity)),'Fixture control path overlaps production');
  }
 }
