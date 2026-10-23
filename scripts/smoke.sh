@@ -7,6 +7,11 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+fail() {
+  echo "FAIL: $1" >&2
+  docker logs --tail 60 "$container_name" || echo 'FAIL: container logs unavailable' >&2
+  exit 1
+}
 docker run --detach --name "$container_name" --network none \
   --cap-drop ALL --security-opt no-new-privileges \
   --security-opt "seccomp=$repository_root/security/codex-seccomp.json" \
@@ -16,26 +21,9 @@ docker run --detach --name "$container_name" --network none \
   --mount "type=bind,src=$repository_root/patches,dst=/checks/patches,readonly" \
   --mount "type=bind,src=$repository_root/WORKFLOW.md,dst=/config/WORKFLOW.md,readonly" \
   --env GITHUB_REPO=smoke/fixture --env GITHUB_TOKEN=smoke-not-a-credential \
-  "${MOMOFLOW_IMAGE:-momoflow-symphony}" >/dev/null
-docker exec "$container_name" node --input-type=module -e '
-  let ready = false;
-  for (let attempt = 0; attempt < 30; attempt++) {
-    try {
-      const response = await fetch("http://127.0.0.1:4000/api/v1/state", { signal: AbortSignal.timeout(2000) });
-      const state = await response.json();
-      if (!response.ok || state.error || !Array.isArray(state.running) || !Array.isArray(state.retrying)) throw new Error("Invalid state");
-      if (state.running.length || state.retrying.length) throw new Error("Unexpected work");
-      const page = await fetch("http://127.0.0.1:4000/", { signal: AbortSignal.timeout(2000) });
-      if (!page.ok || !(await page.text()).includes("Symphony")) throw new Error("Dashboard unavailable");
-      ready = true;
-      console.log("PASS: Symphony state API and dashboard; no running tasks; network disabled.");
-      break;
-    } catch {
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-  }
-  if (!ready) process.exit(1);
-' || { docker logs --tail 60 "$container_name"; exit 1; }
+  "${MOMOFLOW_IMAGE:-momoflow-symphony}" >/dev/null || fail "startup: docker run exited $? (see command error above)"
+docker exec "$container_name" node /checks/scripts/smoke-readiness.mjs \
+  || fail "readiness command: docker exec/node exited $? (see probe diagnostic or launch error above)"
 docker exec "$container_name" codex --version
 docker exec "$container_name" node /checks/smoke-sandbox.mjs
 
