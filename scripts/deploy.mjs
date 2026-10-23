@@ -1,5 +1,6 @@
 // Install this CLI from a reviewed, pinned checkout OUTSIDE the engine/candidate workspace.
 // There is deliberately no build, pull, shell command hook, policy editor or ledger writer.
+import { verifiedExternalReceipt } from './reconcile-external.mjs';
 import { fixtureMountSources } from './deploy-mount-identity.mjs';
 import { readFile, readdir, lstat, realpath, mkdir, open, rm, copyFile } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
@@ -330,17 +331,70 @@ export function readRoleRows(fs,root) {
   const dir=root+'/log/roles';
   try {if(!fs.lstatSync(dir).isDirectory()) throw Error('Invalid roles layout');}
   catch(e) {if(e.code==='ENOENT') return [];throw e;}
-  return fs.readdirSync(dir).filter(n=>n.endsWith('.json')).map(file=>{
+  const names=fs.readdirSync(dir);
+  for(const n of names) if(!/^[a-f0-9]{64}\.json(?:\.enrolled)?$/.test(n) || (n.endsWith('.enrolled') && !names.includes(n.slice(0,-9)))) throw Error('Unknown ledger owner');
+  return names.filter(n=>n.endsWith('.json')).map(file=>{
     if(!/^[a-f0-9]{64}\.json$/.test(file) || !fs.lstatSync(dir+'/'+file).isFile()) throw Error('Invalid role ledger file');
-    const x=JSON.parse(fs.readFileSync(dir+'/'+file));
-    return {file,issue:x.issue,publication:x.publication,stage:x.stage,in_flight:x.in_flight,active_session:!!x.active_session};
+    const source=dir+'/'+file;
+    const bytes=fs.readFileSync(source),x=JSON.parse(bytes);
+    const enrolled=source+'.enrolled';let enrollment=null;
+    try {
+      const st=fs.lstatSync(enrolled);
+      if(!st.isFile() || st.isSymbolicLink() || (st.mode&0o022) || fs.realpathSync(enrolled)!==enrolled) throw Error('Invalid enrollment file');
+      enrollment=fs.readFileSync(enrolled).toString('base64');
+    } catch(e) {if(e.code!=='ENOENT') throw e;}
+    if((fs.lstatSync(source).mode&0o022) || fs.realpathSync(source)!==source) throw Error('Invalid role ledger permissions/path');
+    return {file,issue:x.issue,publication:x.publication,stage:x.stage,in_flight:x.in_flight,active_session:!!x.active_session,bytes:bytes.toString('base64'),enrollment};
   });
 }
-export async function deploymentOwnersIdle(c,rows) {
-  if(!await controllersIdle(c.stateRoot)) return false;
+// Executed only in the identified engine. Never read a host ledger mirror.
+export async function observeDeploymentOwners(c,{containers,docker,fixture=false}) {
+  const all=await containers(),engine=all.symphony;
+  require(engine.Mounts.some(m=>m.Destination==='/data' && m.Type==='volume' && m.Name===c.dataVolume && m.RW),'Live data volume mismatch');
+  let mounts=engine.Mounts;
+  if(fixture) {
+    const b=[c.previous,c.target].find(b=>b.image===engine.Image);
+    require(b,'Unknown fixture ownership image');
+    mounts=await fixtureMountSources(engine,b.inspect.symphony,docker);
+  }
+  const launch=mounts.find(m=>m.Destination==='/run/momoflow-launch');
+  if(c.launchRoot) require(launch?.Type==='bind' && launch.Source===c.launchRoot && launch.RW===false,'Live launch mount mismatch');
+  const script=`const fs=require('fs');const rows=(${readRoleRows.toString()})(fs,'/data');let manifest=null;
+    if(${!!launch}) { const p='/run/momoflow-launch/active.json';try {
+      const st=fs.lstatSync(p);if(!st.isFile() || st.isSymbolicLink() || fs.realpathSync(p)!==p || (st.mode&0o022)) throw Error('Invalid live manifest');
+      manifest=JSON.parse(fs.readFileSync(p));
+    }catch(e){if(e.code!=='ENOENT')throw e;}}
+    process.stdout.write(JSON.stringify({rows,manifest}));`;
+  const observation=JSON.parse(await docker(['exec',engine.Id,'node','-e',script]));
+  const after=(await containers()).symphony;
+  require(after.Id===engine.Id && same(after.Mounts,engine.Mounts),'Ownership engine/mount changed');
+  if(fixture) require(observation.rows.length===0,'Credential-free fixture must not contain role ledgers');
+  return {...observation,engine:engine.Id};
+}
+export function runtimeOwnersIdle(s) {
+  const a=s.admission;
+  return ['running','retrying'].every(k=>Array.isArray(s[k]) && s[k].length===0) &&
+    a?.contract===1 && a.configured===true && !a.error && a.pending_dispatch===false &&
+    ['running','retrying','claimed','blocked'].every(k=>Array.isArray(a[k]) && a[k].length===0);
+}
+export async function reconciledDeploymentOwners(c,rows,observation) {
+  const reconciled=new Set();
+  for(const entry of await readdir(c.stateRoot,{withFileTypes:true})) {
+    if(!entry.isDirectory() || !hex(entry.name)) continue;
+    if(await optional(join(c.stateRoot,entry.name,'external-reconciliation.json'))) {
+      require(observation && observation.rows===rows && typeof c.launchRoot==='string' && resolve(c.launchRoot)===c.launchRoot,'Live reconciliation observation and explicit launchRoot required');
+      if(await verifiedExternalReceipt(c,entry.name,observation)) reconciled.add(entry.name);
+    }
+  }
+  return reconciled;
+}
+export async function deploymentOwnersIdle(c,rows,observation) {
+  const reconciled=await reconciledDeploymentOwners(c,rows,observation);
+  if(!await controllersIdle(c.stateRoot,reconciled)) return false;
   for(const row of rows) {
+    if(reconciled.has(row.file.slice(0,-5))) continue;
     if(row.in_flight!==false || row.active_session) return false;
-    if(['done','blocked'].includes(row.stage)) continue;
+    if(row.stage==='done') continue;
     if(row.stage!=='await_validation') return false;
     const p=row.publication;
     if(!p || p.repo!==c.repo || p.issue!==row.issue || row.file!==`${digest(`${p.repo}:${p.issue}`)}.json`) return false;
@@ -482,13 +536,10 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     }
     return all;
   };
+  const observeOwners=async()=>observeDeploymentOwners(c,{containers,docker,fixture});
   const ownersIdle=async()=>{
-    const all=await containers();
-    require(all.symphony.Mounts.some(m=>m.Destination==='/data' && m.Type==='volume' && m.Name===c.dataVolume && m.RW),'Live data volume mismatch');
-    const rows=JSON.parse(await docker(['exec',all.symphony.Id,'node','-e',
-      `process.stdout.write(JSON.stringify((${readRoleRows.toString()})(require('fs'),'/data')))`]));
-    if(fixture) require(rows.length===0,'Credential-free fixture must not contain role ledgers');
-    return deploymentOwnersIdle(c,rows);
+    const observation=await observeOwners();
+    return deploymentOwnersIdle(c,observation.rows,observation);
   };
   const isolation=async(recovery=false)=>integrationIsolation(c,await containers(),docker,{fixture,recovery});
   const fixtureState=async()=>{
@@ -583,15 +634,30 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
       await api(found.length?'PATCH':'POST',found.length?`/repos/${c.repo}/issues/comments/${found[0].id}`:path,{body});
     }
   };
+  if(preflight==='ownership') {
+    await authorize();await files(c.previous);await match(c.previous);
+    const s=await state();
+    require(hex(s.admission?.generation) && typeof s.admission?.paused==='boolean','Admission observation unknown');
+    activeContract({...c,deploymentId:s.admission.generation},c.previous,s,s.admission.paused);
+    const observation=await observeOwners();
+    const reconciled=await reconciledDeploymentOwners(c,observation.rows,observation);
+    const historicalOwnersIdle=await deploymentOwnersIdle(c,observation.rows,observation);
+    let controllerLock=false;
+    try {await lstat(join(c.stateRoot,'controller.lock'));controllerLock=true;}catch(e){if(e.code!=='ENOENT')throw e;}
+    const runtimeIdle=runtimeOwnersIdle(s);
+    return {effects:'none',engine:observation.engine,dataVolume:c.dataVolume,reconciledOwners:[...reconciled],historicalOwnersIdle,runtimeIdle,controllerLock,ownersIdle:historicalOwnersIdle && runtimeIdle && !controllerLock};
+  }
   if(preflight) return deploy(c,io,{preflight:true,fixture});
   return withDeploymentLock(c,async()=>{controllerOwned=true;return deploy(c,io,{fixture});});
 }
-export async function controllersIdle(stateRoot) {
+export async function controllersIdle(stateRoot,reconciled=new Set()) {
   for(const entry of await readdir(stateRoot,{withFileTypes:true})) {
+    if(entry.isSymbolicLink()) return false;
     if(!entry.isDirectory()) continue;
     if(!hex(entry.name)) return false; // Unknown owner directory needs inspection.
     const dir=join(stateRoot,entry.name);
     try {await lstat(join(dir,'lock'));return false;} catch(e) {if(e.code!=='ENOENT') throw e;}
+    if(reconciled.has(entry.name)) continue;
     for(const name of ['journal.json','launch.json']) {
       const journal=await optional(join(dir,name));
       if(journal && journal.done!==true) return false;
@@ -613,9 +679,9 @@ export async function withDeploymentLock(c,action) {
 
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
   try {
-    require(process.argv.length<=4 && (!process.argv[3] || process.argv[3]==='--preflight'),'Usage: node scripts/deploy.mjs /operator/request.json [--preflight]');
-    const path=resolve(process.argv[2]), result=await connected(await json(path),path,process.argv[3]==='--preflight');
-    console.log(JSON.stringify({id:result.id,prepared:result.prepared,phase:result.phase}));
+    require(process.argv.length<=4 && (!process.argv[3] || ['--preflight','--ownership-check'].includes(process.argv[3])),'Usage: node scripts/deploy.mjs /operator/request.json [--preflight|--ownership-check]');
+    const path=resolve(process.argv[2]), result=await connected(await json(path),path,process.argv[3]==='--ownership-check'?'ownership':process.argv[3]==='--preflight');
+    console.log(JSON.stringify(process.argv[3]==='--ownership-check'?result:{id:result.id,prepared:result.prepared,phase:result.phase}));
     if(result.phase && !['complete','rolled_back'].includes(result.phase)) process.exitCode=1;
   } catch(e) {console.error(reason(e));process.exitCode=1;}
 }

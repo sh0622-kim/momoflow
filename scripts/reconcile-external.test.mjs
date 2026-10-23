@@ -6,7 +6,7 @@ import {join} from 'node:path';
 import {fixture} from './post-pr-fixture.mjs';
 import {atomic,digest,keyFor,withControllerLock} from './post-pr.mjs';
 import {reconcileExternal,verifiedExternalReceipt,foreignOwners,observedWorkersIdle,observeReconciliationWorkers,verifyReconciliationOperator} from './reconcile-external.mjs';
-import {controllersIdle,deploymentOwnersIdle} from './deploy.mjs';
+import {controllersIdle,deploymentOwnersIdle,runtimeOwnersIdle} from './deploy.mjs';
 import {inspect,launchConfig} from './launch.mjs';
 const hex=n=>String(n).repeat(64),sha=n=>String(n).repeat(40);
 test('worker observation accepts only complete known idle engine processes',()=>{
@@ -57,14 +57,15 @@ test('external reconciliation check is effect-free and reports separate original
   assert.deepEqual(await snapshot(f.root),before);assert.ok(f.calls.every(c=>c.method==='GET'));
  }finally{await f.clean();}
 });
-test('reconciliation archives exact originals, retires only old manifest, restores gate; foreign launch passes but deployment stays strict',async()=>{
+test('reconciliation archives exact originals, retires only old manifest, restores gate; launch and deployment accept only the verified historical owner',async()=>{
  const f=await setup();try {
   const before=await snapshot(f.root);await assert.rejects(foreignOwners({...f.c,issue:'2'}),/unfinished/);
   assert.equal((await f.run()).status,'externally-reconciled');
   for(const name of ['ledger','enrollment','launchJournal','recovery','validation','gate'])assert.equal(digest(await readFile(f.paths[name])),before[f.paths[name].slice(f.root.length)]);
   await assert.rejects(lstat(f.paths.manifest),{code:'ENOENT'});assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
   await foreignOwners({...f.c,issue:'2',gateRoot:undefined});assert.equal(await controllersIdle(f.c.stateRoot),false);
-  assert.equal(await deploymentOwnersIdle(f.c,[{file:keyFor(f.c)+'.json',...f.ledger}]),false);
+  const observation=await liveObservation(f);
+  assert.equal(await deploymentOwnersIdle(f.c,observation.rows,observation),true);
   const after=await snapshot(f.root);assert.equal((await f.run()).unchanged,true);assert.deepEqual(await snapshot(f.root),after);
   assert.equal(f.calls.filter(c=>c.method!=='GET').length,0);
  }finally{await f.clean();}
@@ -195,3 +196,72 @@ for(const [name,change] of [
  ['unproven bind',f=>{f.context.host=async()=>({identity:'wrong'});}],
  ['extra mount',f=>{f.operator.Mounts.push({Type:'bind',Source:'/other',Destination:'/other',RW:true});}],
 ])test('operator helper adapter rejects '+name,async()=>{const f=operatorFixture();change(f);await assert.rejects(f.verify());});
+
+// Simulated live transport; exact source/archive bytes use real temporary files.
+async function liveObservation(f) {
+ return {rows:[{file:keyFor(f.c)+'.json',...JSON.parse(await readFile(f.paths.ledger)),
+  bytes:(await readFile(f.paths.ledger)).toString('base64'),enrollment:(await readFile(f.paths.enrollment)).toString('base64')}],manifest:null};
+}
+for(const [name,mutate] of [
+ ['missing receipt',async f=>rm(join(f.dir,'external-reconciliation.json'))],
+ ['incomplete receipt',async f=>{const p=join(f.dir,'external-reconciliation.json'),r=JSON.parse(await readFile(p));r.done=false;await atomic(p,r);}],
+ ['wrong repo',(f,o)=>{f.c.repo='other/repo';}],
+ ['wrong base',(f,o)=>{f.c.base='other';}],
+ ['wrong ledger path',f=>{f.c.ledgerRoot+='/other';}],
+ ['wrong journal root',f=>{f.c.stateRoot+='/other';}],
+ ['wrong launch path',f=>{f.c.launchRoot+='/other';}],
+ ['wrong gate path',f=>{f.c.gateRoot+='/other';}],
+ ['missing live row',(f,o)=>{o.rows.length=0;}],
+ ['missing live enrollment',(f,o)=>{o.rows[0].enrollment=null;}],
+ ['changed live ledger',(f,o)=>{o.rows[0].bytes=Buffer.from(JSON.stringify({...f.ledger,in_flight:false})).toString('base64');}],
+ ['changed live enrollment',(f,o)=>{o.rows[0].enrollment=Buffer.from('{}').toString('base64');}],
+ ['changed launch journal',async f=>writeFile(f.paths.launchJournal,'changed')],
+ ['unexpected controller journal',async f=>atomic(f.paths.controllerJournal,{done:true})],
+ ['changed recovery',async f=>writeFile(f.paths.recovery,'changed')],
+ ['changed validation',async f=>writeFile(f.paths.validation,'changed')],
+ ['missing archive',async f=>{const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));await rm(r.archive,{recursive:true});}],
+ ['changed archive',async f=>{const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));await rm(join(r.archive,'ledger'));await writeFile(join(r.archive,'ledger'),'changed',{mode:0o400});}],
+ ['wrong archive path',async f=>{const p=join(f.dir,'external-reconciliation.json'),r=JSON.parse(await readFile(p));r.archive+='/other';await atomic(p,r);}],
+ ['reactivated manifest',(f,o)=>{o.manifest=f.manifest;}],
+ ['unknown manifest',(f,o)=>{delete o.manifest;}],
+ ['per issue lock',async f=>atomic(join(f.dir,'lock'),{pid:123})],
+ ['other active ledger',(f,o)=>{o.rows.push({file:hex(9)+'.json',stage:'build',in_flight:true});}],
+ ['receipt-less idle blocked',(f,o)=>{o.rows.push({file:hex(9)+'.json',stage:'blocked',in_flight:false,active_session:false});}],
+ ['receipt-less interrupted blocked',(f,o)=>{o.rows.push({file:hex(9)+'.json',stage:'blocked',in_flight:true,active_session:true});}],
+ ['other unknown ledger',(f,o)=>{o.rows.push({file:hex(9)+'.json',in_flight:false,stage:'unknown'});}],
+ ['unknown controller directory',async f=>mkdir(join(f.c.stateRoot,'unknown'))],
+ ['unfinished foreign journal',async f=>{const d=join(f.c.stateRoot,hex(9));await mkdir(d);await atomic(join(d,'launch.json'),{dispatched:true});}],
+])test('deployment receipt owner rejects '+name,async()=>{
+ const f=await setup();try {
+  await f.run();const observation=await liveObservation(f);await mutate(f,observation);
+  let accepted=false;try{accepted=await deploymentOwnersIdle(f.c,observation.rows,observation);}catch{}assert.equal(accepted,false);
+ }finally{await f.clean();}
+});
+test('deployment uses observed bytes instead of a host ledger mirror and rechecks receipts every time',async()=>{
+ const f=await setup();try {
+  await f.run();const observation=await liveObservation(f);
+  // The host copy is stale/unavailable: live observation still binds the archived original.
+  await writeFile(f.paths.ledger,'stale host mirror');await rm(f.paths.enrollment);
+  const before=await snapshot(f.root);
+  assert.equal(await deploymentOwnersIdle(f.c,observation.rows,observation),true);
+  assert.deepEqual(await snapshot(f.root),before);
+  await writeFile(f.paths.launchJournal,'changed between drain and replacement');
+  await assert.rejects(deploymentOwnersIdle(f.c,observation.rows,observation),/bytes changed/);
+ }finally{await f.clean();}
+});
+test('verified historical owner never excuses active or unknown runtime work',async()=>{
+ const f=await setup();try {
+  await f.run();const observation=await liveObservation(f);
+  assert.equal(await deploymentOwnersIdle(f.c,observation.rows,observation),true);
+  const state=await f.io.engine();assert.equal(runtimeOwnersIdle(state),true);
+  for(const key of ['running','retrying']) {
+   assert.equal(runtimeOwnersIdle({...state,[key]:['worker']}),false);
+   assert.equal(runtimeOwnersIdle({...state,[key]:undefined}),false);
+  }
+  for(const key of ['running','retrying','claimed','blocked']) {
+   assert.equal(runtimeOwnersIdle({...state,admission:{...state.admission,[key]:['owner']}}),false);
+   assert.equal(runtimeOwnersIdle({...state,admission:{...state.admission,[key]:undefined}}),false);
+  }
+  assert.equal(runtimeOwnersIdle({...state,admission:{...state.admission,pending_dispatch:true}}),false);
+ }finally{await f.clean();}
+});

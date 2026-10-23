@@ -82,7 +82,7 @@ node /operator/momoflow/scripts/deploy.mjs /operator/requests/deploy.json --pref
 node /operator/momoflow/scripts/deploy.mjs /operator/requests/deploy.json
 ```
 
-`--preflight`는 설정·이미지·merge/review/검사 로그·현재 컨테이너·계약·controller 소유권을
+`--preflight`는 설정·이미지·merge/review/검사 로그·현재 컨테이너·계약을
 조회한다. lock/journal/comment/label/manifest 생성, pull/build/create/stop은 하지 않는다.
 작업이 진행 중이면 실제 실행의 pause 이후 drain에서 기다린다. 검사 성공은 배포 성공이 아니다.
 CLI에는 임의 명령 hook, 후보 스크립트 실행, 자동 label, ledger 수정 기능이 없다.
@@ -283,3 +283,52 @@ Codex login status, token-file GitHub 읽기, 자격 gate와 예외 배포 정�
 
 이 정책/구현 PR의 완료는 #16의 실 Docker 실험 완료나 운영 배포 승인이 아니다.
 실제 정상2·복구1 및 나머지 조건 전에는 #16을 완료하지 않고 기존 2/3·terminal 기록을 유지한다.
+
+
+## GH-24 후보: 외부 완료 owner의 읽기 전용 검사
+
+후보의 배포 소유권 판단은 launch와 동일한 `verifiedExternalReceipt`를 사용한다.
+보존된 interrupted ledger와 미완료 launch/controller journal을 일반 완료로 고쳐 쓰지 않는다.
+정확한 receipt·원본 바이트·archive·repo/issue/경로·원본/외부 사용 이력이 일치하는 과거 owner만
+해당 미완료 표시의 예외로 인정한다. receipt 없는 blocked owner는 계속 차단한다.
+활성 worker/claim/retry/pending, 불명 상태, 다른 owner, per-issue/shared lock은 계속 차단한다.
+최종 교체와 복구 경계마다 새로 조회하며 receipt 성공을 캐시하지 않는다.
+
+외부 운영자는 **리뷰한 정확한 head를 별도 고정 checkout에 설치한 뒤**, 현재 배포의
+operator request를 사용하여 다음 명령을 실행한다. 코딩 workspace에서 실행하지 않는다.
+
+```sh
+node /operator/momoflow/scripts/deploy.mjs /operator/requests/deploy.json --ownership-check
+```
+
+request의 기존 배포 authority·고정 설치·scope/bundle 계약을 유지한다. `controllerVersion`은
+설치한 reviewed commit이어야 한다. 현재 엔진은 `previous`의 고정 파일·실제 identity와 일치해야 하며, `manifest`는 현재
+엔진이 보고한 정확한 launch 상태여야 한다.
+receipt를 판단하려면 `launchRoot`를 현재 엔진의 `/run/momoflow-launch:ro` bind의 정확한
+canonical host 경로로 명시한다. `ledgerRoot`는 receipt에 고정된 원본 경로와 같아야 하지만
+host 파일을 읽지 않는다. 기존 `stateRoot`, `gateRoot`도 receipt의 경로와 같아야 한다.
+다른 디렉터리에 receipt를 복사하여 scope를 바꾸지 않는다.
+
+명령은 현재 Compose project의 엔진 ID와 `/data` named volume 이름/RW를 확인하고,
+그 **실제 엔진의 docker exec**로 ledger/enrollment 바이트와 현재 launch manifest를 읽는다.
+관찰 후 엔진 ID/mount를 재확인한다. 오래된 host 복사본이나 모의 runtime으로 대체하지 않는다.
+controller 원본·archive·receipt는 기존 private canonical 파일 검사를 그대로 적용한다.
+lock 획득, journal/gate/manifest/label 변경, 배포·정지·모델 호출은 하지 않는다.
+`--preflight`는 이 소유권 판정을 호출하지 않으므로 통과해도 idle 증거가 아니다.
+
+출력에서 다음을 구분한다. 출력은 관찰 시점의 증거이며 배포 허가나 성공 receipt가 아니다.
+
+| 출력 | 뜻 |
+| --- | --- |
+| `engine`, `dataVolume`, `effects:"none"` | 실제 읽은 엔진/볼륨과 진단의 무변경 경계 |
+| `reconciledOwners` | 모든 receipt/source/archive 검증을 통과한 정확한 owner key 목록 |
+| `historicalOwnersIdle` | 모든 과거 runner/controller owner가 완료 또는 검증된 외부 완료인가 |
+| `runtimeIdle`, `controllerLock` | 현재 worker/admission 유휴 여부와 shared lock 존재 여부 |
+| `ownersIdle` | 위 조건을 모두 만족한 시점의 전체 소유권 판정 |
+
+GH20의 owner key는 `sha256("sh0622-kim/momoflow:20")`다. 이를 `reconciledOwners`에서 확인한다.
+현재 GH-24가 실행 중이면 GH20 검증이 성공해도 `historicalOwnersIdle`/`runtimeIdle` 및
+전체 `ownersIdle`은 false일 수 있다. false를 진단 명령의 실행 실패나 배포 성공으로 해석하지 않는다.
+증거가 없거나 변조되면 명령은 비정상 종료하며 성공 목록을 출력하지 않는다.
+운영 기록에는 설치 commit, 현재 엔진 ID/볼륨, 관찰 시각, 명령 출력과 GH20 key를 보존한다.
+이 후보의 격리 회귀는 실운영 GH20 검사와 다르다. 외부 설치·live 관찰·전체 배포는 미실행이다.

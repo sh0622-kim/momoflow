@@ -311,3 +311,50 @@ test('unacknowledged generation times out without replacement and leaves admissi
 
 // Include isolated provenance regressions in the existing host/CI test entrypoint.
 import './deploy-fixture.test.mjs';
+
+import {observeDeploymentOwners,runtimeOwnersIdle} from './deploy.mjs';
+import {runInNewContext} from 'node:vm';
+test('live ownership adapter reads identified volume and current manifest; no host mirror fallback or writes',async()=>{
+ const root=await mkdtemp('/tmp/momoflow-owner-adapter-');
+ try {
+  await mkdir(join(root,'log/roles'),{recursive:true});await mkdir(join(root,'workspaces'));await mkdir(join(root,'launch'));
+  const file=h(1)+'.json',ledger={issue:'1',stage:'blocked',iterations:3,in_flight:true,active_session:{thread_id:'old'}};
+  await writeFile(join(root,'log/roles',file),JSON.stringify(ledger));await writeFile(join(root,'log/roles',file+'.enrolled'),'enrolled');
+  const c={dataVolume:'actual-volume',launchRoot:'/operator/launch',ledgerRoot:'/stale/host-copy'};
+  const engine={Id:h(3),Mounts:[{Destination:'/data',Type:'volume',Name:c.dataVolume,RW:true},{Destination:'/run/momoflow-launch',Type:'bind',Source:c.launchRoot,RW:false}]};
+  const map=p=>p.startsWith('/run/momoflow-launch')?p.replace('/run/momoflow-launch',root+'/launch'):p.replace(/^\/data/,root);
+  const mapped={...fs};
+  for(const method of ['lstatSync','readFileSync','readdirSync']) mapped[method]=(p,...args)=>fs[method](map(p),...args);
+  mapped.realpathSync=p=>{const real=fs.realpathSync(map(p));return real===map(p)?p:real;};
+  let calls=[],current=engine;
+  const ports={containers:async()=>({symphony:current}),docker:async args=>{
+   calls.push(args.slice(0,4));assert.deepEqual(args.slice(0,4),['exec',engine.Id,'node','-e']);let out;
+   runInNewContext(args[4],{require:name=>{assert.equal(name,'fs');return mapped;},process:{stdout:{write:s=>{out=s;}}}});return out;
+  }};
+  const first=await observeDeploymentOwners(c,ports);
+  assert.equal(first.engine,engine.Id);assert.equal(first.manifest,null);assert.equal(first.rows[0].bytes,Buffer.from(JSON.stringify(ledger)).toString('base64'));
+  assert.equal(first.rows[0].enrollment,Buffer.from('enrolled').toString('base64'));
+  await writeFile(join(root,'launch/active.json'),JSON.stringify({issue:'1'}));
+  assert.deepEqual((await observeDeploymentOwners(c,ports)).manifest,{issue:'1'});
+  await assert.rejects(observeDeploymentOwners({...c,dataVolume:'stale-volume'},ports),/Live data volume/);
+  await assert.rejects(observeDeploymentOwners({...c,launchRoot:'/other'},ports),/launch mount/);
+  await writeFile(join(root,'log/roles',file),'invalid');await assert.rejects(observeDeploymentOwners(c,ports));
+  assert.ok(calls.length>=2);
+ }finally{await rm(root,{recursive:true,force:true});}
+});
+test('live role reader blocks unknown files, orphan enrollment and writable enrollment',async()=>{
+ const root=await mkdtemp('/tmp/momoflow-owner-layout-');try {
+  await mkdir(join(root,'log/roles'),{recursive:true});await mkdir(join(root,'workspaces'));
+  const dir=join(root,'log/roles');
+  await writeFile(join(dir,'unknown'),'x');assert.throws(()=>readRoleRows(fs,root),/Unknown ledger/);await rm(join(dir,'unknown'));
+  await writeFile(join(dir,h(1)+'.json.enrolled'),'x');assert.throws(()=>readRoleRows(fs,root),/Unknown ledger/);
+  await writeFile(join(dir,h(1)+'.json'),'{}');fs.chmodSync(join(dir,h(1)+'.json.enrolled'),0o666);assert.throws(()=>readRoleRows(fs,root),/enrollment/);
+ }finally{await rm(root,{recursive:true,force:true});}
+});
+
+test('deployment re-observes owner evidence after drain before replacement',async()=>{
+ const f=fixture();let observations=0;
+ f.io.ownersIdle=async()=>++observations===1;
+ assert.equal((await deploy(f.c,f.io)).phase,'deferred');
+ assert.ok(observations>=2);assert.ok(!f.calls.some(x=>x.startsWith('replace:')));
+});

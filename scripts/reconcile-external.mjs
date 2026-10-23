@@ -40,26 +40,32 @@ function binding(c) {
  return {v:1,repo:c.repo,issue:c.issue,base:c.base,pr:c.pr,head:c.head,tree:c.tree,merge:c.merge,originalIterations:c.originalIterations,externalIterations:c.externalIterations,engineContainer:c.engineContainer,engineImage:c.engineImage,runnerSource:c.runnerSource,...(c.configurationHash?{configurationHash:c.configurationHash}:{}),evidence:c.evidence};
 }
 // The receipt is an additional historical fact, never runner completion or a budget reset.
-export async function verifiedExternalReceipt(c,key) {
+export async function verifiedExternalReceipt(c,key,observation) {
  const dir=join(c.stateRoot,key),path=join(dir,'external-reconciliation.json');
  const receipt=await optional(path);if(!receipt)return false;
  await privatePath(path);const b=receipt.binding;
- need(receipt.v===1 && receipt.status==='externally-reconciled' && receipt.done===true && sha(receipt.controllerVersion) && b?.v===1 && b.repo===c.repo && key===keyFor(b) && receipt.id===digest(b) && [b.head,b.tree,b.merge].every(sha),'Invalid external reconciliation receipt');
+ need(receipt.v===1 && receipt.status==='externally-reconciled' && receipt.done===true && sha(receipt.controllerVersion) && b?.v===1 && b.repo===c.repo && b.base===c.base && key===keyFor(b) && receipt.id===digest(b) && [b.head,b.tree,b.merge].every(sha),'Invalid external reconciliation receipt');
  need(same(Object.keys(b.evidence).sort(),['controllerJournal','enrollment','gate','launchJournal','ledger','manifest','recovery','validation'].sort()),'Incomplete reconciliation receipt');
  const scope={...c,issue:b.issue},expected=paths(scope);
  need(receipt.archive===join(dir,'external-reconciliation',receipt.id),'Reconciliation archive path mismatch');
  await privatePath(receipt.archive,true);
  for(const [name,ref] of Object.entries(b.evidence)) {
   if(expected[name])need(ref.path===expected[name],'Reconciliation receipt source path mismatch');
-  if(!['manifest','gate'].includes(name))await bytes(ref);
+  if(observation && ['ledger','enrollment'].includes(name)) {
+   const row=observation.rows.find(r=>r.file===key+'.json');
+   need(row,'Reconciled live ledger missing');
+   const value=name==='ledger'?row.bytes:row.enrollment;
+   need(typeof value==='string' && ref.hash!==null && digest(Buffer.from(value,'base64'))===ref.hash,'Reconciliation live evidence bytes changed');
+  } else if(!['manifest','gate'].includes(name))await bytes(ref);
   const archived={path:join(receipt.archive,name),hash:ref.hash};await bytes(archived);
  }
- const ledger=JSON.parse(await readFile(b.evidence.ledger.path));
+ const ledger=JSON.parse(observation?Buffer.from(observation.rows.find(r=>r.file===key+'.json').bytes,'base64'):await readFile(b.evidence.ledger.path));
  need(ledger.issue===b.issue && ledger.launch?.repo===b.repo && ledger.launch.base===b.base && ledger.launch.limit===b.originalIterations && keyFor(ledger.launch)===key && ledger.iterations===b.originalIterations,'Receipt ledger scope/history mismatch');
  need(same(JSON.parse(await readFile(join(receipt.archive,'manifest'))),ledger.launch),'Archived manifest scope mismatch');
  const recovery=JSON.parse(await readFile(b.evidence.recovery.path)),validation=JSON.parse(await readFile(b.evidence.validation.path));
  need(recovery.issue===Number(b.issue) && recovery.pr===b.pr && recovery.head===b.head && recovery.tree===b.tree && recovery.previous_iterations===b.originalIterations && recovery.additional_iterations_used===b.externalIterations && validation.commit===b.merge && validation.head===b.head && validation.tree===b.tree,'Receipt external completion/history mismatch');
- const manifest=await optional(expected.manifest);
+ const manifest=observation?observation.manifest:await optional(expected.manifest);
+ need(manifest===null || (manifest && typeof manifest==='object'),'Live manifest observation required');
  need(!manifest || !same(manifest,ledger.launch),'Reconciled manifest is still active');
  return true;
 }

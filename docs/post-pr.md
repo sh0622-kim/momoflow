@@ -350,6 +350,8 @@ shared lock은 자동 만료·삭제하지 않으며 운영자 확인 대상이�
 후속 **다른 이슈**의 trusted launch는 이 receipt와 archive 및 현재 원본 ledger/enrollment/
 journal/외부 근거 hash를 다시 확인한 경우에만 해당 과거 owner를 조정된 기록으로 인정한다.
 같은 이슈의 기존 ledger 채택·재실행은 여전히 거부한다. 자동 ready·새 manifest·후속 dispatch는
-없다. 외부 근거 파일도 완료 후 불변으로 보존해야 한다. 일반 배포의 `controllersIdle` 및
-`deploymentOwnersIdle`은 변경하지 않으므로 원본 interrupted owner는 여전히 배포를 막는다.
-배포 lifecycle 예외를 이 receipt로 우회하지 않는다.
+없다. 외부 근거 파일도 완료 후 불변으로 보존해야 한다. GH-24 후보는 같은 receipt 검증을
+일반 배포 소유권 판단에도 연결한다. 정확한 live ledger/enrollment·archive·journal·scope가
+일치하고 해당 manifest가 다시 활성화되지 않은 과거 owner만 인정한다.
+[읽기 전용 소유권 검사](deployment.md#gh-24-후보-외부-완료-owner의-읽기-전용-검사)를 따르며,
+배포 lifecycle·권한·검사 예외를 만들지 않는다. 후보 설치와 실운영 검사는 별도 경계다.
