@@ -113,6 +113,9 @@ symlink 또는 alias/plugin 옵션처럼 검증할 수 없는 경우 구체적�
 btrfs subvolume, FUSE, network filesystem 등 layered/shared backing은 다른 device라는
 이유로 분리됐다고 간주하지 않고 `Isolation filesystem backing unsupported`로 중단한다.
 이 제한을 우회하기 위해 host mount나 권한을 변경하지 않는다.
+WSL의 관련 없는 오래된 `//deleted` bind root는 mountinfo에서 보존하되 대응 근거로
+사용하지 않는다. 비정규 root/target 행이 검사 경로의 상위·하위·동일 mount와 겹치거나
+target 위치를 확정할 수 없으면 중단한다. 경로 정규화는 보수적인 겹침 검사에만 사용한다.
 
 아래 JSON 하나만 준비한다. 실제 absolute/canonical 경로·기존 운영 container ID/project와
 비어 있는 loopback port를 넣는다. `root`는 존재하지 않아야 하며 부모는 operator 소유,

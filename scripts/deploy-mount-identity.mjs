@@ -11,7 +11,6 @@ export function mountRows(text) {
   const f=line.split(' '),sep=f.indexOf('-');
   need(sep>=6 && f.length>sep+3 && /^\d+:\d+$/.test(f[2]),'Isolation mountinfo is malformed');
   const root=unescape(f[3]),target=unescape(f[4]);
-  need(resolve(root)===root && resolve(target)===target,'Isolation mountinfo path is ambiguous');
   return {device:f[2],root,target,filesystem:f[sep+1],source:unescape(f[sep+2]),options:f[sep+3]};
  });
 }
@@ -19,6 +18,14 @@ function device(n) {
  n=BigInt(n);return `${((n>>8n)&0xfffn)|((n>>32n)&0xfffff000n)}:${(n&0xffn)|((n>>12n)&0xffffff00n)}`;
 }
 export function filesystemIdentity(rows,path,s) {
+ // Retain unusable rows (including WSL's stale //deleted bind roots). They
+ // cannot supply identities, but an unrelated mount must not poison the table.
+ // Normalization is only a conservative overlap check, never identity evidence.
+ for(const r of rows) if(resolve(r.root)!==r.root || resolve(r.target)!==r.target) {
+  const located=r.target.startsWith('/') && !r.target.split('/').some(p=>p==='.' || p==='..');
+  need(located && [r.target,resolve(r.target)].every(target=>!within(path,target) && !within(target,path)),
+   'Isolation mountinfo path is ambiguous');
+ }
  const matches=rows.filter(r=>within(path,r.target)).sort((a,b)=>b.target.length-a.target.length);
  need(matches.length && (matches.length===1 || matches[0].target!==matches[1].target),'Isolation mountinfo has missing/stacked mount');
  need(/^\d+$/.test(String(s.dev)) && /^[1-9]\d*$/.test(String(s.ino)),'Isolation stat identity invalid');

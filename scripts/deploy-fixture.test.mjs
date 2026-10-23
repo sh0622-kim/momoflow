@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { command } from './post-pr-docker.mjs';
 import { fixtureSource, fixtureEvidence, fixtureLabels, integrationPlan, isolatedResources } from './deploy-fixture.mjs';
 import { connected, integrationIsolation, replaceConnectedBundle } from './deploy.mjs';
@@ -324,18 +324,6 @@ test('actual local Node probe reads kernel/stat metadata only (no live Docker cl
   assert.equal(p.points[0].path,await realpath(path));
   assert.equal(p.boot,(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim());
   assert.equal(p.mountinfo,await readFile('/proc/self/mountinfo','utf8'));
-  // WSL can retain deleted bind roots with "//deleted" in real mountinfo.
-  // Explicitly identify noncanonical kernel paths, then require the exact
-  // fail-closed parser result rather than accepting arbitrary probe errors.
-  const decode=s=>s.replace(/\\(040|011|012|134)/g,(_,n)=>String.fromCharCode(parseInt(n,8)));
-  const ambiguous=p.mountinfo.trim().split('\n').some(line=>{
-   const fields=line.split(' ');return [fields[3],fields[4]].some(field=>{
-    const path=decode(field);return resolve(path)!==path;
-   });
-  });
-  if(ambiguous) {
-   assert.throws(()=>mountRows(p.mountinfo),{message:'Isolation mountinfo path is ambiguous'});
-  } else {
   const rows=mountRows(p.mountinfo),backing=rows.filter(r=>path===r.target || path.startsWith(r.target==='/'?'/':r.target+'/')).sort((a,b)=>b.target.length-a.target.length)[0];
   assert.ok(backing,'actual probe mountinfo must cover the real temporary directory');
   if(['ext2','ext3','ext4','xfs','tmpfs'].includes(backing.filesystem)) {
@@ -345,9 +333,33 @@ test('actual local Node probe reads kernel/stat metadata only (no live Docker cl
    // fail closed, including overlay in the existing Docker validator.
    assert.throws(()=>filesystemIdentity(rows,path,p.points[0]),/filesystem backing unsupported/);
   }
-  }
   assert.deepEqual(Object.keys(p).sort(),['boot','mountinfo','points']);
  } finally {await rm(root,{recursive:true,force:true});}
+});
+namespaceTest('unrelated deleted WSL roots remain in mountinfo; ambiguous relevant roots and targets fail closed',async()=>{
+ const x=await namespaceFixture();try {
+  const base=await readFile('/proc/self/mountinfo','utf8'),s=await stat(x.root,{bigint:true});
+  const stale=Array.from({length:8},(_,i)=>`${i+10} 0 8:1 /tmp/old-${i}//deleted /mnt/wsl/docker-desktop-bind-mounts/Ubuntu-24.04/old-${i} rw - ext4 /dev/test rw`);
+  const rows=mountRows(base+stale.join('\n'));
+  assert.equal(rows.length,9);assert.equal(rows[1].root,'/tmp/old-0//deleted');
+  assert.deepEqual(filesystemIdentity(rows,x.root,s),filesystemIdentity(mountRows(base),x.root,s));
+  for(const [root,target] of [
+   ['/stale//deleted',x.root],['/stale//deleted',x.root+'/child'],['/stale//deleted','/tmp'],
+   ['/',x.root+'/../'+x.root.split('/').at(-1)],['/',x.root+'/../elsewhere'],
+   ['/','/unrelated/../elsewhere'],['/',x.root+'//child'],['/','relative-target'],
+  ]) {
+   const table=mountRows(base+`99 0 8:1 ${root} ${target} rw - ext4 /dev/test rw`);
+   assert.equal(table.at(-1).root,root);assert.equal(table.at(-1).target,target);
+   assert.throws(()=>filesystemIdentity(table,x.root,s),{message:'Isolation mountinfo path is ambiguous'});
+  }
+  const probe=x.probes.get('engine'),original=probe.mountinfo;
+  probe.mountinfo=original+'\n'+stale.join('\n');
+  await inspectIsolation(x.c,x.production,[x.prospective(x.root+'/test')],x.docker,{fixture:true});
+  for(const target of ['/mounted-0','/mounted-0//child']) {
+   probe.mountinfo=original+`\n99 0 8:1 /stale//deleted ${target} rw - ext4 /dev/test rw`;
+   await assert.rejects(inspectIsolation(x.c,x.production,[x.prospective(x.root+'/test')],x.docker,{fixture:true}),/ambiguous|stacked|nested/);
+  }
+ } finally {await rm(x.root,{recursive:true,force:true});}
 });
 namespaceTest('installer isolation boundary fails safely before journal/root/volume/pause; check success remains resource-free',async()=>{
  const x=await namespaceFixture();try {
