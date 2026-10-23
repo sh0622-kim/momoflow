@@ -17,6 +17,10 @@ WORKDIR /opt/symphony/elixir
 COPY patches/github-token-file.patch /opt/momoflow/github-token-file.patch
 RUN git -C /opt/symphony apply --check /opt/momoflow/github-token-file.patch \
     && git -C /opt/symphony apply /opt/momoflow/github-token-file.patch
+COPY patches/role-flow.patch /opt/momoflow/role-flow.patch
+RUN git -C /opt/symphony apply --check /opt/momoflow/role-flow.patch \
+    && git -C /opt/symphony apply /opt/momoflow/role-flow.patch
+COPY engine/role_runner.ex /opt/symphony/elixir/lib/symphony_elixir/role_runner.ex
 ENV MIX_ENV=prod
 RUN mix local.hex --force && mix local.rebar --force && mix deps.get --only prod && mix build
 RUN useradd --create-home --uid 1000 momo \

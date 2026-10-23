@@ -67,6 +67,12 @@ abstraction layers, services, or dependencies solely for hypothetical future nee
 Symphony owns scheduling, workspaces, retries, and Codex session lifecycle. Keep upstream
 unchanged until an observed limitation and a small acceptance test justify absorbing a feature.
 
+When MOMOFLOW_ROLE_FLOW is enabled, the engine appends a single-stage contract below this
+prompt. Follow that stage boundary: plan, build, separate review, correction when needed, then
+publish. Do not advance stages yourself or spawn parallel agents. The reserved untracked
+.momoflow-role-result.json is engine handoff data; exclude it from commits and PRs. The engine
+records settings, session IDs, HEAD/diff and the shared count under /data/log/roles.
+
 ## Improvement loop
 
 1. Inspect the current code, issue comments, existing PR, and evidence before changing anything.

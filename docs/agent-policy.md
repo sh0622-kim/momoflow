@@ -1,8 +1,9 @@
 # 에이전트 역할과 실행 정책
 
-상태: 역할별 세션 전환은 아직 구현하지 않았다. 부트스트랩 WORKFLOW.md는 단일 Codex
-app-server를 Sol / medium / service_tier default로 명시해 실행한다. 사전 thread/start에서
-같은 유효 설정을 확인했다. 이는 역할별 전환·독립 Astra 검토의 구현 또는 검증을 뜻하지 않는다.
+상태: Docker 후보에 `MOMOFLOW_ROLE_FLOW=1` 순차 실행 연동을 구현했다. 검증·별도 배포
+이후 새 실행부터 적용한다. 현재 세션이나 실행 중인 엔진을 교체하지 않는다. 모의 계약 검사와
+실제 thread/start 설정 조회는 실제 모델 호출·독립 Astra 코드 리뷰와 구분한다. 해당 PR의
+정확한 head 검증 근거를 확인해야 하며 이 문서는 실운영 통과 증거가 아니다.
 
 ## 역할별 설정
 
@@ -57,3 +58,30 @@ flowchart LR
 - 모의 검사, 실제 설정 조회, 실제 모델 실행 검증을 구분해 기록한다.
 
 작업 이슈와 실행 기록은 [기록 규칙](records.md), 배포는 [배포 정책](deployment.md)을 따른다.
+
+## 순차 실행 MVP의 동작과 한계
+
+`engine/role_runner.ex`와 `patches/role-flow.patch`가 Symphony의 기존 세션 API를 사용한다.
+기획·구현·검토·수정·게시마다 새 thread를 열고 응답의 model, reasoningEffort,
+serviceTier=default, granular 승인 전부 false, workspaceWrite/networkAccess=false를 검사한다.
+검토와 수정에는 이전 세션의 결과와 실제 HEAD/diff 해시를 전달한다. 게시도 Sol/medium이며
+검토한 파일을 GitHub API로 PR에 보존하고 head별 검증을 기록한다. 필수 사람 리뷰를 대신하지 않는다.
+
+기본 3회 카운터는 구현 진입 전에 증가한다. 기획·검토·게시가 새 예산을 만들지 않는다.
+repo+issue별 `/data/log/roles/*.json`은 `/data` 볼륨에 남는다. 세션 시작 ID, 설정, 역할 결과와
+HEAD/diff를 기록한다. 실패·중단·예산 소진·완료 ledger는 자동 재실행하지 않으며 ready 제거를
+조회로 확인하고 같은 workpad에 중단 사유를 남긴다. workpad가 여러 개이거나 100개 댓글로
+검색이 불완전하면 차단한다. 최신 누적 행의 기본 예산을 해석할 수 없을 때 과거 행으로 되돌리지 않는다.
+이번 #2의 추가 3회는 이 기능을 만드는 부트스트랩 실행에 한정한다. 새 runner가 댓글에서 예산
+확대를 승인하거나 전역 기본값을 6회로 바꾸지 않는다. 예외 이슈는 운영자 인계가 필요하다.
+
+기획·검토·게시는 HEAD/diff 변경을 발견하면 차단한다. 이는 사후 변경 감지이며 읽기 전용
+샌드박스나 GitHub 권한 분리가 아니다. 승인·네트워크 경계는 기존 설정 그대로다.
+실행 중단 시 active session과 in-flight 표시를 보존한다. 자동 checkpoint 복구나 PR 리뷰 후
+자동 재개는 구현하지 않았다. 운영자는 ledger·workpad·PR head와 남은 예산을 확인한 후
+명시적인 수동 복구를 결정하며 ledger 삭제로 예산을 초기화하지 않는다.
+
+현재 MVP는 로컬 worker 전용이며 SSH role flow를 지원하지 않는다. `max_turns`가 lifetime
+예산을 강제한다고 표현하지 않는다. 이미지 롤백 시 기존 WORKFLOW/compose 묶음을 함께
+복원한다. 새 이미지에서 role flag를 잘못 지정해 단일 세션으로 돌아가는 것을 정상 role 검증으로
+표시하지 않는다. 역할 모드 미지정의 단일 세션 경로는 upstream 회귀용으로 보존했다.
