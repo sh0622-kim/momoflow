@@ -101,6 +101,68 @@ defmodule RoleFlowTest do
     Jason.decode!(File.read!(path))
   end
 
+  test "admission is opt-in; configured missing/malformed controls fail closed", c do
+    alias SymphonyElixir.Admission, as: A
+    assert A.open?()
+    System.put_env("MOMOFLOW_ADMISSION_ROOT", c.root)
+    on_exit(fn -> System.delete_env("MOMOFLOW_ADMISSION_ROOT") end)
+    refute A.open?()
+    for value <- ["{", ~s({"v":1,"generation":"bad","paused":false}),
+                   ~s({"v":1,"generation":"#{String.duplicate("a",64)}","paused":false,"extra":true})] do
+      File.write!(Path.join(c.root,"active.json"),value)
+      assert A.status().paused
+      assert A.status().error == "invalid_gate"
+    end
+    File.write!(Path.join(c.root,"active.json"),Jason.encode!(%{v: 1,generation: String.duplicate("a",64),paused: false}))
+    assert A.open?()
+    System.delete_env("MOMOFLOW_ADMISSION_ROOT")
+  end
+
+  test "actual poll and retry dispatch remain fenced and retain claims/retry metadata", c do
+    alias SymphonyElixir.Orchestrator, as: O
+    connected(c)
+    workflow=Path.join(c.root,"WORKFLOW.md")
+    File.write!(workflow,String.replace(File.read!(workflow),"github","memory"))
+    System.put_env("MOMOFLOW_ADMISSION_ROOT", c.root)
+    on_exit(fn ->
+      System.delete_env("MOMOFLOW_ADMISSION_ROOT")
+      Application.delete_env(:symphony_elixir,:memory_tracker_issues)
+    end)
+    issue=struct(SymphonyElixir.Tracker.Issue,id: "1",identifier: "GH-1",title: "fixture",state: "open",labels: ["momoflow:ready"],dispatchable: true)
+    Application.put_env(:symphony_elixir,:memory_tracker_issues,[issue])
+    token=make_ref()
+    retry=%{attempt: 1,retry_token: token,due_at_ms: 1,identifier: "GH-1",workspace_path: "/preserved",error: "prior error"}
+    state=struct(O.State, claimed: MapSet.new(["1"]), retry_attempts: %{"1" => retry})
+    # Missing gate fails closed at the REAL retry-message entrypoint, with memory tracker reads.
+    {:noreply, retried}=O.handle_info({:retry_issue,"1",token},state)
+    assert retried.claimed == state.claimed
+    assert retried.running == %{}
+    assert retried.retry_attempts["1"].attempt == 1
+    assert retried.retry_attempts["1"].workspace_path == "/preserved"
+    assert retried.retry_attempts["1"].error == "prior error"
+    # Polling still reconciles, but cannot dispatch the eligible memory-tracker issue.
+    {:noreply, polled}=O.handle_info(:run_poll_cycle,retried)
+    assert polled.claimed == retried.claimed
+    assert polled.running == %{}
+    assert polled.retry_attempts == retried.retry_attempts
+    File.write!(Path.join(c.root,"active.json"),Jason.encode!(%{v: 1,generation: String.duplicate("b",64),paused: true}))
+    # Snapshot is acknowledged by the actual orchestrator handler, not an HTTP-only reader.
+    {:reply,snapshot,_}=O.handle_call(:snapshot,nil,state)
+    assert snapshot.admission.generation == String.duplicate("b",64)
+    assert snapshot.admission.paused
+    assert snapshot.admission.claimed == ["1"]
+    assert snapshot.admission.retrying == ["1"]
+    assert snapshot.admission.running == []
+    assert snapshot.admission.pending_dispatch == false
+    # Normal reconciliation of a now-absent issue releases the claim while admission stays closed.
+    Application.put_env(:symphony_elixir,:memory_tracker_issues,[])
+    {:noreply,released}=O.handle_info({:retry_issue,"1",retried.retry_attempts["1"].retry_token},retried)
+    assert released.claimed == MapSet.new()
+    assert released.retry_attempts == %{}
+    assert released.running == %{}
+    System.delete_env("MOMOFLOW_ADMISSION_ROOT")
+  end
+
   test "actual upstream Orchestrator sums thread usage without resetting accumulated totals" do
     alias SymphonyElixir.Orchestrator, as: O
     entry = %{session_id: nil}

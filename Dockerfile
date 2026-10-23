@@ -20,6 +20,10 @@ RUN git -C /opt/symphony apply --check /opt/momoflow/github-token-file.patch \
 COPY patches/role-flow.patch /opt/momoflow/role-flow.patch
 RUN git -C /opt/symphony apply --check /opt/momoflow/role-flow.patch \
     && git -C /opt/symphony apply /opt/momoflow/role-flow.patch
+COPY patches/admission.patch /opt/momoflow/admission.patch
+RUN git -C /opt/symphony apply --check /opt/momoflow/admission.patch \
+    && git -C /opt/symphony apply /opt/momoflow/admission.patch
+COPY engine/admission.ex /opt/symphony/elixir/lib/symphony_elixir/admission.ex
 COPY engine/role_runner.ex /opt/symphony/elixir/lib/symphony_elixir/role_runner.ex
 ENV MIX_ENV=prod
 RUN mix local.hex --force && mix local.rebar --force && mix deps.get --only prod && mix build

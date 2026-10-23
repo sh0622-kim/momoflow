@@ -1,0 +1,62 @@
+--- a/elixir/lib/symphony_elixir/orchestrator.ex
++++ b/elixir/lib/symphony_elixir/orchestrator.ex
+@@ -259,7 +259,8 @@
+       |> reconcile_running_issues()
+       |> reconcile_blocked_issues()
+ 
+-    with :ok <- Config.validate!(),
++    with true <- SymphonyElixir.Admission.open?(),
++         :ok <- Config.validate!(),
+          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
+          true <- available_slots(state) > 0 do
+       choose_issues(issues, state)
+@@ -938,6 +939,14 @@
+   end
+ 
+   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
++    if SymphonyElixir.Admission.open?() do
++      admitted_dispatch_issue(state, issue, attempt, preferred_worker_host)
++    else
++      schedule_issue_retry(state, issue.id, attempt || 1, %{identifier: issue.identifier, worker_host: preferred_worker_host})
++    end
++  end
++
++  defp admitted_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+     recipient = self()
+ 
+     case select_worker_host(state, preferred_worker_host) do
+@@ -1179,6 +1188,16 @@
+   end
+ 
+   defp handle_active_retry(state, issue, attempt, metadata) do
++    if SymphonyElixir.Admission.open?() do
++      admitted_active_retry(state, issue, attempt, metadata)
++    else
++      # Lookup/reconciliation may release terminal/ineligible claims while paused.
++      # Eligible work keeps its retry attempt/metadata without dispatching a worker.
++      {:noreply, schedule_issue_retry(state, issue.id, attempt, metadata)}
++    end
++  end
++
++  defp admitted_active_retry(state, issue, attempt, metadata) do
+     if retry_candidate_issue?(issue, terminal_state_set()) and
+          dispatch_slots_available?(issue, state) and
+          worker_slots_available?(state, metadata[:worker_host]) do
+@@ -1471,6 +1490,7 @@
+ 
+     {:reply,
+      %{
++       admission: SymphonyElixir.Admission.snapshot(state),
+        running: running,
+        retrying: retrying,
+        blocked: blocked,
+--- a/elixir/lib/symphony_elixir_web/presenter.ex
++++ b/elixir/lib/symphony_elixir_web/presenter.ex
+@@ -13,6 +13,7 @@
+       %{} = snapshot ->
+         %{
+           generated_at: generated_at,
++          admission: Map.get(snapshot, :admission),
+           counts: %{
+             running: length(snapshot.running),
+             retrying: length(snapshot.retrying),
