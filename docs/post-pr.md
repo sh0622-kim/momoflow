@@ -317,7 +317,10 @@ recovery/validation 원본 두 파일을 같은 absolute 경로에 각각 RO로 
 Docker socket RW bind도 유지한다. mount 추가·중복은 거부한다. engine의 `/data`와 같은 live
 named volume을 `/engine-data:ro`에, engine의 auth volume을 `/run/momoflow-auth:ro`에 연결한다.
 tokenFile은 `/run/momoflow-auth/token.json`이다. bind 및 named-volume 대응은 fresh kernel
-mount/stat metadata로 확인한다. helper는 현재 engine과 다른 전체 ID·실제 hostname,
+mount/stat metadata로 확인한다. helper bind의 Docker Source는 설정된 absolute host 경로와
+정확히 같아야 하며 alias/translated source는 지원하지 않는다. 특히 다른 stateRoot에 journal을
+복사한 구성은 거부한다. launch/admission/inbox backing은 helper 내부의 일치만으로 인정하지
+않고 live engine의 해당 read-only bind와도 직접 대조한다. helper는 현재 engine과 다른 전체 ID·실제 hostname,
 controller service label, 고정 image/default Env, user `1000:1000`, socket group, read-only root,
 cap-drop ALL/no-new-privileges 및 현재 engine의 container network 연결을 검증한다. coding
 engine 자체나 확인할 수 없는 helper는 거부한다. 새 권한·engine mount 변경은 필요 없다.

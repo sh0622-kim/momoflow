@@ -135,8 +135,8 @@ test('shared controller ownership excludes reconciliation and changed evidence b
 function operatorFixture() {
  const c={repo:'fixture/repo',productionProject:'prod',engineContainer:hex(1),engineImage:'sha256:'+hex(2),operatorContainer:hex(3),operatorImage:'sha256:'+hex(4),operatorSocketGroup:'1001',trustedRoot:'/operator/controller',configFile:'/operator/config/reconcile.json',stateRoot:'/operator/state',inboxRoot:'/operator/inbox',launchRoot:'/operator/launch',gateRoot:'/operator/admission',ledgerRoot:'/engine-data/log/roles',tokenFile:'/run/momoflow-auth/token.json',evidence:{recovery:{path:'/evidence/recovery.json'},validation:{path:'/evidence/validation.json'}}};
  const volume=(name,destination,rw)=>({Type:'volume',Name:name,Source:'/daemon/volumes/'+name,Destination:destination,RW:rw});
- const engine={Id:c.engineContainer,Image:c.engineImage,Name:'/prod-engine',State:{Running:true,Health:{Status:'healthy'}},Config:{Labels:{'com.docker.compose.project':'prod','com.docker.compose.service':'symphony'}},Mounts:[volume('live-data','/data',true),volume('live-auth','/run/momoflow-auth',false)]};
- const bind=(path,rw)=>({Type:'bind',Source:'/opaque/'+path,Destination:path,RW:rw});
+ const engine={Id:c.engineContainer,Image:c.engineImage,Name:'/prod-engine',State:{Running:true,Health:{Status:'healthy'}},Config:{Labels:{'com.docker.compose.project':'prod','com.docker.compose.service':'symphony'}},Mounts:[volume('live-data','/data',true),volume('live-auth','/run/momoflow-auth',false),...['/run/momoflow-launch','/run/momoflow-admission','/run/momoflow-resume'].map(path=>({Type:'bind',Source:'/daemon/opaque'+path,Destination:path,RW:false}))]};
+ const bind=(path,rw)=>({Type:'bind',Source:path,Destination:path,RW:rw});
  const operator={Id:c.operatorContainer,Image:c.operatorImage,State:{Running:true},Config:{Hostname:'actual-helper',User:'1000:1000',Env:['HOME=/home/node'],Labels:{'com.docker.compose.service':'controller'}},HostConfig:{ReadonlyRootfs:true,Privileged:false,CapAdd:null,CapDrop:['ALL'],GroupAdd:['1001'],SecurityOpt:['no-new-privileges:true'],NetworkMode:'container:'+c.engineContainer},Mounts:[bind(c.trustedRoot,false),bind('/operator/config',false),bind(c.stateRoot,true),bind(c.inboxRoot,true),bind(c.launchRoot,true),bind(c.gateRoot,true),bind('/tmp',true),bind('/var/run/docker.sock',true),bind(c.evidence.recovery.path,false),bind(c.evidence.validation.path,false),volume('live-data','/engine-data',false),volume('live-auth','/run/momoflow-auth',false)]};
  const f={c,engine,operator,image:{Id:c.operatorImage,Config:{Env:['HOME=/home/node']}},calls:[],processes:'PID COMMAND\n1 docker-init\n2 beam.smp\n3 erl_child_setup\n4 inet_gethost\n'};
  f.docker=async a=>{
@@ -145,8 +145,10 @@ function operatorFixture() {
   assert.deepEqual(a,['top',c.engineContainer,'-eo','pid,comm']);return f.processes;
  };
  f.context={mounted:new Map(),host:async path=>({identity:path})};
- for(const x of [engine,operator])for(const m of x.Mounts)f.context.mounted.set(m,m.Type==='volume'?{identity:m.Name}:{identity:m.Destination.replace('/var/run/docker.sock','/run/docker.sock')});
+ const controls={'/run/momoflow-launch':c.launchRoot,'/run/momoflow-admission':c.gateRoot,'/run/momoflow-resume':c.inboxRoot};
+ for(const x of [engine,operator])for(const m of x.Mounts)f.context.mounted.set(m,m.Type==='volume'?{identity:m.Name}:{identity:controls[m.Destination] || m.Destination.replace('/var/run/docker.sock','/run/docker.sock')});
  f.verify=()=>verifyReconciliationOperator(c,{docker:f.docker,containerized:true,hostname:async()=>f.hostname || 'actual-helper',contextFor:async(docker,containers)=>{
+  f.contextCalls=(f.contextCalls || 0)+1;
   assert.equal(docker,f.docker);assert.deepEqual(containers,[engine,operator]);
   // Docker parsing returns distinct objects, as it does for the real adapter.
   return {host:f.context.host,mounted:new Map(containers.flatMap(x=>x.Mounts.map(m=>[m,f.context.mounted.get([engine,operator].flatMap(x=>x.Mounts).find(old=>old.Destination===m.Destination && old.Source===m.Source && old.RW===m.RW))]))) };
@@ -163,6 +165,20 @@ test('worker Docker adapter requests PID column and validates engine before and 
 test('trusted existing helper adapter proves current read-only ledger/auth backing and bind authority',async()=>{
  const f=operatorFixture();await f.verify();assert.ok(f.calls.every(a=>a[0]==='inspect'));
  await verifyReconciliationOperator(f.c,{containerized:false,docker:async()=>assert.fail('host must not adopt a helper')});
+});
+test('alternate state bind with copied journals and self-consistent helper backing is rejected before context or effects',async()=>{
+ const f=operatorFixture(),state=f.operator.Mounts.find(m=>m.Destination===f.c.stateRoot),originalHost=f.context.host;
+ state.Source='/another-operator-state';f.context.mounted.set(state,{identity:state.Source});
+ f.context.host=async path=>path===f.c.stateRoot?{identity:state.Source}:originalHost(path);
+ await assert.rejects(f.verify(),/bind.*(source|authority)/i);
+ assert.equal(f.contextCalls || 0,0);
+ assert.ok(f.calls.every(a=>a[0]==='inspect'));
+});
+for(const destination of ['/run/momoflow-launch','/run/momoflow-admission','/run/momoflow-resume'])test('helper controls must match independent live engine backing '+destination,async()=>{
+ const f=operatorFixture(),m=f.engine.Mounts.find(m=>m.Destination===destination);
+ f.context.mounted.set(m,{identity:'different-live-engine-backing'});
+ await assert.rejects(f.verify(),/control.*correspondence/i);
+ assert.ok(f.calls.every(a=>a[0]==='inspect'));
 });
 for(const [name,change] of [
  ['coding engine identity',f=>{f.c.operatorContainer=f.c.engineContainer;}],['unproven self',f=>{f.hostname='coding-engine';}],

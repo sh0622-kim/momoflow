@@ -203,13 +203,21 @@ export async function verifyReconciliationOperator(c,{docker,containerized,hostn
  need(new Set(binds.map(([path])=>path)).size===binds.length,'Overlapping operator mount destinations');
  const mounts=operator.Mounts;
  need(Array.isArray(mounts) && mounts.length===binds.length+2 && new Set(mounts.map(m=>m.Destination)).size===mounts.length,'Unexpected operator mounts');
- for(const [destination,rw] of binds)need(mounts.some(m=>m.Type==='bind' && m.Destination===destination && m.RW===rw),'Required operator bind authority mismatch');
+ // This operator contract uses identical canonical host/container paths. A
+ // self-consistent mount inside the helper cannot authenticate a different host
+ // controller.lock or copied journal directory; translated sources are unsupported.
+ for(const [destination,rw] of binds)need(mounts.some(m=>m.Type==='bind' && m.Source===destination && m.Destination===destination && m.RW===rw),'Required operator bind source/authority mismatch');
  const context=await contextFor(docker,[engine,operator]);
  for(const [destination] of binds) {
   const m=mounts.find(m=>m.Destination===destination);
   // Debian's conventional /var/run socket destination resolves through /run.
   const path=destination==='/var/run/docker.sock'?await canonical(destination):destination;
   need(same(await context.host(path),context.mounted.get(m)),'Operator bind correspondence mismatch');
+ }
+ for(const [destination,engineDestination] of [[c.launchRoot,'/run/momoflow-launch'],[c.gateRoot,'/run/momoflow-admission'],[c.inboxRoot,'/run/momoflow-resume']]) {
+  const m=mounts.find(m=>m.Destination===destination),matches=engine.Mounts.filter(m=>m.Destination===engineDestination),e=matches[0];
+  const actual=context.mounted.get(m),expected=context.mounted.get(e);
+  need(matches.length===1 && e.Type==='bind' && e.RW===false && actual && expected && same(actual,expected),'Operator live control bind correspondence mismatch');
  }
  for(const [destination,engineDestination] of [['/engine-data','/data'],['/run/momoflow-auth','/run/momoflow-auth']]) {
   const m=mounts.find(m=>m.Destination===destination),e=engine.Mounts.find(m=>m.Destination===engineDestination);
