@@ -232,3 +232,12 @@ post-PR flag 없는 runner는 publish→done을 유지한다. 운영자는 검�
 sh scripts/test-role-flow.sh
 node scripts/post-pr.test.mjs
 ```
+
+### 승인된 단일 이슈의 실행 준비 (GH-11 후보)
+
+외부 운영자가 설치한 새 버전에서는 `scripts/launch.mjs <operator-config.json> --preflight`로
+부작용 없이 확인하고, 같은 명령에서 `--preflight`를 빼면 승인된 단일 scope를 준비해
+ready 부여와 기존 controller 관찰을 연결한다. 명시 권한·repo/issue/base·1/2/3회 한도와
+read-only launch/inbox mount가 필요하며 기본 Compose에는 자동 활성화하지 않는다.
+[설치·영속 예산·부분 실패 복구·Docker Desktop/WSL named-volume·외부 live 검증 인계](docs/post-pr.md#승인된-단일-이슈-시작-gh-11-후보-별도-설치-필요)를 따른다.
+현재 세션의 엔진/controller를 교체하거나 후보로 자기 PR을 검증하지 않는다.

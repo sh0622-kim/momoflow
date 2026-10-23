@@ -44,7 +44,7 @@ export async function refreshToken(config, request = fetch, now = Date.now()) {
   await mkdir(dirname(config.tokenFile), { recursive: true, mode: 0o700 });
   const temporary = `${config.tokenFile}.${process.pid}.tmp`;
   try {
-    await writeFile(temporary, JSON.stringify({ token: record.token, expires_at: record.expires_at }), { mode: 0o600 });
+    await writeFile(temporary, JSON.stringify({ token: record.token, expires_at: record.expires_at, repository: config.repository, permissions: record.permissions || null }), { mode: 0o600 });
     await rename(temporary, config.tokenFile);
   } finally {
     await rm(temporary, { force: true });

@@ -326,6 +326,145 @@ defmodule RoleFlowTest do
     assert ledger(c)["iterations"] == 3
   end
 
+  defp enrolled(c, limit) do
+    root = Path.join(c.root, "launch")
+    inbox = Path.join(c.root, "inbox")
+    File.mkdir_p!(root)
+    File.mkdir_p!(inbox)
+    manifest = %{"v" => 1, "id" => String.duplicate("a", 64), "repo" => "fixture/repo",
+      "issue" => "1", "base" => "main", "limit" => limit}
+    file = Path.join(root, "active.json")
+    File.write!(file, Jason.encode!(manifest))
+    {[launch_root: root, inbox_root: inbox], file, manifest}
+  end
+
+  for limit <- 1..3 do
+    @limit limit
+    test "persisted launch limit #{@limit} prevents next actual build executor, including restart", c do
+      {opts, _, manifest} = enrolled(c, @limit)
+      exec = executor(fn role, _ -> if role == "review", do: "changes_requested", else: "complete" end)
+      run(c, exec, opts)
+      state = ledger(c)
+      assert state["iterations"] == @limit
+      assert state["launch"] == manifest
+      assert state["stage"] == "blocked"
+      assert Enum.count(state["events"], &(&1["role"] == "build")) == @limit
+      # This counts actual executor invocations, rather than just testing arithmetic.
+      calls = Stream.repeatedly(fn -> receive do {:stage, role, _} -> role after 0 -> nil end end)
+        |> Enum.take_while(& &1)
+      assert Enum.count(calls, &(&1 == "build")) == @limit
+      run(c, fn _, _, _, _, _ -> flunk("No new executor after restart") end, opts)
+      assert ledger(c)["iterations"] == @limit
+    end
+  end
+
+  for fault <- [:delete, :change, :malformed, :disabled] do
+    @fault fault
+    test "enrolled launch fails closed after #{@fault} across same-PR host resume", c do
+      {exec, connected_opts, inbox} = connected(c)
+      {launch_opts, file, manifest} = enrolled(c, 2)
+      opts = Keyword.merge(connected_opts, launch_opts)
+      run(c, exec, opts)
+      assert ledger(c)["stage"] == "await_validation"
+      host_exchange(c, inbox, "code_failure")
+      case @fault do
+        :delete -> File.rm!(file)
+        :change -> File.write!(file, Jason.encode!(Map.put(manifest, "limit", 3)))
+        :malformed -> File.write!(file, "{")
+        :disabled -> :ok
+      end
+      opts = if @fault == :disabled, do: Keyword.put(opts, :launch_root, nil), else: opts
+      run(c, fn _, _, _, _, _ -> flunk("Changed/deleted contract must not dispatch") end, opts)
+      assert ledger(c)["iterations"] == 1
+      assert ledger(c)["launch"] == manifest
+      assert ledger(c)["stage"] == "blocked"
+    end
+  end
+
+  test "enrollment prevents single-session fallback after BOTH opt-in flags are removed", c do
+    {exec, connected_opts, _} = connected(c)
+    {launch_opts, _, _} = enrolled(c, 2)
+    run(c, exec, Keyword.merge(connected_opts, launch_opts))
+    flags = ~w(MOMOFLOW_ROLE_FLOW MOMOFLOW_LAUNCH_ROOT)
+    old = Map.new(flags, &{&1, System.get_env(&1)})
+    Enum.each(flags, &System.delete_env/1)
+    on_exit(fn -> Enum.each(old, fn {k,v} -> if v, do: System.put_env(k,v), else: System.delete_env(k) end) end)
+    assert R.required?(%{id: "1"}, state_root: Path.join(c.root, "ledger"))
+    run(c, fn _, _, _, _, _ -> flunk("No single-session or role fallback") end, Keyword.put(connected_opts, :launch_root, nil))
+    assert ledger(c)["stage"] == "blocked"
+    assert ledger(c)["iterations"] == 1
+  end
+
+  test "installed capability identifies actual runner source/config and mount access", c do
+    connected(c)
+    status = R.launch_status()
+    assert status.contract == 1
+    assert status.repo == "fixture/repo"
+    assert status.source == Base.encode16(:crypto.hash(:sha256, File.read!(Path.expand("../engine/role_runner.ex", __DIR__))), case: :lower)
+    assert status.launch_root == nil
+    refute status.launch_read_only
+    assert is_boolean(status.inbox_read_only)
+  end
+
+  test "capability reads and validates the engine-visible manifest without enrollment", c do
+    connected(c)
+    {opts, file, manifest} = enrolled(c, 2)
+    assert R.launch_status(opts).manifest == %{status: "present", value: manifest}
+    for {key, value} <- [{"id", String.duplicate("b", 64)}, {"limit", 1}, {"base", "other"}, {"issue", "2"}] do
+      changed = Map.put(manifest, key, value)
+      File.write!(file, Jason.encode!(changed))
+      assert R.launch_status(opts).manifest == %{status: "present", value: changed}
+    end
+    for invalid <- ["{", "[]", Jason.encode!(Map.put(manifest, "limit", 4)), Jason.encode!(Map.put(manifest, "repo", "other/repo")), Jason.encode!(Map.put(manifest, "extra", true))] do
+      File.write!(file, invalid)
+      assert R.launch_status(opts).manifest == %{status: "invalid"}
+    end
+    File.rm!(file)
+    assert R.launch_status(opts).manifest == %{status: "absent"}
+    File.ln_s!("missing", file)
+    assert R.launch_status(opts).manifest == %{status: "invalid"}
+    refute File.exists?(Path.join(c.root, "ledger"))
+  end
+
+  test "two-limit runner and real host exchange allow final review/publish but forbid third correction", c do
+    {exec, connected_opts, inbox} = connected(c)
+    {launch_opts, _, _} = enrolled(c, 2)
+    opts = Keyword.merge(connected_opts, launch_opts)
+    run(c, exec, opts)
+    assert host_exchange(c, inbox, "code_failure") =~ "correction"
+    run(c, exec, opts)
+    state = ledger(c)
+    assert state["iterations"] == 2
+    assert state["stage"] == "await_validation"
+    assert Enum.map(Enum.take(state["events"], -3), & &1["role"]) == ~w(build review publish)
+    [ledger_path] = Path.wildcard(Path.join(c.root, "ledger/*.json"))
+    {out, status} = System.cmd("node", [Path.join(__DIR__, "post-pr-exchange-fixture.mjs"), ledger_path, inbox, "code_failure"], stderr_to_stdout: true)
+    assert status != 0
+    assert out =~ "budget exhausted 2/2"
+    # Retained stale inbox cannot start a third build on restart either.
+    run(c, fn _, _, _, _, _ -> flunk("Third build must not start") end, opts)
+    assert ledger(c)["iterations"] == 2
+  end
+
+  test "enrollment tombstone blocks reseeding a missing ledger", c do
+    {opts, _, _} = enrolled(c, 1)
+    run(c, executor(fn _, _ -> "blocked" end), opts)
+    [path] = Path.wildcard(Path.join(c.root, "ledger/*.json"))
+    File.rm!(path) # Simulated storage fault, never operator recovery advice.
+    run(c, fn _, _, _, _, _ -> flunk("Missing enrolled ledger cannot reseed") end, opts)
+    assert ledger(c)["stage"] == "blocked"
+    assert ledger(c)["iterations"] == nil
+    assert ledger(c)["reason"] =~ "Enrolled ledger missing"
+  end
+
+  test "legacy ledger is never automatically adopted into launch mode", c do
+    run(c, executor(fn _, _ -> "blocked" end))
+    {opts, _, _} = enrolled(c, 2)
+    run(c, fn _, _, _, _, _ -> flunk("Legacy adoption forbidden") end, opts)
+    assert ledger(c)["stage"] == "blocked"
+    assert ledger(c)["reason"] =~ "legacy ledger adoption"
+  end
+
   test "already exhausted workpad prevents any model call", c do
     exec = fn _, _, _, _, _ -> flunk("must not run a role") end
     run(c, exec, initial_count: fn -> 3 end)

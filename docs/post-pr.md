@@ -7,13 +7,13 @@
 역할 계약 74 tests/0 failures, Node 78 tests/0 failures)를 남긴다. 이 계약 검사의 모의 모델/RPC
 경로는 실제 새 runner의 모델 게시·자동 마무리 통합 증거와 구분한다.
 
-새 runner의 publication receipt→await_validation→호스트 exact-head 검증→fresh gates→SHA 병합·
-보존·이슈 종료 및 실제 실패→inbox→모델 수정·재검증은 아직 미검증이다.
-[GH-9](https://github.com/sh0622-kim/momoflow/issues/9)가 새 실행의 통합 대상이며,
-[GH-7 최신 workpad](https://github.com/sh0622-kim/momoflow/issues/7#issuecomment-6355520773)에
-추가2회 승인과 #9의 validate/merge/close 위임, resume=false가 기록돼 있다. 설치 기록 당시의
-승인 대기·hold 상태를 최신 상태로 해석하지 않는다. 자연 실패가 없으면 수정 재개 분기는
-실제 모델 경로 미관찰로 남기며 GH-7 전체 통합 완료로 표시하지 않는다.
+[GH-9/PR #10 완료 근거](https://github.com/sh0622-kim/momoflow/pull/10#issuecomment-6356756800)는
+새 실행의 publication→await_validation→host exact-head 검사→fresh gates→SHA 병합·보존·
+이슈 종료를 관찰했다. head `872ee451cebb54ddec8406992fbeb727b49ad09c`, merge
+`573ea276df12c8830576f033a6d082e16085d820`, 역할74/host78 검사가 기록됐다.
+자연 코드 실패가 없어 실제 모델 수정 재개는 미관찰이며, GH-7 terminal migration이나
+GH-11 후보 launch의 live 검증 증거로 사용하지 않는다. GH-9의 별도 승인·사용량 기록은
+[해당 workpad](https://github.com/sh0622-kim/momoflow/issues/9#issuecomment-6356628473)에 보존한다.
 
 기능은 `MOMOFLOW_ROLE_FLOW=1`, `MOMOFLOW_POST_PR_INBOX`, read-only inbox mount와
 운영자가 설치·설정한 별도 controller가 있어야 연결된다. 기본 Compose는 post-PR flag/mount나
@@ -157,3 +157,119 @@ open이어도 불명확한 요청을 자동 재전송하지 않는다. intent만
 host 장애는 needs-decision과 PR/같은 workpad의 구체적 이유·다음 행동으로 표시한다.
 ready는 제거하고 재조회한다. 다른 보류/필수 승인 우회 권한은 없으며, 라벨을 지웠다는 사실을
 승인으로 해석하지 않는다. 이 기능은 자동 deployment나 목표 간 재귀를 수행하지 않는다.
+
+## 승인된 단일 이슈 시작 (GH-11 후보, 별도 설치 필요)
+
+`launch.mjs`는 운영자가 **이미 승인한** repo/issue/base/권한/1~3회 한도를 한 명령으로
+준비하고 foreground controller에 연결한다. 이슈를 선택하거나 승인 댓글을 해석하지 않는다.
+ready·댓글·같은 계정 작성은 권한이 아니다. 기존 Symphony polling/claim/worker/재시도와
+`post-pr.mjs`의 exact-head 검사·별도 리뷰 receipt·fresh gate·SHA merge·보존·종료를 재사용한다.
+모델/추론/Fast/네트워크/승인 정책은 바꾸지 않는다. 이 기능의 검사는 모의 계약이며
+현재 GH-11에 소급 적용하거나 후보 controller로 자기 PR을 승인하지 않는다.
+
+| 설정 | 추가 계약 |
+| --- | --- |
+| `launchId` | 운영자가 한 번 생성한 64자리 hex ID; 재시작에도 동일 |
+| `iterationLimit` | 정수 1, 2, 3 중 명시; 기본 3보다 확대 불가 |
+| `launchRoot` | host 전용 실제 디렉터리의 절대 경로; 엔진에 `/run/momoflow-launch:ro`로 연결 |
+| `authority.launch` | 명시적 true; 기존 validate/merge/close도 true, resume은 명시 true/false |
+| 기존 config | 승인된 repo/issue/base, 고정 controllerVersion/checkout, 단일 stateRoot, ledgerRoot/inboxRoot/tokenFile, hold=false, check/reviewer 목록 유지 |
+
+기존 JSON에 다음 **실제 운영 값**을 추가한다. 예시는 승인이나 실행 가능한 완성 설정이 아니다.
+
+```json
+{
+  "launchId": "<운영자가 생성·보존한 64 hex>",
+  "iterationLimit": 2,
+  "launchRoot": "/srv/momoflow-launch",
+  "authority": {"launch": true, "validate": true, "resume": true, "merge": true, "close": true}
+}
+```
+
+운영자는 승인된 버전·이미지·설정 묶음을 [배포 정책](deployment.md)에 따라 별도 설치한다.
+엔진의 `MOMOFLOW_ROLE_FLOW=1`, `MOMOFLOW_POST_PR_INBOX=/run/momoflow-resume`와 기존
+read-only inbox에 더해 `MOMOFLOW_LAUNCH_ROOT=/run/momoflow-launch`와 read-only launch
+디렉터리 mount를 설정한다. 기본 Compose에는 자동 활성화하지 않는다. 새 state API의
+`momoflow_launch`는 실제 repo, 동시 이슈 수, 역할 flag, mount 경로/ro 여부와 runner 소스
+SHA-256 및 엔진이 실제 읽은 manifest의 검증 상태/전체 계약을 반환한다. CLI는 검토된 checkout
+소스와 일치하고 최초에는 엔진 쪽 manifest가 없어야 진행한다. 설치 후 ready 직전에는
+version/ID/repo/issue/base/limit 전체가 host 계약과 일치해야 한다. 다른 bind source의 빈 디렉터리나
+다른 계약은 ready 전에 차단한다. 과거 이미지의 HTTP
+200만으로 호환성을 인정하지 않는다. launch mode에서 manifest가 없으면 runner는 모델을
+시작하지 않는다. 기존 작업이 없는 설치 경계에서 켜고, 기존 GH-7/GH-9를 채택하지 않는다.
+
+경로는 symlink 없이 후보 workspace/checkout 밖에 둔다. 운영 디렉터리는 group/other 쓰기를
+허용하지 않고, host만 쓰며 엔진은 읽기만 한다. engine 전체에 controller **하나와 동일한
+stateRoot 하나**를 사용한다. 다른 checkout/stateRoot로 띄운 과거 watcher를 먼저 중지·확인한다.
+인증은 기존 github-auth가 갱신하는 만료 token 파일이다. 후보 auth 코드는 발급 응답의
+`permissions`와 제한한 `repository` 메타데이터를 함께 보존한다. launch는 contents/issues/
+pull_requests write와 checks read/write, repo 및 만료를 검사하고 실제 GitHub GET도 수행한다.
+키 custody·요청 권한·토큰 발급 scope는 그대로다. 구버전 token에 메타데이터가 없으면 차단하며,
+권한 확대나 수동 token 편집 대신 외부 운영자가 같은 권한의 auth 버전을 설치·갱신한다.
+발급 시점 권한 메타데이터와 실제 GET은 이후 모든 write 성공을 보증하지 않으므로 원격 효과는
+별도로 재조회한다. 자격 증명을 출력하지 않는다.
+
+```sh
+node /opt/momoflow-controller/scripts/launch.mjs /etc/momoflow/issue.json --preflight
+node /opt/momoflow-controller/scripts/launch.mjs /etc/momoflow/issue.json
+```
+
+첫 명령은 설정·설치·권한 메타데이터·실제 열린 이슈/base·ready 대상·현재 running/retrying·
+controller/ledger/manifest 상태·경로를 읽고 필수 `composeImage`의 `@sha256:<64 hex>` pin을 검사한다. 파일/lock/댓글/라벨/inbox를 쓰지 않고 Docker나
+모델을 실행하지 않는다. 닫힌 이슈/PR, 다른 ready 또는 실행, hold, 불완전한 API 결과,
+terminal/중단/기존 legacy ledger, 다른 미완료 journal/ledger는 구체적 이유로 차단한다.
+
+두 번째 명령은 동일 검사를 exclusive 소유권 안에서 다시 수행하고 `launch.json` intent를
+먼저 보존한다. `active.json` manifest를 exclusive 생성한 후 설정·runtime·이슈를 다시 읽고
+단일 workpad를 준비한 뒤 ready를 마지막으로 부여·조회한다. 직접 Codex를 호출하지 않는다.
+최초 ledger가 없는 구간은 정상 준비 대기이며 최대 5분 관찰 후 실패를 보존하고 ready를
+제거·확인한다. 한 번 관찰한 ledger가 사라지면 재생성 대기가 아니라 복구 장애다.
+watch는 정상 worker/CI/리뷰 대기 동안 소유권을 유지하고 완료/차단 때 종료한다.
+실패 watcher를 무한 재시작하는 서비스 restart 정책을 붙이지 않는다.
+
+### 영속 예산과 복구
+
+manifest의 version/ID/repo/issue/base/limit를 runner가 ledger의 `launch`에 고정한다.
+처음 launch는 0에서 시작하며 댓글로 예산을 만들지 않는다. runner는 별도 `.json.enrolled`
+표식을 먼저 보존해 ledger 유실 후 초기화를 막는다. 매 역할 진입과 host 수정 재개에서
+동일 manifest를 요구한다. 삭제/변경/잘못된 내용/flag 해제는 기존 ledger에 기본3을
+적용하는 대신 차단한다. 두 opt-in flag를 모두 제거해도 enrollment 표식이 역할 경로를 유지해
+단일 세션으로 우회하지 않는다. 한도를 낮추는 변경도 자동 채택하지 않는다. count·events·terminal은
+runner만 소유한다. 운영자/host는 이를 편집하지 않으며 표식도 삭제하지 않는다.
+
+실제 build executor 진입 전에 count가 증가한다. limit=2면 두 번째 build 뒤 별도 리뷰와
+게시까지 마칠 수 있으나 세 번째 build는 시작하지 않는다. 같은 PR 수정, 재시작·재시도도
+같은 한도다. host는 receipt와 inbox/ready 직전 ledger의 남은 한도 및 manifest를 재검사한다.
+이것은 build 반복 횟수 제한이며 lifetime 토큰·금액 하드 한도가 아니다.
+launch에 등록되지 않은 기존 ledger는 기본3 의미를 유지하고 새 계약에 자동 편입하지 않는다.
+GH-7의 3회 및 GH-9의 별도 1/2 승인·운영 기록은 그대로이며 잔여 예산을 전용하지 않는다.
+
+`stateRoot/controller.lock`은 launch와 기존 reconcile/watch가 공유하며 watch sleep에도 유지한다.
+동일/다른 scope의 중복 실행을 막는다. crash가 남긴 lock은 자동 만료하지 않는다. 운영자는
+PID·실제 프로세스·이슈/ledger/manifest/journal/PR head를 확인하고 종료된 프로세스의 lock만
+제거한다. 확정 dispatch의 재호출은 같은 intent를 관찰하고 ready를 다시 만들지 않는다.
+intent/manifest 생성 중 실패, ready 응답 유실, blocker, 변경된 설정 또는 ledger 유실은 자동
+재dispatch하지 않는다. workpad의 다음 행동과 보존한 journal을 확인하고 외부 운영자가 복구를
+판단한다. 예산/terminal을 편집하는 복구 명령은 제공하지 않는다. 성공한 launch의 후속 scope는
+완료 근거를 보존하고 worker가 없는 설치 경계에서 운영자가 이전 manifest를 보관·교체한다.
+이 명령이 후속 이슈를 선택하거나 자동 실행하지 않는다.
+
+### Docker Desktop/WSL과 외부 검증 인계
+
+Docker Desktop named volume은 WSL의 `/var/lib/docker/volumes/.../_data`로 직접 읽힌다고
+가정하지 않는다. `ledgerRoot`는 매 조회마다 실제 `/data/log/roles`를 읽어야 하며 `docker cp`로
+한 번 복사한 ledger를 재개 판단에 사용하면 안 된다. 운영자는 Node22/git/Docker CLI/Compose가
+있는 **신뢰된 controller helper 환경**에서 controller를 실행할 수 있다. 해당 helper에 named
+workspaces volume을 `/engine-data:ro`로 연결하고 `ledgerRoot=/engine-data/log/roles`를 지정한다.
+운영 bind 디렉터리의 state/launch/inbox는 host helper만 쓰며 launch/inbox만 엔진에 ro로 준다.
+engine의 network namespace를 공유하면 CLI의 `engineURL=http://127.0.0.1:4000`을 유지할 수 있다.
+Docker CLI/socket은 검증을 수행하는 trusted host/helper에만 두고 엔진·후보 검사 컨테이너에는
+전달하지 않는다. helper 이미지/CLI/Compose 버전과 mount/권한을 운영자가 고정·검증한다.
+이것은 새 상주 서비스가 아니라 외부 controller의 설치 방식이며 구현 세션에서 기동하지 않는다.
+
+배포 운영자는 정확한 후보 SHA/image/controllerVersion·이전 버전·권한/mount를 기록한 뒤
+Docker build, 기존 sandbox/readiness smoke와 전체 계약 검사를 수행해야 한다. 이후 승인된
+새 단일 이슈에서 preflight 무변경, 한 번의 launch, 실제 모델 세션/ledger/작은 한도,
+publication→host exact-head→병합/보존/종료를 관찰한다. 자연 코드 실패가 없으면 실제
+모델 수정 재개는 미관찰로 남긴다. 이 PR의 모의 상태 전이 검사와 실제 설정 조회를 새 버전의
+live Docker/GitHub/모델 통합 증거로 바꾸어 쓰지 않는다.

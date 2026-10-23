@@ -6,7 +6,7 @@ index f99a2d9..c75a980 100644
    defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
    defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
-+    if System.get_env("MOMOFLOW_ROLE_FLOW") == "1" do
++    if SymphonyElixir.RoleRunner.required?(issue) do
 +      if worker_host do
 +        {:error, :role_flow_requires_local_worker}
 +      else
@@ -145,3 +145,16 @@ index ae3db62..6e2ac5b 100644
      token_delta = extract_token_delta(running_entry, update)
      codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
      codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
+diff --git a/elixir/lib/symphony_elixir_web/controllers/observability_api_controller.ex b/elixir/lib/symphony_elixir_web/controllers/observability_api_controller.ex
+--- a/elixir/lib/symphony_elixir_web/controllers/observability_api_controller.ex
++++ b/elixir/lib/symphony_elixir_web/controllers/observability_api_controller.ex
+@@ -10,7 +10,8 @@
+
+   @spec state(Conn.t(), map()) :: Conn.t()
+   def state(conn, _params) do
+-    json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
++    payload = Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
++    json(conn, Map.put(payload, :momoflow_launch, SymphonyElixir.RoleRunner.launch_status()))
+   end
+
+   @spec issue(Conn.t(), map()) :: Conn.t()
