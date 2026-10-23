@@ -217,3 +217,16 @@ MOMOFLOW_IMAGE=gh-2-role-check-symphony sh scripts/smoke.sh
 실제 모델 호출을 포함한 순차 실행은 위 모의/설정 검사와 별도로 검증하고, 역할별 thread·turn ID,
 유효 설정, 후보 HEAD/diff, 각 단계 검사와 게시 PR head를 기록한다. 해당 증거가 없으면
 실제 Astra 기획·독립 검토가 완료됐다고 표시하지 않는다. 검증 실패 시 기본값으로 대체하지 않는다.
+
+### PR 이후 호스트 연결 후보 (GH-7)
+
+미배포 후보의 설치·exact-head 검증·권한·inbox·journal 복구는
+[PR 이후 호스트 조정](docs/post-pr.md)에 있다. 기본 compose/WORKFLOW는 계속 publish에서
+멈춘다. 운영자는 검토된 별도 host checkout을 고정하고 엔진에는 read-only inbox만 연결한다.
+이 구현 세션에서 엔진/컨트롤러를 교체하지 않는다. 다음 검사는 GitHub/Docker/model 외부
+효과가 없는 모의 계약 검사이며 실제 운영 통합 근거와 구분한다.
+
+```sh
+sh scripts/test-role-flow.sh
+node scripts/post-pr.test.mjs
+```

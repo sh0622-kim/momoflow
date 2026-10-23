@@ -83,7 +83,7 @@ defmodule SymphonyElixir.RoleRunner do
     try do
       state = load(path, issue, opts)
       validate_state!(state)
-      if state["iterations"] >= 3, do: halt!("Shared three-iteration budget exhausted")
+      state = resume!(state, workspace, issue, opts)
 
       if state["stage"] in ~w(blocked done) or state["in_flight"] do
         halt!("Existing terminal or interrupted role flow; inspect ledger before resuming")
@@ -167,6 +167,13 @@ defmodule SymphonyElixir.RoleRunner do
       _ -> halt!("Cannot clear prior role result")
     end
 
+    prompt =
+      if inbox(opts),
+        do:
+          prompt <>
+            "\nHost-connected publication requires result.publication={repo,issue,pr,base,head}. Keep the SAME PR across corrections; no auto-close keywords. Prior publication: #{Jason.encode!(state["publication"])}. Failure evidence: #{Jason.encode!(state["resume"])}",
+        else: prompt
+
     role_prompt = role_prompt(prompt, state, result_path, before)
     run_stage = Keyword.get(opts, :run_stage, &run_stage/5)
 
@@ -220,12 +227,21 @@ defmodule SymphonyElixir.RoleRunner do
       "role" => role,
       "iteration" => count,
       "settings" => settings(role),
-      "session" => session,
+      "session" => Jason.decode!(Jason.encode!(session)),
       "before" => before,
       "after" => after_snapshot,
       "result" => result,
       "at" => DateTime.to_iso8601(DateTime.utc_now())
     }
+
+    publication =
+      if role == "publish" and next == "done" and inbox(opts) do
+        publication!(result, state, workspace, issue, opts)
+      else
+        nil
+      end
+
+    next = if publication, do: "await_validation", else: next
 
     state =
       Map.merge(state, %{
@@ -235,6 +251,7 @@ defmodule SymphonyElixir.RoleRunner do
         "active_session" => nil
       })
 
+    state = if publication, do: Map.put(state, "publication", publication), else: state
     save(path, state)
 
     if next == "blocked" do
@@ -243,10 +260,12 @@ defmodule SymphonyElixir.RoleRunner do
       )
     end
 
-    if next == "done" do
-      Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, opts) end).(
+    if next in ~w(done await_validation) do
+      waiting_opts = Keyword.put(opts, :waiting, next == "await_validation")
+
+      Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, waiting_opts) end).(
         issue,
-        "Role flow complete; shared iterations=#{count}/3; PR checks/reviews and deployment remain separate. Ledger: #{path}"
+        "Role stage preserved (#{next}); shared iterations=#{count}/3; PR checks/reviews and deployment remain separate. Ledger: #{path}"
       )
     else
       advance(path, state, workspace, issue, prompt, on_message, opts)
@@ -349,6 +368,147 @@ defmodule SymphonyElixir.RoleRunner do
     }
   end
 
+  # Git object identity covers full contents, executable modes, symlinks and deletions.
+  # No index/object writes are made in the candidate repository.
+  def tree!(workspace) do
+    paths =
+      git!(workspace, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+      |> String.split(<<0>>, trim: true)
+      |> Enum.uniq()
+      |> Enum.reject(&(&1 == ".momoflow-role-result.json"))
+
+    entries =
+      Enum.flat_map(paths, fn p ->
+        full = Path.join(workspace, p)
+
+        case File.lstat(full) do
+          {:error, :enoent} ->
+            []
+
+          {:ok, %{type: :symlink}} ->
+            [{String.split(p, "/"), "120000", object("blob", File.read_link!(full))}]
+
+          {:ok, %{type: :regular, mode: mode}} ->
+            m = if Bitwise.band(mode, 0o100) != 0, do: "100755", else: "100644"
+            [{String.split(p, "/"), m, object("blob", File.read!(full))}]
+
+          _ ->
+            halt!("Unsupported candidate tree entry")
+        end
+      end)
+
+    Base.encode16(tree_object(entries), case: :lower)
+  end
+
+  defp object(type, bytes),
+    do: :crypto.hash(:sha, type <> " " <> Integer.to_string(byte_size(bytes)) <> <<0>> <> bytes)
+
+  defp tree_object(entries) do
+    entries
+    |> Enum.group_by(fn {[name | _], _, _} -> name end)
+    |> Enum.map(fn {name, group} ->
+      case group do
+        [{[_], mode, hash}] ->
+          {name, mode, hash, name}
+
+        _ ->
+          children = Enum.map(group, fn {[_ | rest], mode, hash} -> {rest, mode, hash} end)
+          {name, "40000", tree_object(children), name <> "/"}
+      end
+    end)
+    |> Enum.sort_by(&elem(&1, 3))
+    |> Enum.map_join(fn {name, mode, hash, _} -> mode <> " " <> name <> <<0>> <> hash end)
+    |> then(&object("tree", &1))
+  end
+
+  defp inbox(opts) do
+    Keyword.get_lazy(opts, :inbox_root, fn ->
+      case System.get_env("MOMOFLOW_POST_PR_INBOX") do
+        nil -> nil
+        "/run/momoflow-resume" = root -> root
+        _ -> halt!("Resume inbox must be the operator-mounted /run/momoflow-resume")
+      end
+    end)
+  end
+
+  defp publication!(result, state, workspace, issue, opts) do
+    p = result["publication"]
+    review = List.last(state["events"])
+
+    unless is_map(p) and p["repo"] == opts[:repo] and p["issue"] == issue.id and
+             is_integer(p["pr"]) and p["pr"] > 0 and is_binary(p["base"]) and
+             is_binary(p["head"]) and Regex.match?(~r/^[0-9a-f]{40}$/, p["head"]) and
+             review["role"] == "review" and review["result"]["status"] == "complete" and
+             review["after"] == snapshot!(workspace),
+           do: halt!("Missing exact reviewed publication")
+
+    old = state["publication"]
+
+    if old && (old["pr"] != p["pr"] or old["base"] != p["base"]),
+      do: halt!("Correction must reuse same PR/base")
+
+    {:ok, %{status: 200, body: pr}} =
+      request("GET", repo_path(opts) <> "/pulls/#{p["pr"]}", %{}, nil, opts)
+
+    {:ok, %{status: 200, body: commit}} =
+      request("GET", repo_path(opts) <> "/git/commits/#{p["head"]}", %{}, nil, opts)
+
+    tree = tree!(workspace)
+
+    unless pr["state"] == "open" and pr["head"]["sha"] == p["head"] and
+             pr["head"]["repo"]["full_name"] == opts[:repo] and pr["base"]["ref"] == p["base"] and
+             pr["base"]["repo"]["full_name"] == opts[:repo] and is_binary(pr["base"]["sha"]) and
+             Regex.match?(~r/^[0-9a-f]{40}$/, pr["base"]["sha"]) and commit["tree"]["sha"] == tree,
+           do: halt!("Published tree/head/base mismatch")
+
+    Map.merge(p, %{
+      "tree" => tree,
+      "base_head" => pr["base"]["sha"],
+      "snapshot" => review["after"],
+      "review_thread" => review["session"]["thread_id"],
+      "generation" => length(state["events"]) + 1
+    })
+  end
+
+  defp resume!(%{"stage" => "await_validation"} = state, workspace, issue, opts) do
+    root = inbox(opts)
+
+    unless is_binary(root) and Path.type(root) == :absolute and
+             not String.starts_with?(Path.expand(root) <> "/", Path.expand(workspace) <> "/"),
+           do: halt!("Trusted resume inbox unavailable")
+
+    p = state["publication"]
+    name = Base.encode16(:crypto.hash(:sha256, opts[:repo] <> ":" <> issue.id), case: :lower)
+    file = Path.join(root, name <> ".json")
+    stat = File.lstat!(file)
+    unless stat.type == :regular and stat.size < 65536, do: halt!("Invalid resume envelope")
+    r = Jason.decode!(File.read!(file))
+
+    unless not state["in_flight"] and state["iterations"] < 3 and
+             r["repo"] == opts[:repo] and r["issue"] == issue.id and r["publication"] == p and
+             r["generation"] == length(state["events"]) and r["kind"] == "code_failure" and
+             is_binary(r["id"]) and Regex.match?(~r/^[0-9a-f]{64}$/, r["id"]) and
+             is_binary(r["evidence"]) and String.trim(r["evidence"]) != "" and
+             not Enum.any?(state["events"], &(&1["resume_id"] == r["id"])) and
+             snapshot!(workspace) == p["snapshot"] and tree!(workspace) == p["tree"],
+           do: halt!("Stale, interrupted, exhausted or invalid resume request")
+
+    {:ok, %{status: 200, body: pr}} =
+      request("GET", repo_path(opts) <> "/pulls/#{p["pr"]}", %{}, nil, opts)
+
+    unless pr["state"] == "open" and pr["head"]["sha"] == p["head"],
+      do: halt!("Resume PR changed")
+
+    # Persist consumption together with build entry in advance; a crash cannot repeat a build.
+    Map.merge(state, %{
+      "stage" => "build",
+      "resume" => r,
+      "events" => state["events"] ++ [%{"resume_id" => r["id"], "evidence" => r["evidence"]}]
+    })
+  end
+
+  defp resume!(state, _, _, _), do: state
+
   defp git!(workspace, args) do
     case System.cmd("git", args, cd: workspace, stderr_to_stdout: true) do
       {output, 0} -> output
@@ -433,7 +593,11 @@ defmodule SymphonyElixir.RoleRunner do
     pads = Enum.filter(comments, &String.contains?(&1["body"] || "", "<!-- momoflow:workpad -->"))
 
     note =
-      "\n\nEngine stopped (#{DateTime.to_iso8601(DateTime.utc_now())}): #{reason}\nReady removal verified. Inspect /data/log/roles before manual resumption; do not reset the ledger."
+      if opts[:waiting] do
+        "\n\nHost validation pending: #{reason}\nReady removal verified. Routine host checks require no new approval or model run; only a verified host envelope may resume correction."
+      else
+        "\n\nEngine stopped (#{DateTime.to_iso8601(DateTime.utc_now())}): #{reason}\nReady removal verified. Inspect /data/log/roles before manual resumption; do not reset the ledger."
+      end
 
     case pads do
       [pad] when length(comments) < 100 ->
@@ -465,7 +629,7 @@ defmodule SymphonyElixir.RoleRunner do
   end
 
   defp validate_state!(state) do
-    unless state["stage"] in ~w(plan build review publish blocked done) and
+    unless state["stage"] in ~w(plan build review publish blocked done await_validation) and
              is_integer(state["iterations"]) and state["iterations"] in 0..3 and
              is_boolean(state["in_flight"]) and is_list(state["events"]) do
       halt!("Invalid ledger; manual inspection required")

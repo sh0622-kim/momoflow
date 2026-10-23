@@ -588,6 +588,261 @@ defmodule RoleFlowTest do
       R.count_from_comments!(List.duplicate(%{"body" => "ordinary comment"}, 100))
     end
   end
+
+  defp connected(c) do
+    config_path = Path.join(c.root, "WORKFLOW.md")
+
+    File.write!(
+      config_path,
+      "---\n" <>
+        Jason.encode!(%{
+          "tracker" => %{
+            "kind" => "github",
+            "active_states" => ["open"],
+            "terminal_states" => ["closed"],
+            "required_labels" => ["momoflow:ready"],
+            "provider" => %{"repo" => "fixture/repo", "token" => "fixture-not-a-credential"}
+          }
+        }) <> "\n---\nfixture"
+    )
+
+    SymphonyElixir.Workflow.set_workflow_file_path(config_path)
+    on_exit(fn -> SymphonyElixir.Workflow.clear_workflow_file_path() end)
+    inbox = Path.join(c.root, "inbox")
+    File.mkdir_p!(inbox)
+    base = executor(fn _, _ -> "complete" end)
+
+    exec = fn w, i, role, prompt, cb ->
+      {:ok, session} = base.(w, i, role, prompt, cb)
+
+      if role == "publish" do
+        file = Path.join(w, ".momoflow-role-result.json")
+        result = Jason.decode!(File.read!(file))
+
+        publication = %{
+          "repo" => "fixture/repo",
+          "issue" => "1",
+          "pr" => 2,
+          "base" => "main",
+          "head" => String.duplicate("a", 40)
+        }
+
+        File.write!(file, Jason.encode!(Map.put(result, "publication", publication)))
+      end
+
+      {:ok, session}
+    end
+
+    transport = fn method, path, _, _, _ ->
+      body =
+        cond do
+          path =~ "/git/commits/" ->
+            %{"tree" => %{"sha" => R.tree!(c.workspace)}}
+
+          method == "GET" and path =~ "/pulls/2" ->
+            %{
+              "state" => "open",
+              "head" => %{
+                "sha" => String.duplicate("a", 40),
+                "repo" => %{"full_name" => "fixture/repo"}
+              },
+              "base" => %{
+                "ref" => "main",
+                "sha" => String.duplicate("9", 40),
+                "repo" => %{"full_name" => "fixture/repo"}
+              }
+            }
+        end
+
+      {:ok, %{status: 200, body: body}}
+    end
+
+    {exec, [inbox_root: inbox, request_fun: transport], inbox}
+  end
+
+  defp host_exchange(c, inbox, kind) do
+    [path] = Path.wildcard(Path.join(c.root, "ledger/*.json"))
+
+    {out, code} =
+      System.cmd("node", [Path.join(__DIR__, "post-pr-exchange-fixture.mjs"), path, inbox, kind],
+        stderr_to_stdout: true
+      )
+
+    assert code == 0, out
+    out
+  end
+
+  test "full production exchange: publish, host code failure, same-PR correction, separate review, revalidate/finalize",
+       c do
+    {exec, opts, inbox} = connected(c)
+    run(c, exec, opts)
+    first = ledger(c)
+    assert first["stage"] == "await_validation", inspect(first["reason"])
+    assert first["publication"]["tree"] == R.tree!(c.workspace)
+    assert host_exchange(c, inbox, "code_failure") =~ "correction"
+    diagnostic_exec = fn w, i, role, prompt, cb ->
+      if role == "build" do
+        assert prompt =~ "contract_failure_example: expected 1, received 2"
+        assert prompt =~ first["publication"]["head"]
+      end
+      exec.(w, i, role, prompt, cb)
+    end
+    run(c, diagnostic_exec, opts)
+    second = ledger(c)
+    assert second["iterations"] == 2
+    assert second["stage"] == "await_validation"
+    assert Enum.take(second["events"], length(first["events"])) == first["events"]
+    assert Enum.map(Enum.take(second["events"], -3), & &1["role"]) == ~w(build review publish)
+    assert second["publication"]["pr"] == first["publication"]["pr"]
+    assert second["publication"]["review_thread"] != first["publication"]["review_thread"]
+    assert host_exchange(c, inbox, "passed") =~ "done"
+    # Old inbox is retained as evidence but cannot authorize another correction.
+    run(c, fn _, _, _, _, _ -> flunk("replayed request must not run") end, opts)
+    assert ledger(c)["iterations"] == 2
+    assert ledger(c)["stage"] == "blocked"
+  end
+
+  test "third correction may review/publish, fourth build is forbidden across restart", c do
+    {exec, opts, inbox} = connected(c)
+    run(c, exec, opts)
+
+    for expected <- [2, 3] do
+      host_exchange(c, inbox, "code_failure")
+      run(c, exec, opts)
+      assert ledger(c)["iterations"] == expected
+      assert ledger(c)["stage"] == "await_validation"
+    end
+
+    [path] = Path.wildcard(Path.join(inbox, "*.json"))
+    envelope = Jason.decode!(File.read!(path))
+    state = ledger(c)
+
+    envelope =
+      Map.merge(envelope, %{
+        "publication" => state["publication"],
+        "generation" => length(state["events"]),
+        "id" => String.duplicate("f", 64)
+      })
+
+    File.write!(path, Jason.encode!(envelope))
+    run(c, fn _, _, _, _, _ -> flunk("fourth build forbidden") end, opts)
+    assert ledger(c)["iterations"] == 3
+    assert ledger(c)["reason"] =~ "exhausted"
+  end
+
+  for fault <- [:generation, :head, :in_flight, :workspace, :missing, :crash] do
+    @resume_fault fault
+    test "resume fails safely: #{fault}", c do
+      {exec, opts, inbox} = connected(c)
+      run(c, exec, opts)
+      host_exchange(c, inbox, "code_failure")
+      [file] = Path.wildcard(Path.join(inbox, "*.json"))
+      envelope = Jason.decode!(File.read!(file))
+
+      case @resume_fault do
+        :generation ->
+          File.write!(file, Jason.encode!(Map.put(envelope, "generation", 0)))
+
+        :head ->
+          File.write!(
+            file,
+            Jason.encode!(put_in(envelope, ["publication", "head"], String.duplicate("0", 40)))
+          )
+
+        :in_flight ->
+          [path] = Path.wildcard(Path.join(c.root, "ledger/*.json"))
+          File.write!(path, Jason.encode!(Map.put(ledger(c), "in_flight", true)))
+
+        :workspace ->
+          File.write!(Path.join(c.workspace, "unreviewed"), "changed")
+
+        :missing ->
+          File.rm!(file)
+
+        :crash ->
+          :ok
+      end
+
+      runner =
+        if @resume_fault == :crash,
+          do: fn _, _, _, _, _ -> raise "crash after durable build consumption" end,
+          else: fn _, _, _, _, _ -> flunk("invalid request started model") end
+
+      run(c, runner, opts)
+      used = if @resume_fault == :crash, do: 2, else: 1
+      assert ledger(c)["iterations"] == used
+      assert ledger(c)["stage"] == "blocked"
+
+      if @resume_fault == :crash do
+        assert ledger(c)["in_flight"]
+        assert List.last(ledger(c)["events"])["resume_id"] == envelope["id"]
+      end
+
+      run(c, fn _, _, _, _, _ -> flunk("interrupted execution replayed") end, opts)
+      assert ledger(c)["iterations"] == used
+    end
+  end
+
+  test "Git tree matches real Git including mode/symlink/deletion/new file", c do
+    File.write!(Path.join(c.workspace, "deleted"), "delete")
+    File.write!(Path.join(c.workspace, "script"), "script")
+    git(c.workspace, ["add", "."])
+
+    git(c.workspace, [
+      "-c",
+      "user.name=fixture",
+      "-c",
+      "user.email=f@invalid",
+      "commit",
+      "-qm",
+      "files"
+    ])
+
+    File.rm!(Path.join(c.workspace, "deleted"))
+    File.chmod!(Path.join(c.workspace, "script"), 0o755)
+    File.mkdir_p!(Path.join(c.workspace, "dir"))
+    File.write!(Path.join(c.workspace, "dir/new"), "new")
+    File.ln_s!("script", Path.join(c.workspace, "link"))
+    tree = R.tree!(c.workspace)
+    git(c.workspace, ["add", "-A"])
+    assert tree == String.trim(git(c.workspace, ["write-tree"]))
+  end
+
+  test "actual upstream retry releases absent-ready claim, then dispatch honors ready/claim/single slot",
+       c do
+    connected(c)
+    alias SymphonyElixir.Orchestrator, as: O
+    alias SymphonyElixir.Tracker.Issue
+
+    issue =
+      struct(Issue,
+        id: "1",
+        identifier: "GH-1",
+        title: "fixture",
+        state: "open",
+        labels: [],
+        dispatchable: true
+      )
+
+    state = struct(O.State, max_concurrent_agents: 1, claimed: MapSet.new(["1"]))
+    refute O.should_dispatch_issue_for_test(issue, state)
+    released = O.handle_retry_issue_lookup_for_test(issue, state, "1", 1, %{})
+    refute MapSet.member?(released.claimed, "1")
+    ready = %{issue | labels: ["momoflow:ready"]}
+    assert O.should_dispatch_issue_for_test(ready, released)
+    refute O.should_dispatch_issue_for_test(ready, %{released | claimed: MapSet.new(["1"])})
+
+    refute O.should_dispatch_issue_for_test(ready, %{
+             released
+             | running: %{"other" => %{issue: ready, worker_host: nil}}
+           })
+
+    assert {:skip, ^issue} =
+             O.revalidate_issue_for_dispatch_for_test(ready, fn ["1"] -> {:ok, [issue]} end)
+
+    assert {:ok, ^ready} =
+             O.revalidate_issue_for_dispatch_for_test(ready, fn ["1"] -> {:ok, [ready]} end)
+  end
 end
 
 defmodule RoleRPCContractTest do
