@@ -861,6 +861,108 @@ defmodule RoleFlowTest do
     {exec, [inbox_root: inbox, request_fun: transport], inbox}
   end
 
+  defp expected_publication_scope(prompt) do
+    [_, json] = Regex.run(~r/Engine-owned expected publication scope \(JSON\): ([^\n]+)/, prompt)
+    Jason.decode!(json)
+  end
+
+  test "legacy no-inbox publish has no connected publication contract", c do
+    exec = executor(fn _, _ -> "complete" end)
+    run(c, fn w, i, role, prompt, cb ->
+      refute prompt =~ "Engine-owned expected publication scope"
+      exec.(w, i, role, prompt, cb)
+    end)
+    assert ledger(c)["stage"] == "done"
+  end
+
+  test "publish receives JSON string scope without inventing a legacy base", c do
+    {exec, opts, _} = connected(c)
+    inspect_prompt = fn w, i, role, prompt, cb ->
+      if role == "publish" do
+        assert expected_publication_scope(prompt) == %{"repo" => "fixture/repo", "issue" => "1"}
+        assert prompt =~ "Before any GitHub API side effect"
+        assert prompt =~ "never a JSON number"
+        assert prompt =~ "positive JSON integer"
+        assert prompt =~ "actual published commit SHA"
+        assert prompt =~ "Check the serialized result's types and exact scope"
+      else
+        refute prompt =~ "Engine-owned expected publication scope"
+      end
+      exec.(w, i, role, prompt, cb)
+    end
+    run(c, inspect_prompt, opts)
+    assert ledger(c)["stage"] == "await_validation"
+    assert ledger(c)["publication"]["issue"] === "1"
+  end
+
+  test "publish receives the trusted launch base", c do
+    {exec, opts, _} = connected(c)
+    {launch_opts, file, manifest} = enrolled(c, 3)
+    File.write!(file, Jason.encode!(Map.put(manifest, "base", "release")))
+    run(c, fn w, i, role, prompt, cb ->
+      if role == "publish" do
+        assert expected_publication_scope(prompt) == %{"repo" => "fixture/repo", "issue" => "1", "base" => "release"}
+      end
+      exec.(w, i, role, prompt, cb)
+    end, Keyword.merge(opts, launch_opts))
+    assert ledger(c)["reason"] =~ "Launch base mismatch"
+  end
+
+  for {field, value} <- [
+        {"issue", 1}, {"issue", nil}, {"issue", true}, {"issue", []}, {"issue", %{}},
+        {"issue", :missing}, {"issue", "2"}, {"repo", "other/repo"},
+        {"pr", "2"}, {"pr", 0}, {"base", "other"},
+        {"head", String.duplicate("b", 40)}, {"head", "invalid"}
+      ] do
+    @publication_field field
+    @publication_value value
+    test "publication rejects #{@publication_field}=#{inspect(value)}", c do
+      {exec, opts, _} = connected(c)
+      run(c, fn w, i, role, prompt, cb ->
+        result = exec.(w, i, role, prompt, cb)
+        if role == "publish" do
+          file = Path.join(w, ".momoflow-role-result.json")
+          data = Jason.decode!(File.read!(file))
+          p = if @publication_value == :missing,
+            do: Map.delete(data["publication"], @publication_field),
+            else: Map.put(data["publication"], @publication_field, @publication_value)
+          File.write!(file, Jason.encode!(Map.put(data, "publication", p)))
+        end
+        result
+      end, opts)
+      state = ledger(c)
+      assert state["stage"] == "blocked"
+      expected = if @publication_field == "base" or
+                    (@publication_field == "head" and @publication_value != "invalid"),
+        do: "Published tree/head/base mismatch", else: "Missing exact reviewed publication"
+      assert state["reason"] == expected
+      refute state["publication"]
+    end
+  end
+
+  test "publication still rejects a remote tree that differs from the reviewed tree", c do
+    {exec, opts, _} = connected(c)
+    transport = opts[:request_fun]
+    opts = Keyword.put(opts, :request_fun, fn method, path, params, body, config ->
+      if path =~ "/git/commits/",
+        do: {:ok, %{status: 200, body: %{"tree" => %{"sha" => String.duplicate("0", 40)}}}},
+        else: transport.(method, path, params, body, config)
+    end)
+    run(c, exec, opts)
+    assert ledger(c)["reason"] == "Published tree/head/base mismatch"
+  end
+
+  test "publish cannot change the reviewed snapshot", c do
+    {exec, opts, _} = connected(c)
+    run(c, fn w, i, role, prompt, cb ->
+      result = exec.(w, i, role, prompt, cb)
+      if role == "publish", do: File.write!(Path.join(w, "unreviewed"), "changed")
+      result
+    end, opts)
+    assert ledger(c)["reason"] == "publish changed the reviewed tree"
+    refute ledger(c)["publication"]
+  end
+
   defp host_exchange(c, inbox, kind) do
     [path] = Path.wildcard(Path.join(c.root, "ledger/*.json"))
 
@@ -882,6 +984,11 @@ defmodule RoleFlowTest do
     assert first["publication"]["tree"] == R.tree!(c.workspace)
     assert host_exchange(c, inbox, "code_failure") =~ "correction"
     diagnostic_exec = fn w, i, role, prompt, cb ->
+      if role == "publish" do
+        assert expected_publication_scope(prompt) == %{"repo" => "fixture/repo", "issue" => "1", "base" => "main"}
+        assert prompt =~ "Reuse the prior publication's PR/base"
+        assert prompt =~ Jason.encode!(first["publication"])
+      end
       if role == "build" do
         assert prompt =~ "contract_failure_example: expected 1, received 2"
         assert prompt =~ first["publication"]["head"]

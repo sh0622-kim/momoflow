@@ -203,6 +203,11 @@ defmodule SymphonyElixir.RoleRunner do
         else: prompt
 
     role_prompt = role_prompt(prompt, state, result_path, before)
+    role_prompt =
+      if role == "publish" and inbox(opts),
+        do: role_prompt <> publication_contract(state, issue, opts),
+        else: role_prompt
+
     run_stage = Keyword.get(opts, :run_stage, &run_stage/5)
 
     handler = fn message ->
@@ -556,6 +561,24 @@ defmodule SymphonyElixir.RoleRunner do
         _ -> halt!("Resume inbox must be the operator-mounted /run/momoflow-resume")
       end
     end)
+  end
+
+  defp publication_contract(state, issue, opts) do
+    expected = %{"repo" => opts[:repo], "issue" => issue.id}
+    base = (state["launch"] || state["publication"] || %{})["base"]
+    expected = if base, do: Map.put(expected, "base", base), else: expected
+
+    """
+
+    Engine-owned expected publication scope (JSON): #{Jason.encode!(expected)}
+    Before any GitHub API side effect, verify the intended publication against this exact scope and these JSON types.
+    Write result.publication with repo, issue, pr, base, head. repo and issue must exactly match the expected JSON strings;
+    issue must remain a JSON string, never a JSON number. pr must be a positive JSON integer.
+    base must be a JSON string matching the expected base when provided, otherwise the actual PR base.
+    head must be the actual published commit SHA as a lowercase 40-hex JSON string, not the local pre-publication HEAD.
+    Preserve the reviewed tree. Reuse the prior publication's PR/base across corrections; no auto-close keywords.
+    Check the serialized result's types and exact scope before returning it. The runner still verifies remote PR/head/tree and review evidence.
+    """
   end
 
   defp publication!(result, state, workspace, issue, opts) do
