@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { command } from './post-pr-docker.mjs';
 import { fixtureSource, fixtureEvidence, fixtureLabels, integrationPlan, isolatedResources } from './deploy-fixture.mjs';
-import { connected, integrationIsolation, replaceConnectedBundle, fixtureHTTP, fixtureHTTPProbe } from './deploy.mjs';
+import { connected, integrationIsolation, replaceConnectedBundle, fixtureHTTP, fixtureHTTPProbe, observeDeploymentOwners, deploymentOwnersIdle, matchDeploymentBundle } from './deploy.mjs';
 import { digest } from './post-pr.mjs';
 const sha=n=>String(n).repeat(40),hash=n=>String(n).repeat(64);
 async function localFixture() {
@@ -488,6 +488,7 @@ async function connectedNamespaceFixture() {
   if(a[0]==='inspect' && !a.includes('--format')) return JSON.stringify([n.records.get(a[1])]);
   if(a[0]==='exec' && n.records.get(a[1]).State?.Running===false) throw Error('Docker exec: container is not running');
   if(a[0]==='exec' && a[4]===fixtureHTTPProbe) return JSON.stringify({status:200,...(a[5]==='/api/v1/state'?{state:{admission:{contract:1,configured:true,paused:true,generation:c.deploymentId,running:[],retrying:[],claimed:[],blocked:[],pending_dispatch:false}}}:{})});
+  if(a[0]==='exec' && a[4].includes('const rows=(function readRoleRows')) return JSON.stringify({rows:[],manifest:null});
   if(a[0]==='run') {
    assert.ok(a.includes('--rm') && a.includes('--read-only'));
    for(const [flag,value] of [['--pull','never'],['--network','none'],['--cap-drop','ALL'],['--security-opt','no-new-privileges'],['--user','1000:1000'],['--entrypoint','node']]) assert.equal(a[a.indexOf(flag)+1],value);
@@ -503,6 +504,34 @@ async function connectedNamespaceFixture() {
  return {n,x,c,docker,effects,containers,isolation,files,live:()=>live,clean:async()=>{await rm(n.root,{recursive:true,force:true});await rm(x.root,{recursive:true,force:true});}};
 }
 
+namespaceTest('ownership adapter proves opaque fixture binds and rejects changed backing, type, authority and observations',async()=>{
+ const x=await connectedNamespaceFixture();try {
+  const p=x.live(),baseline=structuredClone(p),probe=x.n.probes.get(p.Id),originalProbe=structuredClone(probe);
+  const ports={containers:async()=>structuredClone(await x.containers()),docker:x.docker,fixture:true};
+  assert.notEqual(p.Mounts.find(m=>m.Destination==='/run/momoflow-launch').Source,x.c.launchRoot);
+  const mounts=await fixtureMountSources(p,x.c.previous.inspect.symphony,x.docker);
+  assert.deepEqual(runtimeIdentity({...p,Mounts:mounts},{fixture:true}),x.c.previous.inspect.symphony);
+  assert.deepEqual(await observeDeploymentOwners(x.c,ports),{engine:p.Id,rows:[],manifest:null});
+  for(const fault of ['backing','type','rw','volume','changed-id','changed-mount','ledger']) {
+   Object.assign(p,structuredClone(baseline));Object.assign(probe,structuredClone(originalProbe));
+   const launch=p.Mounts.find(m=>m.Destination==='/run/momoflow-launch');
+   if(fault==='backing') probe.points.find(p=>p.path===launch.Destination).ino='99999999999';
+   if(fault==='type') launch.Type='volume';
+   if(fault==='rw') launch.RW=true;
+   if(fault==='volume') p.Mounts.find(m=>m.Destination==='/data').Name='wrong-volume';
+   const docker=async a=>{
+    if(a[0]==='exec' && a[4].includes('const rows=(function readRoleRows')) {
+     if(fault==='changed-id') p.Id=hash(9);
+     if(fault==='changed-mount') launch.Source='/changed';
+     if(fault==='ledger') return JSON.stringify({rows:[{stage:'blocked'}],manifest:null});
+    }
+    return x.docker(a);
+   };
+   await assert.rejects(observeDeploymentOwners(x.c,{...ports,docker}),/correspondence|authority|launch mount|data volume|engine\/mount changed|must not contain role ledgers/,fault);
+  }
+ } finally {await x.clean();}
+});
+
 namespaceTest('connected fixture replacement rolls back and verifies when stopped candidate rejects exec',async()=>{
  const x=await connectedNamespaceFixture();try {
   let paused=false,t=0;const phases=[];
@@ -514,7 +543,11 @@ namespaceTest('connected fixture replacement rolls back and verifies when stoppe
    await fixtureHTTP(x.c,b,p,x.docker,'/');
    await x.isolation(false);return {auth:'not-exercised',image:p.Image};
   };
-  const io={load:async()=>null,authorize:async()=>{},preflight:()=>x.isolation(false),save:async j=>phases.push(j.phase),gate:async p=>{paused=p;},state,now:()=>t,sleep:async()=>{t++;},ownersIdle:async()=>true,backup:async()=>{},preReplace:()=>x.isolation(false),replace:b=>replaceConnectedBundle(x.c,b,{files:x.files,isolation:x.isolation,docker:x.docker,containers:x.containers,isolatedStop:true}),verify,report:async()=>{}};
+  const ownersIdle=async()=>{
+   const observation=await observeDeploymentOwners(x.c,{containers:x.containers,docker:x.docker,fixture:true});
+   return deploymentOwnersIdle(x.c,observation.rows,observation);
+  };
+  const io={load:async()=>null,authorize:async()=>{},preflight:()=>x.isolation(false),save:async j=>phases.push(j.phase),gate:async p=>{paused=p;},state,now:()=>t,sleep:async()=>{t++;},ownersIdle,backup:async()=>{},preReplace:()=>x.isolation(false),replace:b=>replaceConnectedBundle(x.c,b,{files:x.files,isolation:x.isolation,docker:x.docker,containers:x.containers,isolatedStop:true}),verify,report:async()=>{}};
   const j=await deploy(x.c,io,{fixture:true});
   assert.equal(j.phase,'rolled_back',JSON.stringify(j));assert.ok(phases.includes('rollback_verified'));
   assert.equal(j.rollbackVerification.image,x.c.previous.image);assert.equal(paused,false);
@@ -578,4 +611,21 @@ namespaceTest('recovery probe rejects changed bind correspondence, volumes, prod
    if(fault==='runtime') assert.ok(!x.effects.some(a=>a[0]==='run'),'reject unsafe runtime before inheriting mounts');
   } finally {await x.clean();}
  }
+});
+
+namespaceTest('ordinary engine and auth match opaque Desktop sources only through fresh filesystem proof',async()=>{
+ const x=await namespaceFixture();try {
+  const engine=x.production[0],auth=x.production[1],all={symphony:engine,'github-auth':auth};
+  for(const live of Object.values(all)) {live.Config={};live.HostConfig={};live.State={Running:true,Health:{Status:'healthy'}};live.Image='sha256:'+hash(1);}
+  const b={inspect:Object.fromEntries(Object.entries(all).map(([k,live])=>{const expected=runtimeIdentity(live);expected.mounts[0].source=x.root+(k==='symphony'?'/prod':'/key');return [k,expected];}))};
+  const ports={containers:async()=>all,docker:x.docker};
+  await matchDeploymentBundle({},b,ports);
+  for(const service of ['symphony','github-auth']) {
+   const probe=x.probes.get(all[service].Id),ino=probe.points[0].ino;probe.points[0].ino='9999999999';
+   await assert.rejects(matchDeploymentBundle({},b,ports),/correspondence/);probe.points[0].ino=ino;
+   const rw=all[service].Mounts[0].RW;all[service].Mounts[0].RW=true;await assert.rejects(matchDeploymentBundle({},b,ports),/authority/);all[service].Mounts[0].RW=rw;
+  }
+  const changed=structuredClone(all);changed['github-auth'].Config.User='changed';let calls=0;
+  await assert.rejects(matchDeploymentBundle({},b,{...ports,containers:async()=>++calls===1?all:changed}),/changed/);
+ } finally {await rm(x.root,{recursive:true,force:true});}
 });

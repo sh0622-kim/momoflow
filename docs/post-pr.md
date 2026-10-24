@@ -350,6 +350,83 @@ shared lock은 자동 만료·삭제하지 않으며 운영자 확인 대상이�
 후속 **다른 이슈**의 trusted launch는 이 receipt와 archive 및 현재 원본 ledger/enrollment/
 journal/외부 근거 hash를 다시 확인한 경우에만 해당 과거 owner를 조정된 기록으로 인정한다.
 같은 이슈의 기존 ledger 채택·재실행은 여전히 거부한다. 자동 ready·새 manifest·후속 dispatch는
-없다. 외부 근거 파일도 완료 후 불변으로 보존해야 한다. 일반 배포의 `controllersIdle` 및
-`deploymentOwnersIdle`은 변경하지 않으므로 원본 interrupted owner는 여전히 배포를 막는다.
-배포 lifecycle 예외를 이 receipt로 우회하지 않는다.
+없다. 외부 근거 파일도 완료 후 불변으로 보존해야 한다. GH-24 후보는 같은 receipt 검증을
+일반 배포 소유권 판단에도 연결한다. 정확한 live ledger/enrollment·archive·journal·scope가
+일치하고 해당 manifest가 다시 활성화되지 않은 과거 owner만 인정한다.
+[읽기 전용 소유권 검사](deployment.md#gh-24-후보-외부-완료-owner의-읽기-전용-검사)를 따르며,
+배포 lifecycle·권한·검사 예외를 만들지 않는다. 후보 설치와 실운영 검사는 별도 경계다.
+
+### Controller-only external completion v2 (GH-24)
+
+기존 GH20 v1 receipt와 배포 증거 계약은 그대로 유지한다. `profile:"controller-only-v2"`는
+원본 publish artifact의 숫자 issue 때문에 `Missing exact reviewed publication`으로 막힌
+실행만 지원한다. 원본 ledger는 blocked/in-flight/active_session 및 review 완료 상태 그대로
+보존한다. 이 runner 형식 오류는 [GH-26](https://github.com/sh0622-kim/momoflow/issues/26)의
+별도 수정 범위이며 이 정리 과정은 publication을 고쳐 쓰지 않는다.
+
+v2 설정은 `originalIterations:2`, `originalLimit:3`, `externalIterations:1`,
+`controllerVersion:merge`, `controllerTree:tree`, 현재 `dataVolume`을 요구한다. 기존 여덟
+근거 외에 `publishArtifact`, `review`, `tests`, `ownership`, `ownershipRequest`의 원본
+바이트 hash를 고정한다. 추가 파일 다섯 개는 helper에서 같은 absolute 경로로 각각 RO
+연결한다. key 파일이나 전체 현재 배포 bundle을 helper로 복사하지 않는다.
+
+| 근거 | 필수 기록 |
+| --- | --- |
+| recovery | `kind:controller-external-attempt-v2`, status completed, originalUsed 2/limit 3/externalUsed 1/totalUsed 3, buildSession, originalHead, originalHashes (ledger/publishArtifact/launchJournal/manifest) |
+| review | `kind:controller-external-review-v2`, status approved, model gpt-6-astra/reasoning high/fast false, buildSession과 다른 session |
+| tests | `kind:controller-external-tests-v2`, status passed, tests ≥356/failures 0/skipped 0, node/syntax/diff 각각 exit 0 및 logHashes |
+| validation | `kind:controller-install-v2`, status installed, commit/controllerVersion merge, controllerTree tree, engineUnchanged true, engineContainer/engineImage, ownershipHash |
+
+위 네 기록은 모두 정확한 repo/string issue/pr/final reviewed head/tree를 포함한다. merge와
+head는 달라도 tree는 같아야 한다. 설치된 clean controller의 실제 HEAD/tree도 검사한다.
+
+`ownershipRequest`는 배포를 하지 않는 별도 current-only 계약이다. `ownershipVersion:1`,
+`authority:{observe:true}`, `hold:false`, repo/issue/base, 설치 경로
+(stateRoot/inboxRoot/launchRoot/gateRoot/trustedRoot/ledgerRoot/tokenFile), controllerVersion,
+project/dataVolume/engineURL/verifyMs, 현재 manifest와 **current bundle 하나**를 고정한다.
+current에는 기존 배포 bundle의 commit/image/authImage/runnerSource/composeFile/composeHash/
+files/inspect를 사용한다. previous/target 및 deploy 권한은 필요 없다.
+
+```sh
+node /operator/pinned/scripts/deploy.mjs /operator/current-ownership.json --ownership-check
+```
+
+이 full CLI는 host에서 canonical Compose 파일과 engine/auth의 모든 bind source를 실제
+kernel mount/stat 대응으로 검증한다. Docker Desktop의 opaque Source 문자열을 추측하거나
+치환하지 않는다. default network의 Compose 직렬화 `ipam:{}`만 허용하며 nonempty/null/array는
+거부한다. 실제 실행 권한·mount type/RW·runtime identity와 관찰 전후 container ID는 유지한다.
+결과 JSON 전체를 `ownership` 근거로 보존한다. sourceRequest hash, 원본 ledger/enrollment hash,
+manifest hash, runtime idle, controller lock 부재, engine/auth runtime 및 mount identity hash가
+포함된다. 아직 조정하지 않은 원본 때문에 ownersIdle false인 것은 성공으로 위조하지 않는다.
+
+정리 transaction은 엄격히 검증된 기존 helper에서 같은 live named volume/launch 및 두 서비스의
+filesystem/runtime hash를 다시 읽어 host proof와 비교한다. key 내용·Env·token은 출력하지
+않으며 helper key custody를 확장하지 않는다. 다른 owner/worker/lock, 변경된 hash/head/tree는
+계속 차단한다. 기존 archive/fence/manifest 퇴역/idempotent retry 경로를 사용하며 원본 실행의
+성공·예산 초기화·자동 ready/dispatch를 만들지 않는다. 완료 receipt는 보존된 근거를 검사하는
+역사 기록이므로 이후 무관한 정상 engine/controller upgrade나 다른 manifest를 금지하지 않는다.
+
+원본 한도를 초과한 **이 case의 외부 복구**는 원본 ledger 한도를 수정하지 않는다. 명시적
+사용자 요청에 따라 운영자가 private config에 `authority.externalBudget:true`와
+`externalBudget:{externalLimit:2,totalLimit:4}`를 고정하면 `externalIterations:2`를 기록할 수
+있다. originalIterations 2/originalLimit 3은 계속 불변이다. 외부 사용량은 할당 이하이고
+할당된 totalLimit은 originalIterations + externalLimit과 정확히 같아야 한다. 무한/비정수
+한도나 근거 없는 추가 시도는 거부한다. 최초 v2의 2+1≤3 경우는 이 확장 없이 그대로 검증한다.
+
+확장에는 추가 `evidence.authorization` 원본 파일을 같은 absolute 경로로 helper에 RO
+연결해야 한다. 해당 record는 `kind:controller-external-budget-v1`,
+`profile:controller-only-v2`, 정확한 repo/string issue/pr, originalIterations/originalLimit,
+externalLimit/totalLimit, `source:explicit-user-request`, 비어 있지 않은 실제 `userRequest`와
+기록한 `operator`, originalHashes(ledger/publishArtifact/launchJournal/manifest)를 포함한다.
+label/comment나 공유 credential 자체는 사용자 승인 증거가 아니다. 이 record는 운영자가
+확인한 구체적 요청과 할당을 보존하며 새 issue의 예산이나 일반 runner 정책을 바꾸지 않는다.
+recovery record의 externalUsed/totalUsed에는 실제 외부 시도 수와 실제 합계(현재 2/4)를
+기록한다. authorization도 immutable archive/receipt 및 매 transaction 재검사에 포함된다.
+
+과거 receipt가 참조하는 외부 근거도 helper에서 원본 경로로 읽을 수 있어야 한다. 예를 들어
+GH20의 recovery-status와 원본 deployment validation 파일은 각각 exact absolute path의 RO
+bind로 연결한다. 허용 경로는 설정의 임의 추가 mount 목록이 아니라 **검증을 통과한 과거
+receipt/archive/current original bytes**의 외부 evidence ref에서만 도출한다. 해당 파일의
+현재 바이트 hash도 계속 재검사한다. exact Docker Source·RO·filesystem 대응을 모두 확인하며
+광범위한 `.data` mount, 다른 경로에 복사한 파일 또는 archive를 source 대신 쓰는 방식은
+허용하지 않는다. 실제 current ledger/enrollment와 journal 등의 기존 mount 계약은 유지한다.

@@ -5,8 +5,8 @@ import {mkdtemp,mkdir,readFile,writeFile,rm,readdir,lstat,symlink} from 'node:fs
 import {join} from 'node:path';
 import {fixture} from './post-pr-fixture.mjs';
 import {atomic,digest,keyFor,withControllerLock} from './post-pr.mjs';
-import {reconcileExternal,verifiedExternalReceipt,foreignOwners,observedWorkersIdle,observeReconciliationWorkers,verifyReconciliationOperator} from './reconcile-external.mjs';
-import {controllersIdle,deploymentOwnersIdle} from './deploy.mjs';
+import {reconcileExternal,verifiedExternalReceipt,foreignOwners,observedWorkersIdle,observeReconciliationWorkers,verifyReconciliationOperator,historicalReceiptEvidence} from './reconcile-external.mjs';
+import {controllersIdle,deploymentOwnersIdle,runtimeOwnersIdle} from './deploy.mjs';
 import {inspect,launchConfig} from './launch.mjs';
 const hex=n=>String(n).repeat(64),sha=n=>String(n).repeat(40);
 test('worker observation accepts only complete known idle engine processes',()=>{
@@ -57,14 +57,15 @@ test('external reconciliation check is effect-free and reports separate original
   assert.deepEqual(await snapshot(f.root),before);assert.ok(f.calls.every(c=>c.method==='GET'));
  }finally{await f.clean();}
 });
-test('reconciliation archives exact originals, retires only old manifest, restores gate; foreign launch passes but deployment stays strict',async()=>{
+test('reconciliation archives exact originals, retires only old manifest, restores gate; launch and deployment accept only the verified historical owner',async()=>{
  const f=await setup();try {
   const before=await snapshot(f.root);await assert.rejects(foreignOwners({...f.c,issue:'2'}),/unfinished/);
   assert.equal((await f.run()).status,'externally-reconciled');
   for(const name of ['ledger','enrollment','launchJournal','recovery','validation','gate'])assert.equal(digest(await readFile(f.paths[name])),before[f.paths[name].slice(f.root.length)]);
   await assert.rejects(lstat(f.paths.manifest),{code:'ENOENT'});assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
   await foreignOwners({...f.c,issue:'2',gateRoot:undefined});assert.equal(await controllersIdle(f.c.stateRoot),false);
-  assert.equal(await deploymentOwnersIdle(f.c,[{file:keyFor(f.c)+'.json',...f.ledger}]),false);
+  const observation=await liveObservation(f);
+  assert.equal(await deploymentOwnersIdle(f.c,observation.rows,observation),true);
   const after=await snapshot(f.root);assert.equal((await f.run()).unchanged,true);assert.deepEqual(await snapshot(f.root),after);
   assert.equal(f.calls.filter(c=>c.method!=='GET').length,0);
  }finally{await f.clean();}
@@ -152,7 +153,7 @@ function operatorFixture() {
   assert.equal(docker,f.docker);assert.deepEqual(containers,[engine,operator]);
   // Docker parsing returns distinct objects, as it does for the real adapter.
   return {host:f.context.host,mounted:new Map(containers.flatMap(x=>x.Mounts.map(m=>[m,f.context.mounted.get([engine,operator].flatMap(x=>x.Mounts).find(old=>old.Destination===m.Destination && old.Source===m.Source && old.RW===m.RW))]))) };
- },canonical:async path=>{assert.equal(path,'/var/run/docker.sock');return '/run/docker.sock';}});
+ },historicalEvidence:async()=>f.historical || [],canonical:async path=>{assert.equal(path,'/var/run/docker.sock');return '/run/docker.sock';}});
  return f;
 }
 test('worker Docker adapter requests PID column and validates engine before and after observation',async()=>{
@@ -195,3 +196,163 @@ for(const [name,change] of [
  ['unproven bind',f=>{f.context.host=async()=>({identity:'wrong'});}],
  ['extra mount',f=>{f.operator.Mounts.push({Type:'bind',Source:'/other',Destination:'/other',RW:true});}],
 ])test('operator helper adapter rejects '+name,async()=>{const f=operatorFixture();change(f);await assert.rejects(f.verify());});
+
+// Simulated live transport; exact source/archive bytes use real temporary files.
+async function liveObservation(f) {
+ return {rows:[{file:keyFor(f.c)+'.json',...JSON.parse(await readFile(f.paths.ledger)),
+  bytes:(await readFile(f.paths.ledger)).toString('base64'),enrollment:(await readFile(f.paths.enrollment)).toString('base64')}],manifest:null};
+}
+for(const [name,mutate] of [
+ ['missing receipt',async f=>rm(join(f.dir,'external-reconciliation.json'))],
+ ['incomplete receipt',async f=>{const p=join(f.dir,'external-reconciliation.json'),r=JSON.parse(await readFile(p));r.done=false;await atomic(p,r);}],
+ ['wrong repo',(f,o)=>{f.c.repo='other/repo';}],
+ ['wrong base',(f,o)=>{f.c.base='other';}],
+ ['wrong ledger path',f=>{f.c.ledgerRoot+='/other';}],
+ ['wrong journal root',f=>{f.c.stateRoot+='/other';}],
+ ['wrong launch path',f=>{f.c.launchRoot+='/other';}],
+ ['wrong gate path',f=>{f.c.gateRoot+='/other';}],
+ ['missing live row',(f,o)=>{o.rows.length=0;}],
+ ['missing live enrollment',(f,o)=>{o.rows[0].enrollment=null;}],
+ ['changed live ledger',(f,o)=>{o.rows[0].bytes=Buffer.from(JSON.stringify({...f.ledger,in_flight:false})).toString('base64');}],
+ ['changed live enrollment',(f,o)=>{o.rows[0].enrollment=Buffer.from('{}').toString('base64');}],
+ ['changed launch journal',async f=>writeFile(f.paths.launchJournal,'changed')],
+ ['unexpected controller journal',async f=>atomic(f.paths.controllerJournal,{done:true})],
+ ['changed recovery',async f=>writeFile(f.paths.recovery,'changed')],
+ ['changed validation',async f=>writeFile(f.paths.validation,'changed')],
+ ['missing archive',async f=>{const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));await rm(r.archive,{recursive:true});}],
+ ['changed archive',async f=>{const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));await rm(join(r.archive,'ledger'));await writeFile(join(r.archive,'ledger'),'changed',{mode:0o400});}],
+ ['wrong archive path',async f=>{const p=join(f.dir,'external-reconciliation.json'),r=JSON.parse(await readFile(p));r.archive+='/other';await atomic(p,r);}],
+ ['reactivated manifest',(f,o)=>{o.manifest=f.manifest;}],
+ ['unknown manifest',(f,o)=>{delete o.manifest;}],
+ ['per issue lock',async f=>atomic(join(f.dir,'lock'),{pid:123})],
+ ['other active ledger',(f,o)=>{o.rows.push({file:hex(9)+'.json',stage:'build',in_flight:true});}],
+ ['receipt-less idle blocked',(f,o)=>{o.rows.push({file:hex(9)+'.json',stage:'blocked',in_flight:false,active_session:false});}],
+ ['receipt-less interrupted blocked',(f,o)=>{o.rows.push({file:hex(9)+'.json',stage:'blocked',in_flight:true,active_session:true});}],
+ ['other unknown ledger',(f,o)=>{o.rows.push({file:hex(9)+'.json',in_flight:false,stage:'unknown'});}],
+ ['unknown controller directory',async f=>mkdir(join(f.c.stateRoot,'unknown'))],
+ ['unfinished foreign journal',async f=>{const d=join(f.c.stateRoot,hex(9));await mkdir(d);await atomic(join(d,'launch.json'),{dispatched:true});}],
+])test('deployment receipt owner rejects '+name,async()=>{
+ const f=await setup();try {
+  await f.run();const observation=await liveObservation(f);await mutate(f,observation);
+  let accepted=false;try{accepted=await deploymentOwnersIdle(f.c,observation.rows,observation);}catch{}assert.equal(accepted,false);
+ }finally{await f.clean();}
+});
+test('deployment uses observed bytes instead of a host ledger mirror and rechecks receipts every time',async()=>{
+ const f=await setup();try {
+  await f.run();const observation=await liveObservation(f);
+  // The host copy is stale/unavailable: live observation still binds the archived original.
+  await writeFile(f.paths.ledger,'stale host mirror');await rm(f.paths.enrollment);
+  const before=await snapshot(f.root);
+  assert.equal(await deploymentOwnersIdle(f.c,observation.rows,observation),true);
+  assert.deepEqual(await snapshot(f.root),before);
+  await writeFile(f.paths.launchJournal,'changed between drain and replacement');
+  await assert.rejects(deploymentOwnersIdle(f.c,observation.rows,observation),/bytes changed/);
+ }finally{await f.clean();}
+});
+test('verified historical owner never excuses active or unknown runtime work',async()=>{
+ const f=await setup();try {
+  await f.run();const observation=await liveObservation(f);
+  assert.equal(await deploymentOwnersIdle(f.c,observation.rows,observation),true);
+  const state=await f.io.engine();assert.equal(runtimeOwnersIdle(state),true);
+  for(const key of ['running','retrying']) {
+   assert.equal(runtimeOwnersIdle({...state,[key]:['worker']}),false);
+   assert.equal(runtimeOwnersIdle({...state,[key]:undefined}),false);
+  }
+  for(const key of ['running','retrying','claimed','blocked']) {
+   assert.equal(runtimeOwnersIdle({...state,admission:{...state.admission,[key]:['owner']}}),false);
+   assert.equal(runtimeOwnersIdle({...state,admission:{...state.admission,[key]:undefined}}),false);
+  }
+  assert.equal(runtimeOwnersIdle({...state,admission:{...state.admission,pending_dispatch:true}}),false);
+ }finally{await f.clean();}
+});
+
+async function controllerSetup() {
+ const f=await setup(),c=f.c;
+ Object.assign(c,{profile:'controller-only-v2',originalIterations:2,originalLimit:3,externalIterations:1,controllerVersion:c.merge,controllerTree:c.tree,dataVolume:'live-data'});
+ Object.assign(f.ledger,{iterations:2,reason:'Missing exact reviewed publication',events:[{role:'review',result:{status:'complete'}}]});
+ const pin=async(name,value)=>{const path=f.paths[name] || join(f.root,name+'.json');f.paths[name]=path;await atomic(path,value);c.evidence[name]={path,hash:digest(await readFile(path))};};
+ await pin('ledger',f.ledger);
+ const scope={repo:c.repo,issue:c.issue,pr:c.pr,head:c.head,tree:c.tree};
+ await pin('publishArtifact',{status:'complete',publication:{repo:c.repo,issue:Number(c.issue),pr:c.pr,base:c.base,head:sha(9)}});
+ await pin('review',{kind:'controller-external-review-v2',...scope,status:'approved',model:'gpt-6-astra',reasoning:'high',fast:false,session:'independent-review'});
+ await pin('tests',{kind:'controller-external-tests-v2',...scope,status:'passed',tests:400,failures:0,skipped:0,checks:['node','syntax','diff'].map(name=>({name,exit:0})),logHashes:{node:hex(1),syntax:hex(2),diff:hex(3)}});
+ await pin('ownershipRequest',{ownershipVersion:1,authority:{observe:true},repo:c.repo,base:c.base,controllerVersion:c.merge,dataVolume:c.dataVolume});
+ await pin('recovery',{kind:'controller-external-attempt-v2',...scope,status:'completed',originalUsed:2,limit:3,externalUsed:1,totalUsed:3,originalHead:sha(9),buildSession:'external-build',originalHashes:Object.fromEntries(['ledger','publishArtifact','launchJournal','manifest'].map(k=>[k,c.evidence[k].hash]))});
+ const serviceEvidence={kernel:'11111111-1111-1111-1111-111111111111',services:['symphony','github-auth'].map((service,i)=>({service,id:i?hex(9):c.engineContainer,image:c.engineImage,runtimeHash:hex(i+1),mountHashes:[{type:'volume',destination:'/data',rw:true,identityHash:hex(i+1)}]}))};
+ await pin('ownership',{kind:'deployment-ownership-v1',effects:'none',...scope,base:c.base,controllerVersion:c.merge,engine:c.engineContainer,engineImage:c.engineImage,dataVolume:c.dataVolume,sourceRequest:c.evidence.ownershipRequest,ledgerHashes:[{file:keyFor(c)+'.json',ledgerHash:c.evidence.ledger.hash,enrollmentHash:c.evidence.enrollment.hash}],serviceEvidence,manifestContract:digest(f.manifest),runtimeIdle:true,controllerLock:false});
+ await pin('validation',{kind:'controller-install-v2',...scope,commit:c.merge,controllerVersion:c.merge,controllerTree:c.tree,status:'installed',engineUnchanged:true,engineContainer:c.engineContainer,engineImage:c.engineImage,ownershipHash:c.evidence.ownership.hash});
+ f.io.installedController=async()=>({commit:c.merge,tree:c.tree});f.io.ownership=async()=>JSON.parse(await readFile(f.paths.ownership));f.pin=pin;
+ return f;
+}
+test('versioned controller completion preserves numeric publish failure and shared2+1 budget without a deployment record',async()=>{
+ const f=await controllerSetup();try {
+  const original=digest(await readFile(f.paths.ledger)),artifact=digest(await readFile(f.paths.publishArtifact));
+  const before=await snapshot(f.root);assert.equal((await reconcileExternal(f.c,f.io,{check:true})).status,'eligible');assert.deepEqual(await snapshot(f.root),before);
+  await f.run();const receipt=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));
+  assert.equal(receipt.v,2);assert.equal(receipt.binding.originalLimit,3);assert.equal(receipt.binding.originalIterations+receipt.binding.externalIterations,3);
+  assert.equal(digest(await readFile(f.paths.ledger)),original);assert.equal(digest(await readFile(f.paths.publishArtifact)),artifact);
+  assert.equal(JSON.parse(await readFile(f.paths.publishArtifact)).publication.issue,1);
+  assert.equal(await verifiedExternalReceipt({...f.c,controllerVersion:sha(8),engineContainer:hex(8),engineImage:'sha256:'+hex(8)},keyFor(f.c)),true);
+  await atomic(f.paths.manifest,{issue:'another-scope'});assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
+ }finally{await f.clean();}
+});
+for(const phase of ['intent','fence-written','fenced','manifest-retired','gate-restored','receipt'])test('controller-only retry is safe after '+phase,async()=>{
+ const f=await controllerSetup();try {
+  let failed=false;f.io.checkpoint=async p=>{if(p===phase&&!failed){failed=true;throw Error('crash');}};
+  await assert.rejects(f.run(),/crash/);await f.run();assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
+ }finally{await f.clean();}
+});
+for(const [name,change] of [
+ ['extra external build',f=>{f.c.externalIterations=2;}],['different limit',f=>{f.c.originalLimit=4;}],
+ ['unknown profile',f=>{f.c.profile='blocked-anything';}],['wrong installed controller',f=>{f.io.installedController=async()=>({commit:sha(8),tree:f.c.tree});}],
+ ['stale live ledger',f=>{const own=f.io.ownership;f.io.ownership=async()=>({...await own(),ledgerHashes:[]});}],
+ ['changed auth runtime',f=>{const own=f.io.ownership;f.io.ownership=async()=>({...await own(),serviceEvidence:{kernel:'changed',services:[]}});}],
+ ['synthetic fixed publication',async f=>{const a=JSON.parse(await readFile(f.paths.publishArtifact));a.publication.issue=f.c.issue;await f.pin('publishArtifact',a);}],
+ ['stale reviewed head',async f=>{const r=JSON.parse(await readFile(f.paths.review));r.head=sha(8);await f.pin('review',r);}],
+ ['failed external tests',async f=>{const r=JSON.parse(await readFile(f.paths.tests));r.failures=1;await f.pin('tests',r);}],
+ ['build self-review',async f=>{const r=JSON.parse(await readFile(f.paths.review));r.session='external-build';await f.pin('review',r);}],
+])test('controller profile blocks '+name+' without effects',async()=>{
+ const f=await controllerSetup();try {await change(f);const before=await snapshot(f.root);await assert.rejects(f.run());assert.deepEqual(await snapshot(f.root),before);}finally{await f.clean();}
+});
+
+async function extendedControllerSetup() {
+ const f=await controllerSetup(),c=f.c;c.externalIterations=2;c.externalBudget={externalLimit:2,totalLimit:4};c.authority.externalBudget=true;
+ await f.pin('authorization',{kind:'controller-external-budget-v1',profile:c.profile,repo:c.repo,issue:c.issue,pr:c.pr,originalIterations:2,originalLimit:3,externalLimit:2,totalLimit:4,source:'explicit-user-request',userRequest:'Complete this recovery with the necessary additional scoped budget.',operator:'test-operator',originalHashes:Object.fromEntries(['ledger','publishArtifact','launchJournal','manifest'].map(k=>[k,c.evidence[k].hash]))});
+ const recovery=JSON.parse(await readFile(f.paths.recovery));recovery.externalUsed=2;recovery.totalUsed=4;await f.pin('recovery',recovery);return f;
+}
+test('explicit scoped external allocation preserves original2of3 while recording actual total4',async()=>{
+ const f=await extendedControllerSetup();try {
+  const ledger=await readFile(f.paths.ledger);assert.equal((await reconcileExternal(f.c,f.io,{check:true})).status,'eligible');await f.run();
+  assert.deepEqual(await readFile(f.paths.ledger),ledger);const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));
+  assert.equal(r.binding.originalIterations,2);assert.equal(r.binding.originalLimit,3);assert.equal(r.binding.externalIterations,2);assert.equal(r.binding.externalBudget.totalLimit,4);
+  assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);await f.run();
+ }finally{await f.clean();}
+});
+for(const [name,change] of [
+ ['missing config authority',f=>{delete f.c.authority.externalBudget;}],
+ ['allocation exceeded',f=>{f.c.externalIterations=3;}],
+ ['unbounded allocation',f=>{f.c.externalBudget.externalLimit=Infinity;}],
+ ['allocation total mismatch',f=>{f.c.externalBudget.totalLimit=5;}],
+ ['wrong authorization issue',async f=>{const a=JSON.parse(await readFile(f.paths.authorization));a.issue='999';await f.pin('authorization',a);}],
+ ['wrong original bytes',async f=>{const a=JSON.parse(await readFile(f.paths.authorization));a.originalHashes.ledger=hex(9);await f.pin('authorization',a);}],
+ ['missing user authority',async f=>{const a=JSON.parse(await readFile(f.paths.authorization));a.source='label';await f.pin('authorization',a);}],
+ ['wrong authorized allocation',async f=>{const a=JSON.parse(await readFile(f.paths.authorization));a.externalLimit=3;await f.pin('authorization',a);}],
+ ['false external used count',async f=>{const a=JSON.parse(await readFile(f.paths.recovery));a.externalUsed=1;await f.pin('recovery',a);}],
+])test('external budget rejects '+name+' before effects',async()=>{
+ const f=await extendedControllerSetup();try{await change(f);const before=await snapshot(f.root);await assert.rejects(f.run());assert.deepEqual(await snapshot(f.root),before);}finally{await f.clean();}
+});
+
+test('historical helper RO source allowlist derives only from fully verified receipt and archive bytes',async()=>{
+ const f=await setup();try {
+  await f.run();const c={...f.c,issue:'24'};
+  assert.deepEqual(await historicalReceiptEvidence(c),[f.c.evidence.recovery,f.c.evidence.validation].sort((a,b)=>a.path.localeCompare(b.path)));
+  await writeFile(f.paths.recovery,'stale source');await assert.rejects(historicalReceiptEvidence(c));
+ }finally{await f.clean();}
+});
+test('helper historical source mounts retain exact Source, RO and filesystem proof',async()=>{
+ const f=operatorFixture(),path='/historical/recovery.json',m={Type:'bind',Source:path,Destination:path,RW:false};
+ f.historical=[{path,hash:hex(1)}];f.operator.Mounts.push(m);f.context.mounted.set(m,{identity:path});await f.verify();
+ m.RW=true;await assert.rejects(f.verify(),/source\/authority/);m.RW=false;
+ m.Source='/copy';await assert.rejects(f.verify(),/source\/authority/);m.Source=path;
+ f.context.mounted.set(m,{identity:'/copied-object'});await assert.rejects(f.verify(),/correspondence/);
+});

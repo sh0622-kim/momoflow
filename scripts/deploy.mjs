@@ -1,6 +1,7 @@
 // Install this CLI from a reviewed, pinned checkout OUTSIDE the engine/candidate workspace.
 // There is deliberately no build, pull, shell command hook, policy editor or ledger writer.
-import { fixtureMountSources } from './deploy-mount-identity.mjs';
+import { verifiedExternalReceipt } from './reconcile-external.mjs';
+import { fixtureMountSources, verifiedMountSources, mountContext } from './deploy-mount-identity.mjs';
 import { readFile, readdir, lstat, realpath, mkdir, open, rm, copyFile } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -18,10 +19,20 @@ const iid = x => /^sha256:[a-f0-9]{64}$/.test(x || '');
 const same = isDeepStrictEqual;
 const optional = async p => { try { return await json(p); } catch(e) { if(e.code === 'ENOENT') return null; throw e; } };
 const sleep = ms => new Promise(r => setTimeout(r,ms));
-export function deploymentConfig(c,{fixture=false}={}) {
+export function deploymentConfig(c,{fixture=false,ownership=false}={}) {
+  const currentOnly=ownership && c.ownershipVersion===1;
+  if(currentOnly) {
+    require(!fixture && !c.fixtureMode && !c.fixtureSource && !c.fixtureRepository && c.current && !c.previous && !c.target,'Current-only ownership request required');
+    require(c.authority?.observe===true && c.hold===false && /^[\w.-]+\/[\w.-]+$/.test(c.repo) && /^[1-9][0-9]*$/.test(c.issue) && typeof c.base==='string' && c.base.length>0,'Explicit read-only ownership authority/scope required');
+    for(const k of ['stateRoot','inboxRoot','launchRoot','gateRoot','trustedRoot','ledgerRoot','tokenFile'])require(typeof c[k]==='string' && resolve(c[k])===c[k],'Absolute ownership path required: '+k);
+    require(sha(c.controllerVersion) && /^[a-z0-9][a-z0-9_-]+$/.test(c.project) && /^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/.test(c.dataVolume || '') && /^http:\/\/(127\.0\.0\.1|host\.docker\.internal):[0-9]+$/.test(c.engineURL) && Number.isInteger(c.verifyMs) && c.verifyMs>=1 && c.verifyMs<=300000,'Pinned ownership installation/deadline required');
+    const b=c.current;
+    require(sha(b.commit) && iid(b.image) && iid(b.authImage) && hex(b.runnerSource) && hex(b.composeHash) && typeof b.composeFile==='string' && resolve(b.composeFile)===b.composeFile && b.files?.[b.composeFile]===b.composeHash && Object.values(b.files).every(hex) && b.inspect?.symphony && b.inspect?.['github-auth'],'Complete pinned current engine/auth bundle required');
+    return c;
+  }
   require(fixture ? c.fixtureMode==='credential-free-v1' && c.fixtureSource && c.fixtureRepository && c.integration && c.repo==='smoke/fixture' && same(c.manifest,{status:'absent'}) && c.tokenFile===undefined : !c.fixtureMode && !c.fixtureSource && !c.fixtureRepository, 'Fixture requests require the separate isolated integration entrypoint');
   require(hex(c.deploymentId) && /^[\w.-]+\/[\w.-]+$/.test(c.repo) && /^[1-9][0-9]*$/.test(c.issue), 'Explicit deployment scope required');
-  require(c.authority?.deploy === true && c.hold === false && c.compatibility === 'unchanged-data' && c.exceptional === false, 'Explicit deployment authority, unchanged data and ordinary scope required; exceptional changes need separate handling');
+  require(c.authority?.deploy===true && c.hold === false && c.compatibility === 'unchanged-data' && c.exceptional === false, 'Explicit deployment authority, unchanged data and ordinary scope required; exceptional changes need separate handling');
   require(/^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/.test(c.dataVolume || ''),'Explicit data named volume required');
   require(/^[a-z0-9][a-z0-9_-]+$/.test(c.project), 'Explicit Compose project required');
   for(const k of ['stateRoot','deploymentRoot','gateRoot','trustedRoot',...(fixture?['launchRoot']:['tokenFile']),'inboxRoot','ledgerRoot']) require(typeof c[k] === 'string' && resolve(c[k]) === c[k], `Absolute operator path required: ${k}`);
@@ -205,6 +216,17 @@ export function runtimeIdentity(x,{fixture=false}={}) {
     securityOpt:securityIdentity(x.HostConfig.SecurityOpt),networkMode:x.HostConfig.NetworkMode,readonly:x.HostConfig.ReadonlyRootfs,
     ports:x.HostConfig.PortBindings || {},environmentHash:digest([...(x.Config.Env || [])].sort())};
 }
+export async function matchDeploymentBundle(c,b,{containers,docker,fixture=false}) {
+  const all=await containers(),services=fixture?['symphony']:['symphony','github-auth'];
+  for(const service of services) {
+    const x=all[service];require(x && b.inspect[service],'Missing expected deployment service');
+    const normalized={...x,Mounts:await verifiedMountSources(x,b.inspect[service],docker)};
+    require(same(runtimeIdentity(normalized,{fixture}),b.inspect[service]) && x.State.Running && x.State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
+  }
+  const after=await containers();
+  for(const service of services)require(after[service]?.Id===all[service].Id && same(runtimeIdentity(after[service],{fixture}),runtimeIdentity(all[service],{fixture})) && after[service].State.Running && after[service].State.Health?.Status==='healthy','Deployment service changed during proof');
+  return all;
+}
 export function safeRuntime(c,b,{fixture=false}={}) {
   if(fixture) return fixtureRuntime(c,b);
   const e=b.inspect.symphony, a=b.inspect['github-auth'];
@@ -234,10 +256,10 @@ export function composeIdentity(c,b,doc,images,profiles={}, {fixture=false}={}) 
   const keys=(x,allowed)=>require(x && typeof x==='object' && !Array.isArray(x) && Object.keys(x).every(k=>allowed.includes(k)),'Unsupported Compose field');
   keys(doc,['name','services','volumes','networks']);
   require(doc.name===c.project && Object.keys(doc.services).sort().join()===(fixture?'symphony':'github-auth,symphony'),'Compose project/services mismatch');
-  keys(doc.networks,['default']);keys(doc.networks.default,['name','external',...(fixture?['internal','ipam']:[])]);
-  // Compose emits an empty IPAM object for this fixture's default network.
+  keys(doc.networks,['default']);keys(doc.networks.default,['name','external','ipam',...(fixture?['internal']:[])]);
+  // Compose emits an empty IPAM object for the default network.
   // Accept only that serialization default; address/driver settings remain forbidden.
-  if(fixture && Object.hasOwn(doc.networks.default,'ipam')) keys(doc.networks.default.ipam,[]);
+  if(Object.hasOwn(doc.networks.default,'ipam')) keys(doc.networks.default.ipam,[]);
   if(fixture) require(doc.networks.default.internal===true && !doc.networks.default.external,'Fixture network must block external traffic');
   const network=doc.networks.default.name;
   require(network===`${c.project}_default`,'Compose network mismatch');
@@ -285,7 +307,7 @@ export function composeIdentity(c,b,doc,images,profiles={}, {fixture=false}={}) 
     }));
     const expected=b.inspect[service];
     // Docker normalizes no-new-privileges:true to no-new-privileges.
-    const identity={image:image.Id,user:s.user ?? base.User,entrypoint:fixture?(s.entrypoint ?? base.Entrypoint ?? null):(s.entrypoint ?? base.Entrypoint),
+    const identity={image:image.Id,user:s.user ?? base.User,entrypoint:s.entrypoint ?? base.Entrypoint ?? null,
       command:s.command ?? (s.entrypoint?.length?null:base.Cmd),mounts,privileged:s.privileged ?? false,
       capAdd:s.cap_add?.length?s.cap_add:null,capDrop:s.cap_drop?.length?s.cap_drop:null,
       securityOpt,networkMode:network,readonly:s.read_only ?? false,ports,
@@ -330,17 +352,107 @@ export function readRoleRows(fs,root) {
   const dir=root+'/log/roles';
   try {if(!fs.lstatSync(dir).isDirectory()) throw Error('Invalid roles layout');}
   catch(e) {if(e.code==='ENOENT') return [];throw e;}
-  return fs.readdirSync(dir).filter(n=>n.endsWith('.json')).map(file=>{
+  const names=fs.readdirSync(dir);
+  for(const n of names) if(!/^[a-f0-9]{64}\.json(?:\.enrolled)?$/.test(n) || (n.endsWith('.enrolled') && !names.includes(n.slice(0,-9)))) throw Error('Unknown ledger owner');
+  return names.filter(n=>n.endsWith('.json')).map(file=>{
     if(!/^[a-f0-9]{64}\.json$/.test(file) || !fs.lstatSync(dir+'/'+file).isFile()) throw Error('Invalid role ledger file');
-    const x=JSON.parse(fs.readFileSync(dir+'/'+file));
-    return {file,issue:x.issue,publication:x.publication,stage:x.stage,in_flight:x.in_flight,active_session:!!x.active_session};
+    const source=dir+'/'+file;
+    const bytes=fs.readFileSync(source),x=JSON.parse(bytes);
+    const enrolled=source+'.enrolled';let enrollment=null;
+    try {
+      const st=fs.lstatSync(enrolled);
+      if(!st.isFile() || st.isSymbolicLink() || (st.mode&0o022) || fs.realpathSync(enrolled)!==enrolled) throw Error('Invalid enrollment file');
+      enrollment=fs.readFileSync(enrolled).toString('base64');
+    } catch(e) {if(e.code!=='ENOENT') throw e;}
+    if((fs.lstatSync(source).mode&0o022) || fs.realpathSync(source)!==source) throw Error('Invalid role ledger permissions/path');
+    return {file,issue:x.issue,publication:x.publication,stage:x.stage,in_flight:x.in_flight,active_session:!!x.active_session,bytes:bytes.toString('base64'),enrollment};
   });
 }
-export async function deploymentOwnersIdle(c,rows) {
-  if(!await controllersIdle(c.stateRoot)) return false;
+// Executed only in the identified engine. Never read a host ledger mirror.
+export async function observeDeploymentOwners(c,{containers,docker,fixture=false,contextFor=mountContext}) {
+  const all=await containers(),engine=all.symphony;
+  require(engine.Mounts.some(m=>m.Destination==='/data' && m.Type==='volume' && m.Name===c.dataVolume && m.RW),'Live data volume mismatch');
+  let mounts=engine.Mounts;
+  if(fixture) {
+    const b=[c.previous,c.target].find(b=>b.image===engine.Image);
+    require(b,'Unknown fixture ownership image');
+    mounts=await fixtureMountSources(engine,b.inspect.symphony,docker);
+  }
+  const launch=mounts.find(m=>m.Destination==='/run/momoflow-launch');
+  if(c.launchRoot) {
+    require(launch?.Type==='bind' && launch.RW===false,'Live launch mount mismatch');
+    if(fixture)require(launch.Source===c.launchRoot,'Live launch mount mismatch');
+    else {
+      const context=await contextFor(docker,Object.values(all)),host=await context.host(c.launchRoot),actual=context.mounted.get(launch);
+      require(actual && host.inode && same(actual,host),'Live launch mount correspondence mismatch');
+    }
+  }
+  const script=`const fs=require('fs');const rows=(${readRoleRows.toString()})(fs,'/data');let manifest=null;
+    if(${!!launch}) { const p='/run/momoflow-launch/active.json';try {
+      const st=fs.lstatSync(p);if(!st.isFile() || st.isSymbolicLink() || fs.realpathSync(p)!==p || (st.mode&0o022)) throw Error('Invalid live manifest');
+      manifest=JSON.parse(fs.readFileSync(p));
+    }catch(e){if(e.code!=='ENOENT')throw e;}}
+    process.stdout.write(JSON.stringify({rows,manifest}));`;
+  const observation=JSON.parse(await docker(['exec',engine.Id,'node','-e',script]));
+  const after=await containers();
+  for(const [service,x] of Object.entries(all)) {
+    const y=after[service];
+    require(y?.Id===x.Id && ['Mounts','Image','Config','HostConfig'].every(k=>same(y[k],x[k])) && y.State?.Running===x.State?.Running,'Ownership engine/mount changed');
+  }
+  if(fixture) require(observation.rows.length===0,'Credential-free fixture must not contain role ledgers');
+  return {...observation,engine:engine.Id};
+}
+export function runtimeOwnersIdle(s) {
+  const a=s.admission;
+  return ['running','retrying'].every(k=>Array.isArray(s[k]) && s[k].length===0) &&
+    a?.contract===1 && a.configured===true && !a.error && a.pending_dispatch===false &&
+    ['running','retrying','claimed','blocked'].every(k=>Array.isArray(a[k]) && a[k].length===0);
+}
+// Hashed live metadata only: no key, token, Env or role body is emitted. A host
+// proof authenticates canonical binds; a helper can recheck the same objects
+// without mounting the auth private key into its own namespace.
+export async function ownershipServiceEvidence(all,docker) {
+  const context=await mountContext(docker,Object.values(all)),kernel=(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim();
+  const services=Object.entries(all).sort(([a],[b])=>a.localeCompare(b)).map(([service,x])=>{
+    require(x.State?.Running && x.State.Health?.Status==='healthy','Ownership service unhealthy');
+    const runtime=runtimeIdentity(x);
+    const mountHashes=x.Mounts.map(m=>{const identity=context.mounted.get(m);require(identity,'Missing ownership mount identity');return {type:m.Type,destination:m.Destination,rw:m.RW,identityHash:digest(identity)};}).sort((a,b)=>a.destination.localeCompare(b.destination));
+    return {service,id:x.Id,image:x.Image,runtimeHash:digest({...runtime,mounts:runtime.mounts.map(m=>m.type==='bind'?{...m,source:null}:m)}),mountHashes};
+  });
+  return {kernel,services};
+}
+export async function deploymentOwnershipCheck(c,{containers,docker,state,fixture=false,request,expectedManifest=c.manifest}) {
+  deploymentConfig(c,{fixture,ownership:true});const b=c.ownershipVersion===1?c.current:c.previous;
+  await bundleFiles(c,b,docker,{fixture});const all=await matchDeploymentBundle(c,b,{containers,docker,fixture});
+  const s=await state();require(hex(s.admission?.generation) && typeof s.admission?.paused==='boolean','Admission observation unknown');
+  activeContract({...c,manifest:expectedManifest,deploymentId:s.admission.generation},b,s,s.admission.paused);
+  const observation=await observeDeploymentOwners(c,{containers,docker,fixture});
+  const reconciled=await reconciledDeploymentOwners(c,observation.rows,observation),historicalOwnersIdle=await deploymentOwnersIdle(c,observation.rows,observation);
+  let controllerLock=false;try{await lstat(join(c.stateRoot,'controller.lock'));controllerLock=true;}catch(e){if(e.code!=='ENOENT')throw e;}
+  const runtimeIdle=runtimeOwnersIdle(s);
+  const serviceEvidence=await ownershipServiceEvidence(all,docker);
+  const after=await containers();
+  require(observation.engine===all.symphony.Id && Object.keys(all).every(k=>after[k]?.Id===all[k].Id && same(runtimeIdentity(after[k],{fixture}),runtimeIdentity(all[k],{fixture})) && after[k].State?.Running===true && after[k].State.Health?.Status==='healthy'), 'Ownership services changed during observation');
+  return {kind:'deployment-ownership-v1',effects:'none',repo:c.repo,base:c.base,project:c.project,controllerVersion:c.controllerVersion,engine:observation.engine,engineImage:all.symphony.Image,dataVolume:c.dataVolume,...(request?{sourceRequest:request}:{}),ledgerHashes:observation.rows.map(r=>({file:r.file,ledgerHash:digest(Buffer.from(r.bytes,'base64')),enrollmentHash:r.enrollment===null?null:digest(Buffer.from(r.enrollment,'base64'))})).sort((a,b)=>a.file.localeCompare(b.file)),serviceEvidence,manifestContract:observation.manifest?digest(observation.manifest):null,reconciledOwners:[...reconciled].sort(),historicalOwnersIdle,runtimeIdle,controllerLock,ownersIdle:historicalOwnersIdle && runtimeIdle && !controllerLock};
+}
+export async function reconciledDeploymentOwners(c,rows,observation) {
+  const reconciled=new Set();
+  for(const entry of await readdir(c.stateRoot,{withFileTypes:true})) {
+    if(!entry.isDirectory() || !hex(entry.name)) continue;
+    if(await optional(join(c.stateRoot,entry.name,'external-reconciliation.json'))) {
+      require(observation && observation.rows===rows && typeof c.launchRoot==='string' && resolve(c.launchRoot)===c.launchRoot,'Live reconciliation observation and explicit launchRoot required');
+      if(await verifiedExternalReceipt(c,entry.name,observation)) reconciled.add(entry.name);
+    }
+  }
+  return reconciled;
+}
+export async function deploymentOwnersIdle(c,rows,observation) {
+  const reconciled=await reconciledDeploymentOwners(c,rows,observation);
+  if(!await controllersIdle(c.stateRoot,reconciled)) return false;
   for(const row of rows) {
+    if(reconciled.has(row.file.slice(0,-5))) continue;
     if(row.in_flight!==false || row.active_session) return false;
-    if(['done','blocked'].includes(row.stage)) continue;
+    if(row.stage==='done') continue;
     if(row.stage!=='await_validation') return false;
     const p=row.publication;
     if(!p || p.repo!==c.repo || p.issue!==row.issue || row.file!==`${digest(`${p.repo}:${p.issue}`)}.json`) return false;
@@ -432,7 +544,7 @@ export async function replaceConnectedBundle(c,b,{files,isolation,docker,contain
 }
 
 async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false}={}) {
-  deploymentConfig(c,{fixture});
+  deploymentConfig(c,{fixture,ownership:preflight==='ownership'});
   await privateFile(requestFile);
   const requestBytes=await readFile(requestFile), api=github(c);
   require(same(JSON.parse(requestBytes),c),'Request bytes/config mismatch');
@@ -474,21 +586,14 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
   };
   const files=b=>bundleFiles(c,b,docker,{fixture});
   const observed=async()=>Object.fromEntries(Object.entries(await containers()).map(([k,x])=>[k,{...runtimeIdentity(x,{fixture}),running:x.State.Running,health:x.State.Health?.Status}]));
-  const match=async b=>{
-    const all=await containers();
-    for(const service of (fixture?['symphony']:['symphony','github-auth'])) {
-      const x=all[service], normalized=fixture?{...x,Mounts:await fixtureMountSources(x,b.inspect[service],docker)}:x;
-      require(same(runtimeIdentity(normalized,{fixture}),b.inspect[service]) && x.State.Running && x.State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
-    }
-    return all;
-  };
+  const match=b=>matchDeploymentBundle(c,b,{containers,docker,fixture});
+  if(preflight==='ownership') {
+    await authorize();return deploymentOwnershipCheck(c,{containers,docker,state,fixture,request:{path:requestFile,hash:digest(requestBytes)}});
+  }
+  const observeOwners=async()=>observeDeploymentOwners(c,{containers,docker,fixture});
   const ownersIdle=async()=>{
-    const all=await containers();
-    require(all.symphony.Mounts.some(m=>m.Destination==='/data' && m.Type==='volume' && m.Name===c.dataVolume && m.RW),'Live data volume mismatch');
-    const rows=JSON.parse(await docker(['exec',all.symphony.Id,'node','-e',
-      `process.stdout.write(JSON.stringify((${readRoleRows.toString()})(require('fs'),'/data')))`]));
-    if(fixture) require(rows.length===0,'Credential-free fixture must not contain role ledgers');
-    return deploymentOwnersIdle(c,rows);
+    const observation=await observeOwners();
+    return deploymentOwnersIdle(c,observation.rows,observation);
   };
   const isolation=async(recovery=false)=>integrationIsolation(c,await containers(),docker,{fixture,recovery});
   const fixtureState=async()=>{
@@ -586,12 +691,14 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
   if(preflight) return deploy(c,io,{preflight:true,fixture});
   return withDeploymentLock(c,async()=>{controllerOwned=true;return deploy(c,io,{fixture});});
 }
-export async function controllersIdle(stateRoot) {
+export async function controllersIdle(stateRoot,reconciled=new Set()) {
   for(const entry of await readdir(stateRoot,{withFileTypes:true})) {
+    if(entry.isSymbolicLink()) return false;
     if(!entry.isDirectory()) continue;
     if(!hex(entry.name)) return false; // Unknown owner directory needs inspection.
     const dir=join(stateRoot,entry.name);
     try {await lstat(join(dir,'lock'));return false;} catch(e) {if(e.code!=='ENOENT') throw e;}
+    if(reconciled.has(entry.name)) continue;
     for(const name of ['journal.json','launch.json']) {
       const journal=await optional(join(dir,name));
       if(journal && journal.done!==true) return false;
@@ -613,9 +720,9 @@ export async function withDeploymentLock(c,action) {
 
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
   try {
-    require(process.argv.length<=4 && (!process.argv[3] || process.argv[3]==='--preflight'),'Usage: node scripts/deploy.mjs /operator/request.json [--preflight]');
-    const path=resolve(process.argv[2]), result=await connected(await json(path),path,process.argv[3]==='--preflight');
-    console.log(JSON.stringify({id:result.id,prepared:result.prepared,phase:result.phase}));
+    require(process.argv.length<=4 && (!process.argv[3] || ['--preflight','--ownership-check'].includes(process.argv[3])),'Usage: node scripts/deploy.mjs /operator/request.json [--preflight|--ownership-check]');
+    const path=resolve(process.argv[2]), result=await connected(await json(path),path,process.argv[3]==='--ownership-check'?'ownership':process.argv[3]==='--preflight');
+    console.log(JSON.stringify(process.argv[3]==='--ownership-check'?result:{id:result.id,prepared:result.prepared,phase:result.phase}));
     if(result.phase && !['complete','rolled_back'].includes(result.phase)) process.exitCode=1;
   } catch(e) {console.error(reason(e));process.exitCode=1;}
 }
