@@ -480,3 +480,29 @@ globalThis.fetch=async()=>({ok:true,json:async()=>d.state});syncBuiltinESMExport
   await assert.rejects(stat(join(c.gateRoot,'active.json')),/ENOENT/);await assert.rejects(stat(join(c.stateRoot,'controller.lock')),/ENOENT/);
  } finally {await rm(x.root,{recursive:true,force:true});}
 });
+
+test('withdrawal at final forward boundary prevents replacement; after target verification it permits rollback but holds admission',async()=>{
+ for(const when of ['before-replace','after-verify']) {
+  const f=fixture();let revoked=false;
+  f.io.authorize=async()=>{if(revoked)throw new DeploymentError('Approval revoked');};
+  if(when==='before-replace')f.io.preReplace=async()=>{revoked=true;};
+  else {const verify=f.io.verify;f.io.verify=async(b,p)=>{await verify(b,p);if(b===f.c.target && p)revoked=true;};}
+  const j=await deploy(f.c,f.io);
+  assert.equal(f.paused,true);
+  if(when==='before-replace') {assert.equal(j.phase,'deferred');assert.ok(!f.calls.some(x=>x.startsWith('replace:')));}
+  else {assert.equal(j.phase,'blocked');assert.ok(j.events.some(x=>x.phase==='rollback_verified'));assert.ok(f.calls.includes('replace:'+f.c.previous.commit));assert.match(j.rollbackReason,/revoked/);}
+ }
+});
+
+for(const phase of ['backup_intent','resume_intent','rollback_resume_intent'])for(const withdrawal of ['revoked','expired']) test(`approval ${withdrawal} during durable ${phase} prevents next forward effect`,async()=>{
+ const f=fixture();let withdrawn=false;
+ const save=f.io.save;f.io.save=async j=>{await save(j);if(j.phase===phase)withdrawn=true;};
+ f.io.authorize=async()=>{if(withdrawn)throw new DeploymentError('Approval '+withdrawal);};
+ if(phase==='rollback_resume_intent') {const verify=f.io.verify;f.io.verify=async(b,p)=>{if(b===f.c.target)throw Error('candidate failure');return verify(b,p);};}
+ const j=await deploy(f.c,f.io);assert.notEqual(j.phase,'complete');assert.notEqual(j.phase,'rolled_back');assert.equal(f.paused,true);
+ assert.ok(!f.calls.includes('gate:false'));
+ if(phase==='backup_intent')assert.ok(!f.calls.includes('backup'));
+ else {assert.equal(j.phase,'blocked');assert.ok(f.calls.includes('replace:'+f.c.previous.commit));assert.ok(j.events.some(x=>x.phase==='rollback_verified'));}
+ const effects=f.calls.filter(x=>x.startsWith('replace:') || x==='gate:false' || x==='backup');
+ await assert.rejects(deploy(f.c,f.io),new RegExp(withdrawal));assert.deepEqual(f.calls.filter(x=>x.startsWith('replace:') || x==='gate:false' || x==='backup'),effects);
+});

@@ -21,12 +21,12 @@ export function finishConfig(c) {
   deploymentConfig({...c,...c.finish,ownershipVersion:1,current:c.finish.previous,previous:undefined,target:undefined,authority:{observe:true}},{ownership:true});
   return c;
 }
-async function privatePath(p,directory=false) {
+export async function privatePath(p,directory=false) {
   const s=await lstat(p);
   require((directory?s.isDirectory():s.isFile()) && !s.isSymbolicLink() && !(s.mode&0o022) && await realpath(p)===p && !p.startsWith('/data/workspaces/'),'Completion input must be canonical, private and outside candidate workspaces');
 }
 // Immutable generated artifacts can be re-read, never overwritten with a new contract.
-async function immutable(path,bytes) {
+export async function immutable(path,bytes) {
   let f;
   try {f=await open(path,'wx',0o600);}catch(e){if(e.code!=='EEXIST')throw e;await privatePath(path);require(same(await readFile(path),bytes),'Prepared completion artifact changed');return;}
   try {await f.writeFile(bytes);await f.sync();}finally{await f.close();}
@@ -71,30 +71,30 @@ export async function finish(c,io) {
     await save('deployment_result',{deploymentPhase:d.phase,target:d.target,previous:d.previous,verification:d.resumedVerification,deploymentReason:d.reason,rollbackVerification:d.rollbackVerification,rollbackReason:d.rollbackReason});
     require(d.phase==='complete','Target deployment failed or rolled back; manifest preserved');
     await io.authorize();
-    await save('retirement_pause_intent');await io.gate(true);
+    await save('retirement_pause_intent');await io.authorize();await io.gate(true);
     await io.drain();
     await io.verify(true,{status:'present',value:c.launch});
     await io.idle(c.launch);
     await io.authorize();
-    await save('retirement_intent');
+    await save('retirement_intent');await io.authorize();
     const archive=await io.retire(); // preserves/fsyncs exact bytes, then removes ONLY active.json
     await save('retired',{archive});
     await io.idle(null); // actual engine + mount + full owner observation after unlink
     await io.verify(true,{status:'absent'});
     await io.authorize();
-    await save('resume_intent');await io.gate(false);
+    await save('resume_intent');await io.authorize();await io.gate(false);
     const verification=await io.verify(false,{status:'absent'});
     await save('complete',{outcome:'complete',verification,next:'Normal completion verified; no successor dispatch'});
     await io.report(j);return j;
   } catch(e) {
     // Never delete on a deployment failure, retry effects, or auto-recover an uncertain resume.
-    if(['retirement_pause_intent','retirement_intent','retired','resume_intent'].includes(j.phase)) {await io.authorize();await io.gate(true);}
+    if(['retirement_pause_intent','retirement_intent','retired','resume_intent'].includes(j.phase)) await (io.fence || (()=>io.gate(true)))();
     if(j.phase!=='complete') await save('blocked',{outcome:j.deploymentPhase && j.deploymentPhase!=='complete'?'deployment_failed':'completion_blocked',reason:safeReason(e),next:'Inspect completion/deployment journal, actual engine and exact manifest; preserve originals; operator recovery required'});
     await io.report(j);throw e;
   }
 }
 // Display failure is isolated from completion authority and journal persistence.
-async function observeCompletion(c, record, publication) {
+export async function observeCompletion(c, record, publication) {
   try {
     const ledger=await json(join(c.ledgerRoot,keyFor(c)+'.json'));
     const phase=record.recheck?.status==='blocked'||['blocked','excluded'].includes(record.phase)
@@ -123,7 +123,7 @@ export function completionPorts(c,request,ports,{journalFile,authorize,report,pu
     authorize:auth,load:()=>optional(journalFile),save:async x=>{await atomic(journalFile,x);
       await observeCompletion(c,x,publication);
     },deploymentId,evidence:request.evidence,publication,
-    deploy:ports.execute,gate:ports.gate,idle,
+    deploy:ports.execute,gate:ports.gate,fence:()=>ports.gate(true),idle,
     drain:async()=>{const end=Date.now()+request.drainMs;while(true){await auth();const s=await ports.state();if(s.admission?.paused===true && s.admission.generation===deploymentId && runtimeOwnersIdle(s) && await ports.ownersIdle())return;require(Date.now()<end,'Retirement drain timeout; manifest preserved');await ports.sleep();}},
     verify:(paused,m)=>ports.verify(target,paused,m),
     retire:async()=>{

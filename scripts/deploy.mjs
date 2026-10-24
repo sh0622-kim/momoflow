@@ -76,7 +76,11 @@ export function activeContract(c,b,s,paused) {
     [1,2,3].includes(m.value.limit) && same(Object.keys(m.value).sort(),['base','id','issue','limit','repo','v']))),'Invalid launch manifest');
   require(same(l.manifest,m), 'Launch manifest/limit changed');
 }
-export async function deploymentEvidence(c, e, api, log) {
+export const ordinaryExclusion=/^(AGENTS\.md$|WORKFLOW\.md$|README\.md$|Dockerfile(?:\.|$)|compose(?:\.[^/]+)?\.ya?ml$|\.dockerignore$|\.env(?:\.|$)|docs\/(agent-policy|constitution|deployment|deployment-fixture|post-pr|github-flow|human-actions|records)\.md$|security\/|\.github\/|\.codex\/|\.agents\/|scripts\/|engine\/|patches\/)/;
+export function deploymentExclusions(files) {
+  return files.flatMap(x=>[x.filename,x.previous_filename].filter(p=>p && ordinaryExclusion.test(p)).map(path=>({path,reason:'engine/auth/host/check or policy boundary; ordinary deployment excluded'})));
+}
+export async function deploymentEvidence(c, e, api, log, {classifyExceptional}={}) {
   require(digest(e)===c.evidence.hash, 'Host evidence identity mismatch');
   const p=receipt({...c,launch:e.ledger?.launch},e.ledger);
   require(same(p,e.publication) && p.repo===c.repo && p.issue===c.issue && p.base===c.base && e.merge===c.target.commit, 'Publication/merge scope mismatch');
@@ -113,13 +117,14 @@ export async function deploymentEvidence(c, e, api, log) {
   const files=await list(api,`${root}/pulls/${p.pr}/files`);
   // Engine, auth, host execution and their verification/configuration remain exceptional.
   // Check both sides of renames; preserving runtime shape does not prove unchanged policy.
-  const policy=/^(AGENTS\.md$|WORKFLOW\.md$|README\.md$|Dockerfile(?:\.|$)|compose(?:\.[^/]+)?\.ya?ml$|\.dockerignore$|\.env(?:\.|$)|docs\/(agent-policy|constitution|deployment|deployment-fixture|post-pr|github-flow|human-actions|records)\.md$|security\/|\.github\/|\.codex\/|\.agents\/|scripts\/|engine\/|patches\/)/;
-  require(!files.some(x=>policy.test(x.filename) || (x.previous_filename && policy.test(x.previous_filename))),'Policy/check/permission/budget changes require separate exceptional deployment');
+  const exclusions=deploymentExclusions(files);
+  if(classifyExceptional) await classifyExceptional(files,exclusions);
+  else require(exclusions.length===0,'Policy/check/permission/budget changes require separate exceptional deployment');
   const [owner,name]=c.repo.split('/');
   const response=await api('POST','/graphql',{query:'query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved} pageInfo{hasNextPage}}}}}',variables:{owner,name,number:p.pr}});
   const threads=response.data?.repository?.pullRequest?.reviewThreads;
   require(!response.errors && threads && threads.pageInfo?.hasNextPage===false && threads.nodes.every(x=>x.isResolved===true),'Unresolved/incomplete review threads');
-  return {head:p.head,tree:p.tree,merge:c.target.commit,image:v.image,request:v.request};
+  return {head:p.head,tree:p.tree,merge:c.target.commit,image:v.image,request:v.request,exclusions};
 }
 
 // Real state machine, injected ports only for local contract tests. Production uses fixed ports below.
@@ -161,15 +166,15 @@ export async function deploy(c,io,{preflight=false,fixture=false}={}) {
       await io.sleep();
     }
     await record('drained',{drainedAdmission:(await io.state()).admission});
-    await record('backup_intent'); await io.backup();
+    await io.authorize();await record('backup_intent'); await io.authorize(); await io.backup();
     await record('preserved');
     await io.authorize(); await io.preReplace();
     require(drained(await io.state(),c.deploymentId) && await io.ownersIdle(),'Drain/owner state changed before replacement');
-    await record('replace_intent'); replacement=true; await io.replace(c.target);
+    await record('replace_intent');await io.authorize(); replacement=true; await io.replace(c.target);
     await record('verify_intent');
     await record('verified',{targetVerification:await io.verify(c.target,true)});
     await io.authorize();
-    await record('resume_intent'); resumeAttempted=true; await io.gate(false); const resumedVerification=await io.verify(c.target,false);
+    await record('resume_intent'); await io.authorize(); resumeAttempted=true; await io.gate(false); const resumedVerification=await io.verify(c.target,false);
     await record('complete',{resumedVerification,next:'Observe runtime; automatic promotion remains disabled'});
   } catch(e) {
     // Local messages contain no command output, environment, keys or API response bodies.
@@ -189,7 +194,7 @@ export async function deploy(c,io,{preflight=false,fixture=false}={}) {
         await record('rollback_verify_intent');
         await record('rollback_verified',{rollbackVerification:await io.verify(c.previous,true)});
         await io.authorize();
-        await record('rollback_resume_intent'); await io.gate(false); const resumedVerification=await io.verify(c.previous,false);
+        await record('rollback_resume_intent'); await io.authorize(); await io.gate(false); const resumedVerification=await io.verify(c.previous,false);
         await record('rolled_back',{resumedVerification,next:'Previous bundle verified; correct candidate before a new authorized deployment'});
       } catch(r) {
         await io.gate(true);
@@ -512,6 +517,13 @@ export async function connectedCompletion(c,requestFile,action) {
   require(!c.fixtureMode && !c.fixtureSource && !c.fixtureRepository,'Production completion requires GitHub evidence');
   return connect(c,requestFile,false,{completion:action});
 }
+// Only the installed exceptional module supplies these fixed ports. No JSON flag can
+// relax the ordinary gate, authorize itself or inject candidate commands.
+export async function connectedExceptionalCompletion(c,requestFile,action,{authorize,classifyExceptional}) {
+  require(!c.fixtureMode && !c.fixtureSource && !c.fixtureRepository,'Production exceptional completion requires GitHub evidence');
+  require(typeof authorize==='function' && typeof classifyExceptional==='function','Installed exceptional authorization required');
+  return connect(c,requestFile,false,{completion:action,exceptional:{authorize,classifyExceptional}});
+}
 // No fixture CLI flag or generic evidence callback. Isolation is mandatory here and
 // production authorization is never represented by local fixture provenance.
 export async function connectedFixture(c,requestFile,preflight=false,{isolatedStop=false}={}) {
@@ -521,10 +533,10 @@ export async function connectedFixture(c,requestFile,preflight=false,{isolatedSt
 // Real fixture HTTP on its isolated loopback; never substitute another container
 // or fall back to the host endpoint when the exact pinned runtime is unavailable.
 // Separate isolated-only completion harness. Never accepts GitHub deployment credentials/evidence.
-export async function connectedFixtureCompletion(c,requestFile,manifest,action) {
+export async function connectedFixtureCompletion(c,requestFile,manifest,action,{fixtureAuthorization,isolatedStop=false}={}) {
   require(c.fixtureSource && c.fixtureRepository && c.integration && c.repo==='smoke/fixture','Explicit isolated completion fixture required');
   require(manifest?.status==='present' && manifest.value?.v===1 && hex(manifest.value.id) && manifest.value.repo===c.repo && manifest.value.issue===c.issue && manifest.value.base===c.base && [1,2,3].includes(manifest.value.limit) && same(Object.keys(manifest.value).sort(),['base','id','issue','limit','repo','v']),'Exact isolated completion manifest required');
-  return connect(c,requestFile,false,{fixture:true,completion:action,completionManifest:manifest});
+  return connect(c,requestFile,false,{fixture:true,isolatedStop,completion:action,completionManifest:manifest,...(fixtureAuthorization?{exceptional:{authorize:fixtureAuthorization}}:{})});
 }
 export const fixtureHTTPProbe=`fetch('http://127.0.0.1:4000'+process.argv[1],{signal:AbortSignal.timeout(Number(process.argv[2]))}).then(async r=>{process.stdout.write(JSON.stringify({status:r.status,...(process.argv[1]==='/api/v1/state'?{state:await r.json()}: {})}));}).catch(()=>process.exit(1));`;
 export async function fixtureHTTP(c,b,x,docker,path,timeout=5000) {
@@ -589,7 +601,7 @@ export async function replaceConnectedBundle(c,b,{files,isolation,docker,contain
   }
 }
 
-async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false,completion=null,completionManifest=null}={}) {
+async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false,completion=null,completionManifest=null,exceptional=null}={}) {
   deploymentConfig(c,{fixture,ownership:preflight==='ownership'});
   await privateFile(requestFile);
   const requestBytes=await readFile(requestFile), api=github(c), expectedManifest=completionManifest || c.manifest;
@@ -627,6 +639,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
       await lstat('/.dockerenv');
       await verifyIndependentOperator(c,docker);
     } catch(e) {if(e.code!=='ENOENT') throw e;}
+    if(exceptional) await exceptional.authorize();
   };
   const files=b=>bundleFiles(c,b,docker,{fixture});
   const observed=async()=>Object.fromEntries(Object.entries(await containers()).map(([k,x])=>[k,{...runtimeIdentity(x,{fixture}),running:x.State.Running,health:x.State.Health?.Status}]));
@@ -672,7 +685,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     require(same(normalize(c.previous),normalize(c.target)) && same(c.previous.inspect['github-auth'],c.target.inspect['github-auth']),'Runtime permission/auth/config shape change requires separate operation');
     await privateFile(c.evidence.path);
     if(fixture) await fixtureEvidence(c,await json(c.evidence.path),docker);
-    else await deploymentEvidence(c,await json(c.evidence.path),api,h=>readFile(join(dirname(c.evidence.path),'logs',h)));
+    else await deploymentEvidence(c,await json(c.evidence.path),api,h=>readFile(join(dirname(c.evidence.path),'logs',h)),exceptional || {});
     await match(c.previous);
     if(fixture) await fixtureState();
     const s=await state();
