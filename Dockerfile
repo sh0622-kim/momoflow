@@ -23,6 +23,10 @@ RUN git -C /opt/symphony apply --check /opt/momoflow/role-flow.patch \
 COPY patches/admission.patch /opt/momoflow/admission.patch
 RUN git -C /opt/symphony apply --check /opt/momoflow/admission.patch \
     && git -C /opt/symphony apply /opt/momoflow/admission.patch
+COPY patches/work-status.patch /opt/momoflow/work-status.patch
+RUN git -C /opt/symphony apply --check /opt/momoflow/work-status.patch \
+    && git -C /opt/symphony apply /opt/momoflow/work-status.patch
+COPY engine/work_status.ex /opt/symphony/elixir/lib/symphony_elixir/work_status.ex
 COPY engine/admission.ex /opt/symphony/elixir/lib/symphony_elixir/admission.ex
 COPY engine/role_runner.ex /opt/symphony/elixir/lib/symphony_elixir/role_runner.ex
 ENV MIX_ENV=prod

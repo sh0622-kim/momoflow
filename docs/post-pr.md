@@ -768,3 +768,48 @@ node /operator/pinned/scripts/reconcile-external.mjs /operator/NEW-prepared-gh36
 나중에 engine/controller를 합법적으로 업그레이드해도 historical receipt reader는 옛 runtime을
 요구하지 않는다. 캡처한 bundle 바이트를 보존하여 옛 live Compose 경로의 이후 변경과 구분한다.
 원본 ledger/enrollment/launch와 host 부재, private source refs/archive는 계속 검증한다.
+
+## GH-38 후보: 대시보드의 읽기 전용 현재 작업
+
+후보 설치 전에는 운영 기능으로 표시하지 않는다. `engine/work_status.ex`와
+`patches/work-status.patch`는 기존 대시보드 및 `/api/v1/state`의 `work_status`에
+단계·다음 행동·주체·출처·마지막 관측 시각을 추가한다. 기존 지표와 실행 표는 유지한다.
+대시보드는 매 runtime tick마다 파일 관측을 갱신하므로 worker가 없어도 호스트 진행을
+읽는다. API의 `generated_at`은 조회 시각이고 상태의 `observed_at`은 원본 관측 시각이다.
+
+현재 작업은 기존 launch mount의 `active.json`과 정확히 같은 launch를 가진 ledger로
+한정한다. launch가 없으면 과거 ledger를 임의로 현재 작업으로 선택하지 않는다.
+대시보드 `?issue=38`처럼 명시적으로 선택하면 같은 저장소의 보존된 작업을
+`Selected issue (may be historical)`로 표시한다. 완료 후 manifest가 정리된 작업도 이
+경로로 확인한다. legacy launch 없는 실행의 상세 단계는 확인 불가로 남는다.
+
+호스트는 기존 `inboxRoot` 안의 `sha256(repo+":"+issue).status.json`에 v1 공개 요약을
+원자적으로 쓴다. 실행 envelope인 `.json`과 별도 파일이며 runner는 이를 실행 권한이나
+재개 명령으로 읽지 않는다. 추가 mount·권한·서비스·credential·timer는 없다.
+기존 reconcile의 검사 시작/검사·리뷰 대기/수정 인계/병합/차단과 completion의 저장
+관측점만 사용한다. display 기록 실패는 기존 실행 결과와 권한·ready 처리에 영향을 주지 않는다.
+설치되지 않은 기존 호스트는 파일을 만들지 않으며 UI는 확인 불가와 PR/workpad 확인을 안내한다.
+
+공개 필드는 `v, repo, issue, launch, generation, pr, head, phase, observed_at`뿐이다.
+오류 원문·원본 세션·private journal·호스트 경로를 전달하지 않는다. 호스트는 allowlist의
+phase만 쓰고 UI는 고정 문구와 검증한 GitHub scope로 링크를 만든다. regular 파일과 부모
+디렉터리를 검사하고 bounded read를 사용한다. ledger는 최대 2 MB, manifest와 summary는
+각 4 KB다. 크기 초과·파싱 실패·symlink·불명 scope는 확인 불가다.
+
+| 근거 | 표시 경계 |
+| --- | --- |
+| ledger mtime | 마지막 영속 상태 시각; heartbeat나 현재 세션 활동 시각이 아님. plan/build/review/publish 중 같은 issue URL/session의 기존 orchestrator running 항목과 최근 120초 내 활동이 일치하면 장기 역할을 표시하며, 활동 시각과 영속 시각을 따로 표시 |
+| host summary | launch·generation·PR/head 일치, released runner의 대기/terminal 단계에만 사용 |
+| 관측 시각 | 미래/누락/잘못된 값 또는 120초 초과는 확인 불가; UI 재조회로 갱신하지 않음. in_flight만으로 생존을 추정하지 않으며 세션 부재/불일치/활동 중단은 오래된 단계를 되살리지 않음 |
+| completion 사전 실패/제외 | 실제 finishConnected catch도 blocked 공개 관측을 기록. 완료 후 재검사 실패는 직전 complete를 blocked로 교체; 화면 쓰기 실패가 실행 gate에 영향을 주지 않음 |
+| 긴 validation/호스트 중단 | 30초 기존 polling 대비 120초 freshness가 지나면 진행 추정 대신 확인 불가; 오래된 성공을 현재 성공으로 유지하지 않음 |
+| runner done / PR 게시 / running=0 | 전체 완료나 배포 완료가 아님 |
+| host merged | 병합 확인; 배포 미확인 |
+| completion complete | 기존 deploy·retirement·live verification 후에만 완료 phase 기록; 선택한 작업의 시점 근거이며 영구 runtime 건강 보장이 아님 |
+
+검증은 기존 `scripts/test-role-flow.sh`에 candidate Presenter/LiveView 실제 렌더링과
+상태 회귀를 포함하고 `scripts/post-pr.test.mjs`에서 공개 요약·기록 실패 격리를 검사한다.
+fixture 외부 효과는 모의이며 실운영 자연 발생 대기/재개나 배포 관찰로 집계하지 않는다.
+이 변경은 engine/patch/scripts/Dockerfile을 포함하므로 일반 자동 배포 제외 대상이다.
+정확한 PR head의 별도 리뷰·고정 호스트 검증 후 운영자가 예외 설치/배포를 처리한다.
+현재 코딩 세션에서 자기 엔진을 교체하지 않는다.

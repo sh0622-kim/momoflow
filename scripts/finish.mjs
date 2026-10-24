@@ -1,3 +1,4 @@
+import { writeWorkStatus } from './work-status.mjs';
 // Operator-installed normal completion only. No candidate commands, crash replay or ledger writes.
 import { writeSync } from 'node:fs';
 import { readFile, readdir, lstat, realpath, open, rm } from 'node:fs/promises';
@@ -92,6 +93,15 @@ export async function finish(c,io) {
     await io.report(j);throw e;
   }
 }
+// Display failure is isolated from completion authority and journal persistence.
+async function observeCompletion(c, record, publication) {
+  try {
+    const ledger=await json(join(c.ledgerRoot,keyFor(c)+'.json'));
+    const phase=record.recheck?.status==='blocked'||['blocked','excluded'].includes(record.phase)
+      ?'blocked':record.phase==='complete'?'complete':'finishing';
+    await writeWorkStatus(c,ledger,phase,publication || record.publication || ledger.publication);
+  } catch {}
+}
 // Shared by the isolated harness; production still uses only the fixed GitHub connection.
 export function completionPorts(c,request,ports,{journalFile,authorize,report,publication}) {
   const dir=resolve(journalFile,'..'),target=request.target,previous=request.previous,deploymentId=request.deploymentId;
@@ -110,7 +120,9 @@ export function completionPorts(c,request,ports,{journalFile,authorize,report,pu
     require(same(s.momoflow_launch?.manifest,manifest?{status:'present',value:manifest}:{status:'absent'}),'Engine-visible manifest mismatch');
   };
   return {
-    authorize:auth,load:()=>optional(journalFile),save:x=>atomic(journalFile,x),deploymentId,evidence:request.evidence,publication,
+    authorize:auth,load:()=>optional(journalFile),save:async x=>{await atomic(journalFile,x);
+      await observeCompletion(c,x,publication);
+    },deploymentId,evidence:request.evidence,publication,
     deploy:ports.execute,gate:ports.gate,idle,
     drain:async()=>{const end=Date.now()+request.drainMs;while(true){await auth();const s=await ports.state();if(s.admission?.paused===true && s.admission.generation===deploymentId && runtimeOwnersIdle(s) && await ports.ownersIdle())return;require(Date.now()<end,'Retirement drain timeout; manifest preserved');await ports.sleep();}},
     verify:(paused,m)=>ports.verify(target,paused,m),
@@ -207,10 +219,12 @@ export async function finishConnected(c) {
       require(!old || old.request===digest(c.configContents),'Completion configuration changed');
       if(old?.phase==='complete') {
         const blocked={...old,recheck:{status:'blocked',reason:safeReason(e),at:new Date().toISOString(),next:'Inspect original launch/host/ledger evidence and current runtime; completed effects are never replayed'}};
-        await atomic(journalFile,blocked);await workpad(c,blocked);
+        await atomic(journalFile,blocked);await observeCompletion(c,blocked);await workpad(c,blocked);
       } else if(!old) {
         const blocked={...prepared,request:digest(c.configContents),phase:e instanceof DeploymentError && e.message.includes('separate exceptional deployment')?'excluded':'blocked',outcome:'excluded_or_invalid',reason:safeReason(e),next:'Inspect prepared host evidence and operator authority; no deployment or manifest replay'};
-        await atomic(journalFile,blocked);await workpad(c,blocked);
+        await atomic(journalFile,blocked);await observeCompletion(c,blocked);await workpad(c,blocked);
+      } else {
+        await observeCompletion(c,{...old,phase:'blocked'});
       }
     });
     throw e;
