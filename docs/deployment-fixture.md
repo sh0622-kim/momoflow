@@ -277,3 +277,60 @@ readiness/sandbox·정상2/복구1·활성 작업 보호·운영 불변·allowli
 새로운 유료 모델 실행이나 외부 자원은 만들지 않았다. #18 구현 PR의 별도 리뷰/검사와
 #16의 실험 완료는 구분한다. #16은 실제 정상2·복구1과 나머지 조건을 확인하기 전 닫지 않으며,
 기존 2/3 및 terminal 기록은 보존하고 재실행 라벨이나 예산 초기화를 하지 않는다.
+
+## GH-30 후보: 마무리 CLI의 격리 실행
+
+외부 운영자가 리뷰한 exact PR head를 clean controller checkout에 고정하고, 위 전용
+installer로 **새 격리 project**를 설치한다. 기존 실운영/과거 실험 request를 재사용해
+자격을 꾸미지 않는다. installer가 만든 첫 A→B request와 별도 아래 plan을 사용한다.
+기존 provenance/고정 WORKFLOW/내부 network/빈 Codex 및 ledger/운영과 다른 mount·volume·port
+검사를 유지한다. 설치 직후 gate가 paused여도 실제 idle이어야 한다.
+
+plan은 operator 전용 canonical 파일이며 다음 값으로 작성한다. `request`는 installer의 첫
+요청 파일, launch의 repo=`smoke/fixture`, issue/base는 그 요청과 같고 limit은 1/2/3 중 하나다.
+launch id는 설치한 controller의 `digest({deploymentId:request.deploymentId,kind:"isolated-completion-v1"})`
+값이다. 일반 launch/runner ledger나 GitHub merge receipt를 만들지 않는 **합성 단일 scope**다.
+
+```json
+{
+  "kind": "isolated-completion-v1",
+  "request": "/operator/fresh-test/request-one.json",
+  "authority": {"finish": true, "retire": true},
+  "launch": {"v": 1, "id": "<위 digest>", "repo": "smoke/fixture", "issue": "18", "base": "main", "limit": 3}
+}
+```
+
+```sh
+node /operator/momoflow/scripts/finish-isolated.mjs /operator/fresh-test/finish-plan.json
+node /operator/momoflow/scripts/finish-isolated.mjs /operator/fresh-test/finish-plan.json
+```
+
+전용 CLI는 독립 operator identity와 격리를 먼저 검사하고, 빈 launch root에 이 scope만
+exclusive 설치한다. 실제 engine의 present 응답을 기다린 후 기존 fixture deploy의 실제
+Docker A→B·backup·운영 확인과 공통 finish 모듈의 pause/drain·원본 보존·exact 퇴역·live absent·
+재개 확인을 같은 deployment/controller lock 아래 수행한다. 일반 fixture CLI는 계속 absent
+manifest만 허용한다. 전용 completion entry만 이 합성 manifest를 허용하며 Codex/역할/다른
+launch 파일은 계속 비어 있어야 한다. 두 번째 호출은 검증만 하고 배포/삭제/gate 효과를 반복하지 않는다.
+
+`stateRoot/sha256("smoke/fixture:ISSUE")/isolated-completion.json`,
+`isolated-completion-result.json`, 원본 `completed-manifest-ID.json`, 기존 배포 journal/backup을
+PR에 연결한다. 출력의 previous/target/image, archive 원본 hash, actual engine absent와 admission,
+운영 project 불변 및 중복 호출 전후 container ID·gate 파일 hash를 기록한다. 이 경로에는
+GitHub head/merge/review/auth와 모델 호출이 없으며 결과도 `not-exercised`로 표시한다.
+일반 GitHub 배포 자격이나 실제 정상 launch→GitHub merge 실증으로 승격하지 않는다.
+
+코딩 workspace에서 이 명령이나 Docker 교체를 실행하지 않는다. 이번 build의 로컬 subprocess
+회귀는 외부 효과를 모의했으며 위 실 Docker 실행은 외부 운영자 검증 항목이다. 중간 실패는
+manifest/journal/격리 자원을 보존하고 재실행하지 않는다. GH-30의 정책·host controller 설치는
+이 실험과 별도 예외 작업이며 자기 승인하지 않는다.
+
+
+GH-30의 독립 helper 설치 회귀는 실제 `finishConnected` subprocess와
+`deploy.mjs --ownership-check` subprocess에서 config/module/파일 경로를 실행한다.
+canonical 키 경로 없이 고정 host proof를 사용하는 성공, proof/sourceRequest 변조,
+auth restart/runtime/mount drift, 다른 bind 대응 실패, 다른 helper와 network 공유,
+helper의 secret parent 노출 거부를 확인한다. 로컬 회귀의 Docker/HTTP 및 kernel 좌표는
+명시적 모의 자료다. 이것을 live host proof나 일반 GitHub 배포 자격으로 사용하지 않는다.
+외부 운영자는 새 exact PR head의 독립 bridge helper에서 키/secret parent mount 없이
+full `--ownership-check`를 실행하고, 이 문서의 격리 finish lifecycle과 함께 PR에 기록한다.
+고정 host proof 생성/설정 계약은 [배포 문서](deployment.md#gh-30-후보-최초-launch에-묶는-정상-마무리)를 따른다.

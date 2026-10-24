@@ -2,6 +2,7 @@
 import { readFile, realpath, stat, lstat } from 'node:fs/promises';
 import { resolve, dirname, join, basename } from 'node:path';
 import { isDeepStrictEqual as same } from 'node:util';
+import { createHash } from 'node:crypto';
 const need=(v,m)=>{if(!v) throw Object.assign(Error(m),{safeReason:m});};
 const within=(p,root)=>p===root || p.startsWith(root==='/'?'/':root+'/');
 const unescape=s=>s.replace(/\\(040|011|012|134)/g,(_,n)=>String.fromCharCode(parseInt(n,8)));
@@ -108,6 +109,10 @@ export async function verifiedMountSources(live,expected,docker,options) {
   if(m.Type!=='bind') return m;
   const e=expected.mounts.filter(e=>e.type==='bind' && e.destination===m.Destination && e.rw===m.RW);
   need(e.length===1,'Fixture bind destination/type/authority mismatch');
+  if(options?.authKeyIdentityHash && m.Destination==='/run/secrets/github-app.pem') {
+   need(m.RW===false && createHash('sha256').update(JSON.stringify(context.mounted.get(m))).digest('hex')===options.authKeyIdentityHash,'Bound auth key live identity changed');
+   return {...m,Source:e[0].source};
+  }
   const host=await context.host(e[0].source),actual=context.mounted.get(m);
   need(actual && host.inode && host.device===actual.device && host.path===actual.path && host.inode===actual.inode,'Fixture bind host/live correspondence mismatch');
   return {...m,Source:e[0].source};

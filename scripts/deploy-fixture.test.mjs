@@ -1,3 +1,4 @@
+import { hostname } from 'node:os';
 // Real local Git/filesystem; Docker/image records are simulated. No auth/model calls.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -628,4 +629,55 @@ namespaceTest('ordinary engine and auth match opaque Desktop sources only throug
   const changed=structuredClone(all);changed['github-auth'].Config.User='changed';let calls=0;
   await assert.rejects(matchDeploymentBundle({},b,{...ports,containers:async()=>++calls===1?all:changed}),/changed/);
  } finally {await rm(x.root,{recursive:true,force:true});}
+});
+
+// Real files and module paths, simulated Docker/kernel mount coordinates.
+// The host key path is deliberately absent in the helper namespace.
+import { ownershipServiceEvidence, boundAuthKeyProof } from './deploy.mjs';
+import { atomic } from './post-pr.mjs';
+namespaceTest('bound host auth proof permits only the unchanged private-key bind; all other correspondence stays live',async()=>{
+ const x=await namespaceFixture(),oldHostname=process.env.HOSTNAME;process.env.HOSTNAME=hostname();
+ try {
+  const all={symphony:x.production[0],'github-auth':x.production[1]};
+  for(const [service,a] of Object.entries(all)) {
+   a.Image='sha256:'+hash(service==='symphony'?1:2);a.State={Running:true,Health:{Status:'healthy'}};
+   a.Config={Labels:{'com.docker.compose.service':service},Env:[],User:'momo',Entrypoint:null,Cmd:[]};
+   a.HostConfig={NetworkMode:'prod_default',SecurityOpt:['no-new-privileges:true'],Privileged:false,CapAdd:null,CapDrop:[],ReadonlyRootfs:false};
+  }
+  const auth=all['github-auth'],p=x.probes.get(auth.Id),dest='/run/secrets/github-app.pem';
+  auth.Mounts[0].Destination=dest;p.points[0].path=dest;p.mountinfo=p.mountinfo.replaceAll('/mounted-0',dest);
+  const self=await x.make('helper',[x.root+'/test']);Object.assign(self,{State:{Running:true},Config:{Hostname:process.env.HOSTNAME},HostConfig:{NetworkMode:'operator_bridge'}});
+  const docker=async a=>a[0]==='inspect'&&!a.includes('--format')?JSON.stringify([a[1]===hostname()?self:x.records.get(a[1])]):x.docker(a);
+  const b={commit:sha(1),image:all.symphony.Image,authImage:auth.Image,runnerSource:hash(3),composeFile:x.root+'/compose.json',composeHash:hash(4),files:{[x.root+'/compose.json']:hash(4)},inspect:{}};
+  for(const [service,a] of Object.entries(all)) {
+   b.inspect[service]=JSON.parse(JSON.stringify(runtimeIdentity(a)));b.inspect[service].mounts[0].source=x.root+(service==='symphony'?'/prod':'/unmounted-secret/key.pem');
+  }
+  // Prove ordinary full correspondence before creating the host observation.
+  const originalKey=b.inspect['github-auth'].mounts[0].source;
+  b.inspect['github-auth'].mounts[0].source=x.root+'/key';await matchDeploymentBundle({},b,{containers:async()=>all,docker});
+  b.inspect['github-auth'].mounts[0].source=originalKey;
+  const c={repo:'fixture/repo',issue:'30',base:'main',hold:false,project:'prod',dataVolume:'live-data',controllerVersion:sha(3),engineURL:'http://host.docker.internal:4000',verifyMs:1000,operatorContainer:'helper'};
+  for(const k of ['stateRoot','inboxRoot','launchRoot','gateRoot','trustedRoot','ledgerRoot','tokenFile'])c[k]=x.root+'/'+k;
+  const source={...c,ownershipVersion:1,authority:{observe:true},current:b};delete source.operatorContainer;
+  const request={path:x.root+'/source.json'};await atomic(request.path,source);request.hash=digest(await readFile(request.path));
+  const proof={kind:'deployment-ownership-v1',effects:'none',repo:c.repo,base:c.base,project:c.project,dataVolume:c.dataVolume,controllerVersion:c.controllerVersion,engineImage:b.image,sourceRequest:request,serviceEvidence:await ownershipServiceEvidence(all,docker)};
+  const binding={path:x.root+'/proof.json',sourceRequest:request};await atomic(binding.path,proof);binding.hash=digest(await readFile(binding.path));c.authBindProof=binding;
+  const ports={containers:async()=>all,docker};
+  assert.equal((await matchDeploymentBundle(c,b,ports))['github-auth'].Id,auth.Id);
+  await assert.rejects(matchDeploymentBundle({...c,authBindProof:undefined},b,ports),/correspondence|canonical|backing/);
+  for(const change of [v=>v.hash=hash(0),v=>v.sourceRequest.hash=hash(0)]) {const saved=structuredClone(binding);change(binding);await assert.rejects(matchDeploymentBundle(c,b,ports),/bytes changed/);Object.assign(binding,saved);}
+  const saved=structuredClone(auth),savedProbe=structuredClone(p);
+  for(const mutate of [()=>auth.Id='restarted-auth',()=>auth.Image='sha256:'+hash(8),()=>auth.Config.User='root',()=>auth.Mounts[0].RW=true,()=>p.points[0].ino='987654321',()=>p.boot='00000000-0000-0000-0000-000000000000']) {
+   mutate();await assert.rejects(matchDeploymentBundle(c,b,ports));Object.assign(auth,structuredClone(saved));Object.assign(p,structuredClone(savedProbe));
+  }
+  const engineProbe=x.probes.get(all.symphony.Id),ino=engineProbe.points[0].ino;engineProbe.points[0].ino='999999999';
+  await assert.rejects(matchDeploymentBundle(c,b,ports),/correspondence/);engineProbe.points[0].ino=ino;
+  for(const mode of ['host','container:engine','none']) {self.HostConfig.NetworkMode=mode;await assert.rejects(matchDeploymentBundle(c,b,ports),/independent/);}self.HostConfig.NetworkMode='operator_bridge';
+  self.Config.Hostname='other';await assert.rejects(matchDeploymentBundle(c,b,ports),/independent/);self.Config.Hostname=process.env.HOSTNAME;
+  const parent=await x.make('key-parent',[x.root]);self.Mounts=parent.Mounts;x.probes.set(self.Id,x.probes.get(parent.Id));
+  await assert.rejects(matchDeploymentBundle(c,b,ports),/secret parent/);
+  const chained={...source,authBindProof:binding};await atomic(request.path,chained);binding.sourceRequest.hash=digest(await readFile(request.path));
+  await assert.rejects(boundAuthKeyProof(c,b,all,docker),/no chained/);
+  assert.ok(x.calls.every(a=>['exec','inspect'].includes(a[0])));
+ } finally {if(oldHostname===undefined)delete process.env.HOSTNAME;else process.env.HOSTNAME=oldHostname;await rm(x.root,{recursive:true,force:true});}
 });

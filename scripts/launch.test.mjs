@@ -184,3 +184,10 @@ test('fresh check detects engine manifest drift immediately before ready',async(
   assert.equal(f.calls.filter(x=>x.m==='POST'&&x.b?.labels?.includes('momoflow:ready')).length,0);
   assert.equal(f.reconciles,0);
 });
+test('opt-in finish records code completion without closing the issue at host merge',async()=>{
+ const f=fixture();f.c.finish={operatorOwned:true};
+ await reconcile(f.c,f.io);
+ assert.equal(f.journal.done,true);assert.equal(f.journal.mergeAttempt.state,'confirmed');
+ assert.ok(!f.calls.some(x=>x.method==='PATCH'&&x.path.endsWith('/issues/1')&&x.body.state==='closed'));
+ assert.match(f.pad.body,/운영 마무리 대기/);
+});

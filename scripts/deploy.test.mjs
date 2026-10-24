@@ -1,3 +1,4 @@
+import { hostname } from 'node:os';
 // Local contracts: fake external effects, real deployment state machine. No Docker/auth/model calls.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -88,6 +89,14 @@ for(const [name,change] of [
  ['merge tree',({f,e})=>{f.responses.set(`GET /repos/fixture/repo/git/commits/${e.merge}`,{tree:{sha:sha(1)},parents:[{sha:f.p.base_head},{sha:f.p.head}]});}]
 ]) test(`deployment rejects ${name} mismatch without any remote mutation`,async()=>{
  const x=evidenceFixture();change(x);x.c.evidence.hash=digest(x.e);await assert.rejects(deploymentEvidence(x.c,x.e,x.f.io.api,async()=>Buffer.from('log')));assert.ok(x.f.calls.every(x=>x.method==='GET'));
+});
+for(const filename of ['scripts/finish.mjs','scripts/finish-isolated.mjs','scripts/deploy.mjs','engine/admission.ex','patches/admission.patch','patches/github-token-file.patch','Dockerfile','Dockerfile.auth','compose.github-app.yaml','scripts/git-askpass.sh','scripts/reconcile-external.mjs','scripts/github-app-auth.mjs','scripts/start-local.sh','scripts/smoke.sh']) test(`engine/auth/host/check control remains excluded from ordinary deployment: ${filename}`,async()=>{
+ const {f,c,e}=evidenceFixture();
+ f.responses.set('GET /repos/fixture/repo/pulls/2/files?per_page=100',[{filename}]);
+ await assert.rejects(deploymentEvidence(c,e,f.io.api,async()=>Buffer.from('log')),/separate exceptional deployment/);
+ assert.ok(f.calls.every(x=>x.method==='GET'));
+ f.responses.set('GET /repos/fixture/repo/pulls/2/files?per_page=100',[{filename:'app.js',previous_filename:filename}]);
+ await assert.rejects(deploymentEvidence(c,e,f.io.api,async()=>Buffer.from('log')),/separate exceptional deployment/);
 });
 test('deployment rejects corrupt host logs',async()=>{
  const {f,c,e}=evidenceFixture();await assert.rejects(deploymentEvidence(c,e,f.io.api,async()=>Buffer.from('changed')),/log corrupt/);
@@ -380,5 +389,94 @@ test('ordinary image missing Entrypoint matches Docker null without accepting ar
   x.b.inspect.symphony.entrypoint=[];await assert.rejects(bundleFiles(x.c,x.b,x.docker),/runtime contract/);
   x.doc.services.symphony.entrypoint=[];await x.persist();await bundleFiles(x.c,x.b,x.docker);
   x.b.inspect.symphony.entrypoint=['unexpected'];await assert.rejects(bundleFiles(x.c,x.b,x.docker),/runtime contract/);
+ } finally {await rm(x.root,{recursive:true,force:true});}
+});
+
+// Real executable CLI/module/config paths and files; Docker, HTTP and kernel
+// coordinates are simulated. This is not live host ownership or deployment proof.
+test('actual ownership CLI accepts bound unchanged auth without host key and rejects drift before effects',async t=>{
+ const x=await composeFixture();try {
+  const {command}=await import('./post-pr-docker.mjs'),{readFile,stat}=await import('node:fs/promises'),{fileURLToPath}=await import('node:url');
+  const {c,b}=x;c.verifyMs=30000;c.gateRoot=join(x.root,'gate');c.launchRoot=join(x.root,'launch');c.operatorContainer='operator-helper';
+  for(const k of ['stateRoot','inboxRoot','ledgerRoot','tokenFile'])c[k]=join(x.root,k);
+  c.trustedRoot=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
+  for(const k of ['stateRoot','inboxRoot','ledgerRoot','gateRoot','launchRoot'])await mkdir(c[k]);
+  await writeFile(c.tokenFile,'{}',{mode:0o600});
+  const keyPath=join(x.root,'no-secret-mount','key.pem'),all={},probes={},services=[];
+  const boot=(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim(),st=await stat(x.root,{bigint:true}),n=st.dev;
+  const device=`${((n>>8n)&0xfffn)|((n>>32n)&0xfffff000n)}:${(n&0xffn)|((n>>12n)&0xffffff00n)}`;
+  for(const [index,service] of ['symphony','github-auth'].entries()) {
+   const e=b.inspect[service],doc=x.doc.services[service];
+   for(const m of e.mounts.filter(m=>m.type==='bind')) {
+    if(m.destination==='/run/secrets/github-app.pem')m.source=keyPath;
+    else if(m.destination==='/run/momoflow-admission')m.source=c.gateRoot;
+    else if(m.destination==='/run/momoflow-launch')m.source=c.launchRoot;
+    else if(m.destination==='/run/momoflow-resume'){m.source=join(x.root,'resume');await mkdir(m.source);}
+    const v=doc.volumes.find(v=>v.target===m.destination);v.source=m.source;
+   }
+   const env=Object.entries(doc.environment).map(([k,v])=>k+'='+v);
+   const a={Id:h(index+1),Image:e.image,State:{Running:true,Health:{Status:'healthy'}},Config:{...x.images[e.image].Config,Env:['BASE=1',...env],Labels:{'com.docker.compose.project':c.project,'com.docker.compose.service':service}},HostConfig:{Privileged:e.privileged,CapAdd:e.capAdd,CapDrop:e.capDrop,SecurityOpt:e.securityOpt,NetworkMode:e.networkMode,ReadonlyRootfs:e.readonly,PortBindings:e.ports},Mounts:e.mounts.map(m=>({Type:m.type,Name:m.type==='volume'?m.source:undefined,Source:m.type==='bind'?'/opaque/'+service+m.destination:'/daemon/'+m.source,Destination:m.destination,RW:m.rw}))};
+   all[service]=a;const points=[],rows=[],mountHashes=[];
+   for(const [i,m] of a.Mounts.entries()) {
+    const expected=e.mounts[i];let identity;
+    if(expected.source===keyPath)identity={device,path:'/host-secret/github-app.pem',inode:'987654321'};
+    else if(m.Type==='bind'){const st=await stat(expected.source,{bigint:true});identity={device,path:expected.source,inode:String(st.ino)};}
+    else identity={device,path:'/volumes/'+m.Name,inode:m.Name===c.dataVolume?'23456789':'34567890'};
+    points.push({path:m.Destination,dev:String(st.dev),ino:identity.inode});rows.push(`${i+1} 0 ${device} ${identity.path} ${m.Destination} rw - ext4 /dev/simulated rw`);
+    mountHashes.push({type:m.Type,destination:m.Destination,rw:m.RW,identityHash:digest(identity)});
+   }
+   probes[a.Id]={boot,mountinfo:rows.join('\n'),points};const r=runtimeIdentity(a);
+   services.push({service,id:a.Id,image:a.Image,runtimeHash:digest({...r,mounts:r.mounts.map(m=>m.type==='bind'?{...m,source:null}:m)}),mountHashes:mountHashes.sort((a,b)=>a.destination.localeCompare(b.destination))});
+  }
+  await x.persist();
+  const current={...c,ownershipVersion:1,authority:{observe:true},current:b};delete current.previous;delete current.target;delete current.deploymentId;delete current.evidence;
+  const requestRef={path:join(x.root,'host-request.json')};await writeFile(requestRef.path,JSON.stringify(current),{mode:0o600});requestRef.hash=digest(await readFile(requestRef.path));
+  const proof={kind:'deployment-ownership-v1',effects:'none',repo:c.repo,base:c.base,project:c.project,dataVolume:c.dataVolume,controllerVersion:c.controllerVersion,engineImage:b.image,sourceRequest:requestRef,serviceEvidence:{kernel:boot,services:services.sort((a,b)=>a.service.localeCompare(b.service))}};
+  const binding={path:join(x.root,'host-proof.json'),sourceRequest:requestRef};await writeFile(binding.path,JSON.stringify(proof),{mode:0o600});binding.hash=digest(await readFile(binding.path));
+  current.authBindProof=binding;const configFile=join(x.root,'ownership.json');await writeFile(configFile,JSON.stringify(current),{mode:0o600});
+  const self={Id:h(5),Config:{Hostname:hostname()},State:{Running:true},HostConfig:{NetworkMode:'operator_bridge'},Mounts:[]};probes[self.Id]={boot,mountinfo:`1 0 ${device} / / rw - ext4 /dev/simulated rw`,points:[]};
+  const state={running:[],retrying:[],admission:{contract:1,configured:true,paused:false,generation:h(4),running:[],retrying:[],claimed:[],blocked:[],pending_dispatch:false},momoflow_launch:{contract:1,source:b.runnerSource,repo:c.repo,concurrency:1,role_flow:true,launch_read_only:true,inbox_read_only:true,launch_root:'/run/momoflow-launch',inbox_root:'/run/momoflow-resume',manifest:{status:'absent'}}};
+  const data={all,probes,images:x.images,doc:x.doc,self,state,version:c.controllerVersion,mountinfo:`1 0 ${device} / / rw - ext4 /dev/simulated rw\n`},dataFile=join(x.root,'cli-data.json'),trace=join(x.root,'trace.jsonl'),preload=join(x.root,'preload.mjs');
+  await writeFile(dataFile,JSON.stringify(data));
+  await writeFile(preload,`import fs from 'node:fs/promises';import syncfs from 'node:fs';import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';
+const d=JSON.parse(await fs.readFile(${JSON.stringify(dataFile)},'utf8')),read=fs.readFile,spawn=cp.spawn;
+process.env.HOSTNAME=${JSON.stringify(hostname())};fs.readFile=async(p,...a)=>p==='/proc/self/mountinfo'?d.mountinfo:read(p,...a);
+console.log=(...a)=>syncfs.writeSync(1,a.join(' ')+'\\n');console.error=(...a)=>syncfs.writeSync(2,a.join(' ')+'\\n');
+cp.spawn=(file,args,options)=>{syncfs.appendFileSync(${JSON.stringify(trace)},JSON.stringify({file,args})+'\\n');let value;
+try {if(file==='git')value=args.includes('status')?'':d.version;
+else if(file==='docker') {
+ if(args[0]==='ps')value=Object.values(d.all).map(x=>JSON.stringify({ID:x.Id})).join('\\n');
+ else if(args[0]==='inspect'){const x=[...Object.values(d.all),d.self].find(x=>x.Id===args.at(-1)) || (['operator-helper',process.env.HOSTNAME].includes(args.at(-1))?d.self:d.images[args.at(-1)]);if(!x)throw Error('unknown inspect');value=JSON.stringify(args.includes('--format')?x.Mounts:[x]);}
+ else if(args[0]==='compose' && args.includes('config'))value=JSON.stringify(d.doc);
+ else if(args[0]==='exec')value=JSON.stringify(args[4].includes('const paths=JSON.parse')?d.probes[args[1]]:{rows:[],manifest:null});
+ else throw Error('unexpected Docker effect');
+} else throw Error('unexpected command');return spawn(process.execPath,['-e','require("fs").writeSync(1,'+JSON.stringify(value)+')'],options);
+} catch(e){return spawn(process.execPath,['-e','require("fs").writeSync(2,'+JSON.stringify(e.message)+');process.exit(1)'],options);}};
+globalThis.fetch=async()=>({ok:true,json:async()=>d.state});syncBuiltinESMExports();`);
+  const run=()=>command(process.execPath,['--import',preload,join(c.trustedRoot,'scripts/deploy.mjs'),configFile,'--ownership-check'],{timeout:30000});
+  const ok=await run();assert.equal(ok.exit,0,ok.output.toString());const result=JSON.parse(ok.output);assert.equal(result.effects,'none');assert.equal(result.ownersIdle,true);assert.equal(result.engine,all.symphony.Id);
+  await assert.rejects(stat(keyPath),/ENOENT/);
+  for(const [name,path,ino,rejected] of [
+   ['filesystem root','/','12345678',true],
+   ['secret parent','/host-secret','12345678',true],
+   ['sibling prefix','/host-secret-archive','12345678',false],
+   ['same key','/host-secret/github-app.pem','987654321',true],
+   ['inode alias','/unrelated-key-alias','987654321',true]
+  ]) await t.test(`helper mount ${name}`,async()=>{
+   const mounted=structuredClone(data),destination='/operator/exposed';
+   mounted.self.Mounts=[{Type:'bind',Source:'/opaque/helper',Destination:destination,RW:false}];
+   mounted.probes[self.Id]={boot,mountinfo:`1 0 ${device} ${path} ${destination} rw - ext4 /dev/simulated rw`,points:[{path:destination,dev:String(st.dev),ino}]};
+   await writeFile(dataFile,JSON.stringify(mounted));const r=await run();
+   assert.equal(r.exit,rejected?1:0,r.output.toString());
+   if(rejected)assert.match(r.output.toString(),/Operator must not mount auth key or secret parent/);
+   else {const result=JSON.parse(r.output);assert.equal(result.effects,'none');assert.equal(result.ownersIdle,true);}
+  });
+  for(const change of [d=>d.all['github-auth'].Id=h(9),d=>d.self.HostConfig.NetworkMode='container:engine',d=>d.probes[h(2)].points.at(-1).ino='999999999']) {
+   const bad=structuredClone(data);change(bad);await writeFile(dataFile,JSON.stringify(bad));const r=await run();assert.equal(r.exit,1,r.output.toString());
+  }
+  await writeFile(dataFile,JSON.stringify(data));await writeFile(binding.path,'{}');const corrupt=await run();assert.equal(corrupt.exit,1);assert.match(corrupt.output.toString(),/bytes changed/);
+  const calls=(await readFile(trace,'utf8')).trim().split('\n').map(JSON.parse);assert.ok(calls.some(x=>x.args[0]==='exec'));
+  assert.ok(calls.every(x=>x.file==='git'||['ps','inspect','exec','compose'].includes(x.args[0])));assert.ok(calls.filter(x=>x.args[0]==='compose').every(x=>x.args.includes('config')));
+  await assert.rejects(stat(join(c.gateRoot,'active.json')),/ENOENT/);await assert.rejects(stat(join(c.stateRoot,'controller.lock')),/ENOENT/);
  } finally {await rm(x.root,{recursive:true,force:true});}
 });
