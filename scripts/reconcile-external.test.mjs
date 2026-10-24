@@ -414,3 +414,75 @@ for(const [name,change] of [
 ])test('corrective completion rejects '+name+' before effects',async()=>{
  const f=await correctiveControllerSetup();try{await change(f);const before=await snapshot(f.root);await assert.rejects(f.run());assert.deepEqual(await snapshot(f.root),before);}finally{await f.clean();}
 });
+
+// Exercise the executable module, production ports and dynamic deploy import in a
+// fresh Node process. External commands/fetch/kernel mount table are simulated;
+// config, original evidence, permissions and source imports are real. No Docker.
+test('real CLI module lifecycle completes ownership dependency and read-only check',async()=>{
+ const f=await controllerSetup();try {
+  const {stat}=await import('node:fs/promises'),{fileURLToPath}=await import('node:url');
+  const {runtimeIdentity}=await import('./deploy.mjs'),{command}=await import('./post-pr-docker.mjs');
+  const c=f.c;c.trustedRoot=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');c.verifyMs=1000;
+  c.runnerSource=digest(await readFile(join(c.trustedRoot,'engine/role_runner.ex')));
+  await writeFile(c.tokenFile,JSON.stringify({token:'simulated-test-token',expires_at:new Date(Date.now()+3600000).toISOString()}),{mode:0o600});
+  const data=join(f.root,'data'),auth=join(f.root,'auth');await mkdir(data);await mkdir(auth);
+  const bind={Type:'bind',Source:c.launchRoot,Destination:'/run/momoflow-launch',RW:false};
+  const engine={Id:c.engineContainer,Image:c.engineImage,State:{Running:true,Health:{Status:'healthy'}},Config:{Labels:{'com.docker.compose.project':c.productionProject,'com.docker.compose.service':'symphony'}},HostConfig:{},Mounts:[{Type:'volume',Name:c.dataVolume,Source:'/daemon/data',Destination:'/data',RW:true},bind]};
+  const authContainer={Id:hex(9),Image:'sha256:'+hex(9),State:{Running:true,Health:{Status:'healthy'}},Config:{Labels:{'com.docker.compose.project':c.productionProject,'com.docker.compose.service':'github-auth'}},HostConfig:{},Mounts:[{Type:'volume',Name:'live-auth',Source:'/daemon/auth',Destination:'/run/momoflow-auth',RW:false}]};
+  const all={symphony:engine,'github-auth':authContainer},boot=(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim(),s=await stat(f.root,{bigint:true}),n=s.dev;
+  const device=`${((n>>8n)&0xfffn)|((n>>32n)&0xfffff000n)}:${(n&0xffn)|((n>>12n)&0xffffff00n)}`;
+  const probes={},services=[];
+  for(const [service,x] of Object.entries(all).sort(([a],[b])=>a.localeCompare(b))) {
+   const points=[],rows=[],mountHashes=[];
+   for(const [i,m] of x.Mounts.entries()) {
+    const path=m===bind?c.launchRoot:m.Name===c.dataVolume?data:auth,st=await stat(path,{bigint:true});
+    points.push({path:m.Destination,dev:String(st.dev),ino:String(st.ino)});
+    rows.push(`${i+1} 0 ${device} ${path} ${m.Destination} rw - ext4 /dev/simulated rw`);
+    mountHashes.push({type:m.Type,destination:m.Destination,rw:m.RW,identityHash:digest({device,path,inode:String(st.ino)})});
+   }
+   probes[x.Id]={boot,mountinfo:rows.join('\n'),points};const r=runtimeIdentity(x);
+   services.push({service,id:x.Id,image:x.Image,runtimeHash:digest({...r,mounts:r.mounts.map(m=>m.type==='bind'?{...m,source:null}:m)}),mountHashes:mountHashes.sort((a,b)=>a.destination.localeCompare(b.destination))});
+  }
+  const request={ownershipVersion:1,authority:{observe:true},hold:false,repo:c.repo,issue:c.issue,base:c.base,controllerVersion:c.merge,project:c.productionProject,dataVolume:c.dataVolume,engineURL:c.engineURL,verifyMs:1000,current:{commit:c.merge,image:c.engineImage,authImage:authContainer.Image,runnerSource:c.runnerSource,composeHash:hex(1),composeFile:'/operator/compose.json',files:{'/operator/compose.json':hex(1)},inspect:{symphony:{},'github-auth':{}}}};
+  for(const k of ['stateRoot','inboxRoot','launchRoot','gateRoot','trustedRoot','ledgerRoot','tokenFile'])request[k]=c[k];
+  await f.pin('ownershipRequest',request);
+  const proof=JSON.parse(await readFile(f.paths.ownership));Object.assign(proof,{sourceRequest:c.evidence.ownershipRequest,serviceEvidence:{kernel:boot,services}});await f.pin('ownership',proof);
+  const install=JSON.parse(await readFile(f.paths.validation));install.ownershipHash=c.evidence.ownership.hash;await f.pin('validation',install);
+  const observation={rows:[{file:keyFor(c)+'.json',bytes:(await readFile(f.paths.ledger)).toString('base64'),enrollment:(await readFile(f.paths.enrollment)).toString('base64')}],manifest:f.manifest};
+  const state=await f.io.engine(),api={};
+  for(const path of [`/repos/${c.repo}/issues/${c.issue}`,`/repos/${c.repo}/pulls/${c.pr}`,`/repos/${c.repo}/git/commits/${c.head}`,`/repos/${c.repo}/git/commits/${c.merge}`,`/repos/${c.repo}/issues?state=open&labels=momoflow%3Aready&per_page=100`])api[path]=await f.io.api('GET',path);
+  const configFile=join(f.root,'cli-config.json'),fixtureFile=join(f.root,'cli-fixture.json'),preload=join(f.root,'cli-preload.mjs'),trace=join(f.root,'cli-trace.jsonl');
+  await writeFile(configFile,JSON.stringify(c),{mode:0o600});
+  await writeFile(fixtureFile,JSON.stringify({all,probes,observation,state,api,merge:c.merge,tree:c.tree,mountinfo:`1 0 ${device} / / rw - ext4 /dev/simulated rw\n`,trace}));
+  await writeFile(preload,`import fs from 'node:fs/promises';import syncfs from 'node:fs';import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';
+const fixture=JSON.parse(await fs.readFile(${JSON.stringify(fixtureFile)},'utf8')),read=fs.readFile,lstat=fs.lstat;
+fs.readFile=async(path,...args)=>path==='/proc/self/mountinfo'?fixture.mountinfo:read(path,...args);
+fs.lstat=async(path,...args)=>{if(path==='/.dockerenv')throw Object.assign(Error('simulated host'),{code:'ENOENT'});return lstat(path,...args);};
+const trace=x=>syncfs.appendFileSync(fixture.trace,JSON.stringify(x)+'\\n');
+// Nested Node asynchronous stdio can be lost on this host; capture console calls
+// synchronously while retaining the real command process/pipe/close lifecycle.
+console.log=(...a)=>syncfs.writeSync(1,a.join(' ')+'\\n');console.error=(...a)=>syncfs.writeSync(2,a.join(' ')+'\\n');
+const originalSpawn=cp.spawn;
+cp.spawn=(file,args,options)=>{try {trace({file,args});let value;
+if(file==='git')value=args.includes('status')?'':args.includes('HEAD^{tree}')?fixture.merge+'\\n'+fixture.tree:fixture.merge;
+else if(file==='docker') {
+ if(args[0]==='ps')value=Object.values(fixture.all).map(x=>JSON.stringify({ID:x.Id})).join('\\n');
+ else if(args[0]==='inspect') {const x=Object.values(fixture.all).find(x=>x.Id===args.at(-1));if(!x)throw Error('unknown inspect');value=JSON.stringify(args.includes('--format')?x.Mounts:[x]);}
+ else if(args[0]==='exec') {if(fixture.failExec)throw Error('simulated observation unavailable');value=JSON.stringify(args[4].includes('const paths=JSON.parse')?fixture.probes[args[1]]:fixture.observation);}
+ else if(args[0]==='top')value='PID COMMAND\\n1 beam.smp\\n';
+ else throw Error('unexpected Docker effect');
+} else throw Error('unexpected command');
+return originalSpawn(process.execPath,['-e','require("fs").writeSync(1,'+JSON.stringify(value)+')'],options);
+}catch(e){return originalSpawn(process.execPath,['-e','require("fs").writeSync(2,'+JSON.stringify(e.message)+');process.exit(1)'],options);}};
+globalThis.fetch=async url=>{trace({url:String(url)});return {ok:true,status:200,json:async()=>String(url).includes('/api/v1/state')?fixture.state:fixture.api[new URL(url).pathname+new URL(url).search]};};syncBuiltinESMExports();`);
+  const before=await snapshot(f.root),result=await command(process.execPath,['--import',preload,join(c.trustedRoot,'scripts/reconcile-external.mjs'),configFile,'--check'],{timeout:15000});
+  assert.equal(result.exit,0,result.output.toString());assert.ok(result.output.length,'CLI must emit its read-only result');assert.equal(JSON.parse(result.output).status,'eligible');assert.equal(JSON.parse(result.output).effects,'none');
+  const calls=(await readFile(trace,'utf8')).trim().split('\n').map(x=>JSON.parse(x));assert.ok(calls.some(x=>x.args?.[0]==='exec'));
+  assert.ok(calls.some(x=>x.url?.startsWith('https://api.github.com/')),'must proceed beyond ownership module observation');
+  const after=await snapshot(f.root);delete after['/cli-trace.jsonl'];assert.deepEqual(after,before);
+  const broken=JSON.parse(await readFile(fixtureFile));broken.failExec=true;await writeFile(fixtureFile,JSON.stringify(broken));
+  const failed=await command(process.execPath,['--import',preload,join(c.trustedRoot,'scripts/reconcile-external.mjs'),configFile,'--check'],{timeout:15000});
+  assert.equal(failed.exit,1,failed.output.toString());assert.match(failed.output.toString(),/observation unavailable|metadata probe unavailable/);assert.doesNotMatch(failed.output.toString(),/unsettled top-level await/);
+  const failedAfter=await snapshot(f.root);delete failedAfter['/cli-trace.jsonl'];delete failedAfter['/cli-fixture.json'];delete before['/cli-fixture.json'];assert.deepEqual(failedAfter,before);
+ }finally{await f.clean();}
+});

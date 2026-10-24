@@ -438,10 +438,16 @@ authorization에도 originalPr을 기록하되, 두 record의 `pr` 및 review/te
 pr/head/tree/merge는 **최종 corrective PR**과 정확히 일치해야 한다. 최종 controller 설치도
 해당 corrective merge/tree여야 한다. originalPr을 생략한 기존 동일-PR v2는 pr을 원본 번호로
 사용한다. 이 구분은 원본 PR을 재발행하거나 기존 artifact를 바꾸지 않는다. 현재 할당은
-original 2/3 + external 3, 실제 합계 5이며 externalLimit 3/totalLimit 5를 별도 승인 근거에
+original 2/3 + external 4, 실제 합계 6이며 externalLimit 4/totalLimit 6을 별도 승인 근거에
 고정한다.
 
 live ownership의 manifestContract는 보존한 원본 manifest를 parse한 object의 digest와
 대조한다. ledger.launch와 원본 manifest의 내용은 구조적으로 같아야 하지만 JSON key
 삽입 순서는 달라도 된다. 원본 파일 바이트 hash와 archive는 계속 각각 검증하며, global
 digest 규칙을 바꾸거나 ledger/manifest를 재직렬화해서 원본을 대체하지 않는다.
+
+ownership adapter의 공유 deploy helper는 정적 import로 CLI 실행 전에 평가한다.
+CLI top-level await 중 지연 deploy import가 같은 receipt module을 다시 참조하면 ESM
+cycle에서 exit 13을 일으킬 수 있으므로 runtime dynamic import를 사용하지 않는다. 별도 Node process에서 실제 CLI/module/adapter 경로의 effect-free 성공과
+관찰 실패(exit 1)를 검사한다. 이 회귀의 외부 command/fetch/mount metadata는 모의이며
+실제 설치 helper 검증을 대신하지 않는다.

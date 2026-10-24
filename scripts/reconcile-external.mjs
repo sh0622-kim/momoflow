@@ -6,6 +6,9 @@ import {isDeepStrictEqual as same} from 'node:util';
 import {config,json,digest,keyFor,atomic,github,list,verifyInstall,withControllerLock} from './post-pr.mjs';
 import {command} from './post-pr-docker.mjs';
 import {mountContext} from './deploy-mount-identity.mjs';
+// Resolve the receipt/deployment module cycle before CLI execution, not during an
+// awaited ownership observation (dynamic import there deadlocks ESM evaluation).
+import {deploymentConfig,observeDeploymentOwners,runtimeOwnersIdle,ownershipServiceEvidence} from './deploy.mjs';
 const need=(v,m)=>{if(!v)throw Error(m);};
 const hex=v=>typeof v==='string' && /^[a-f0-9]{64}$/.test(v);
 const sha=v=>typeof v==='string' && /^[a-f0-9]{40}$/.test(v);
@@ -246,7 +249,6 @@ export async function reconciliationPorts(c) {
     }
     need(all.symphony?.Id===c.engineContainer && all['github-auth'],'Ownership engine/auth missing or changed');return all;
    };
-   const {deploymentConfig,observeDeploymentOwners,runtimeOwnersIdle,ownershipServiceEvidence}=await import('./deploy.mjs');
    deploymentConfig(request,{ownership:true});
    const all=await containers(),observation=await observeDeploymentOwners(request,{containers,docker}),s=await engine();
    // The pinned full CLI proof authenticated canonical host binds. Fresh hashes
