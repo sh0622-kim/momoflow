@@ -347,3 +347,6 @@ await import('./deploy.test.mjs');
 await import('./finish.test.mjs');
 
 import "./decision.test.mjs";
+
+// Normal budget-stop recovery uses the existing external ownership transaction.
+await import('./reconcile-budget.test.mjs');

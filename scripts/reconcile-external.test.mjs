@@ -619,3 +619,24 @@ globalThis.fetch=async url=>{trace({url:String(url)});return {ok:true,status:200
   const failedAfter=await snapshot(f.root);delete failedAfter['/cli-trace.jsonl'];delete failedAfter['/cli-fixture.json'];delete before['/cli-fixture.json'];assert.deepEqual(failedAfter,before);
  }finally{await f.clean();}
 });
+
+test('normal-budget helper admits only exact named RO evidence and three semantically pinned old bundle files',async()=>{
+ const {budgetFixture}=await import('./reconcile-budget-fixture.mjs');
+ const {budgetExtraMounts,budgetEvidenceNames}=await import('./reconcile-budget.mjs');
+ const source=await budgetFixture();try {
+  const f=operatorFixture();f.c.profile='controller-budget-exhausted-v4';f.c.evidence=source.c.evidence;
+  f.operator.Mounts=f.operator.Mounts.filter(m=>!['/evidence/recovery.json','/evidence/validation.json'].includes(m.Destination));
+  const names=budgetEvidenceNames.filter(n=>!['ledger','enrollment','manifest','launchJournal','controllerJournal','gate'].includes(n));
+  for(const ref of [...names.map(n=>f.c.evidence[n]),...await budgetExtraMounts(f.c)]) {
+   if(f.operator.Mounts.some(m=>m.Destination===ref.path))continue;
+   const m={Type:'bind',Source:ref.path,Destination:ref.path,RW:false};f.operator.Mounts.push(m);f.context.mounted.set(m,{identity:ref.path});
+  }
+  const request=JSON.parse(await readFile(source.paths.ownershipRequest)),workflow=request.current.inspect.symphony.mounts.find(m=>m.destination==='/config/WORKFLOW.md').source;
+  const liveWorkflow={Type:'bind',Source:'/daemon/opaque-workflow',Destination:'/config/WORKFLOW.md',RW:false};f.engine.Mounts.push(liveWorkflow);f.context.mounted.set(liveWorkflow,{identity:workflow});
+  await f.verify();const native=f.operator.Mounts.find(m=>m.Destination===f.c.evidence.buildNative.path);
+  f.context.mounted.set(liveWorkflow,{identity:'/different-live-workflow'});await assert.rejects(f.verify(),/workflow.*correspondence/);f.context.mounted.set(liveWorkflow,{identity:workflow});
+  native.RW=true;await assert.rejects(f.verify(),/source\/authority/);native.RW=false;
+  native.Source='/copied-native-evidence';await assert.rejects(f.verify(),/source\/authority/);native.Source=native.Destination;
+  f.operator.Mounts.push({Type:'bind',Source:'/secret-parent',Destination:'/secret-parent',RW:false});await assert.rejects(f.verify(),/Unexpected operator mounts/);
+ }finally{await source.clean();}
+});
