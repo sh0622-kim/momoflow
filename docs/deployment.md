@@ -436,3 +436,8 @@ node /operator/momoflow/scripts/finish.mjs /operator/requests/launch.json
 필수 후속 gate다. 로컬 Node 회귀는 실제 subprocess/module/filesystem/lock을 실행하지만
 Docker/GitHub 효과는 모의한다. 실 모델·실운영 배포 검증으로 기록하지 않는다.
 격리 실행은 [전용 마무리 fixture](deployment-fixture.md#gh-30-후보-마무리-cli의-격리-실행)를 따른다.
+
+GH36의 정상 예산 소진 원본은 [외부 완료 v4](post-pr.md#gh-36-후보-정상-예산-소진-owner의-외부-완료-v4)의
+prepare/check/apply/duplicate로 별도 처리한다. 새 controller를 먼저 설치하되 reconciliation
+동안 old engine/auth는 유지한다. receipt와 공통 ownership preflight를 확인한 뒤에만 승인된
+새 이미지 배포로 진행한다. 코드 완료·owner 퇴역은 이슈의 자연 발생 운영 관찰 완료와 구분한다.

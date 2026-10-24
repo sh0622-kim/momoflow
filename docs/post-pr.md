@@ -613,3 +613,158 @@ RoleRunner와 Node subprocess 사이에는 모의 GitHub 효과를 사용한다.
 실제 모델·운영 대기 발생·설치 또는 외부 개입 감소 증거가 아니다. 새 경로가 자연 발생하지
 않으면 감소 **미관찰**로 남긴다. 고정 host의 Docker 검사·독립 리뷰·예외 설치와 실제 업무 관찰은
 후속 단계다. 검증/설치 보조 일반화, 상태 감시·완료 기록, 범용 crash 복구는 이번 범위 밖이다.
+
+## GH-36 후보: 정상 예산 소진 owner의 외부 완료 v4
+
+`controller-budget-exhausted-v4`는 GH34의 정상 예산 종료를 보존하면서 **외부 코드 완료와
+옛 실행 owner 퇴역**을 기록한다. 원본을 성공으로 바꾸거나 이슈를 닫지 않는다. 별도
+리뷰·정확한 head의 격리 검증·외부 설치 전에는 운영 완료로 취급하지 않는다. 자연 발생
+판단 대기나 외부 개입 감소는 여전히 `natural-observation-pending`이다. v1/v2/v3의 실제
+중단 계약은 그대로다.
+
+허용 원본은 blocked, reason `Shared iteration budget exhausted`, iterations/launch.limit
+3/3, in_flight false, active_session null, publication 없음, controller journal **부재**다.
+마지막 역할은 완료된 세 번째 Astra/high review의 changes_requested여야 한다. enrollment와
+manifest가 launch에 구조적으로 같고, launch는 dispatched/observed true, done 아님,
+blocker `Terminal/interrupted ledger requires recovery`여야 한다. 원본 gate는 unpaused다.
+원본 여섯 파일/부재를 최초 캡처 index와 live 경로·바이트로 대조한다. 계획용 snapshot은
+live named volume의 원본을 대신하지 않는다.
+
+### 준비와 적용 순서
+
+1. Owner PR과 recovery PR의 별도 리뷰·정확한 head 검증을 마친 뒤 허용된 merge 방식으로
+   병합한다. owner tuple과 설치 tuple의 issue/PR/head/tree/merge를 고정한다. merge commit의
+   tree는 검토 head의 tree와 같아야 한다. owner의 첫 parent는 검증 request의 base_head,
+   recovery의 첫 parent는 검증 base_head 또는 방금 검증한 owner merge만 허용한다.
+   이 좁은 경로는 squash/rebase merge와 그 밖의 base 변경을 지원하지 않는다.
+2. Recovery merge의 깨끗한 controller checkout을 **외부 운영자가** 설치한다. 실행 중인
+   old engine/auth, 이미지·Compose·WORKFLOW·인증 볼륨은 유지한다. 새 controller와 old
+   engine의 runner source가 다른 것이 이 profile의 명시된 설치 상태다.
+3. 설치된 controller의 기존 `deploy.mjs <ownershipRequest> --ownership-check`로 새 full
+   host proof를 얻는다. ownershipVersion 1, authority.observe true, current는 실제 old
+   bundle, manifest는 GH34 원본 present, controllerVersion/trustedRoot는 recovery merge다.
+   authBindProof를 연쇄하지 않는다. 옛 owner 때문에 ownersIdle false여도 runtimeIdle true,
+   controllerLock false인 완전한 proof는 준비 입력이 될 수 있다.
+4. 승인된 외부 운영자가 두 리뷰 이후 남은 action label의 해소 판단을 별도 record에 남긴다.
+   이슈는 open/closed 어느 쪽이든 **non-ready**다. 공유 계정/라벨 부재를 승인으로 추론하지
+   않는다. 명령은 라벨을 바꾸지 않으며, 현재 needs-decision/review 각각이 record에 있어야 한다.
+5. 아래 preparation → check → apply → duplicate 명령을 같은 request로 실행한다. preparation도
+   `/engine-data` live volume 및 필요한 private evidence를 RO로 읽는 외부 환경에서 실행한다.
+   Docker socket이나 production 쓰기 권한은 preparation에 필요하지 않다.
+6. 원본 hash·host 부재, manifest 퇴역, 원본 gate 복원, old engine/auth 유지와 공통 ownership
+   preflight를 확인한다. 그다음 별도 승인된 [배포 절차](deployment.md)로 검증 이미지를
+   설치한다. receipt 자체는 배포나 자연 발생 관찰의 성공 근거가 아니다. 다음 이슈를 실행하지 않는다.
+
+```sh
+node /operator/pinned/scripts/prepare-reconciliation.mjs /operator/input-gh36.json /operator/NEW-prepared-gh36
+node /operator/pinned/scripts/reconcile-external.mjs /operator/NEW-prepared-gh36/request.json --check
+node /operator/pinned/scripts/reconcile-external.mjs /operator/NEW-prepared-gh36/request.json --apply
+node /operator/pinned/scripts/reconcile-external.mjs /operator/NEW-prepared-gh36/request.json --apply
+node /operator/pinned/scripts/reconcile-external.mjs /operator/NEW-prepared-gh36/request.json --check
+```
+
+Preparation은 검증된 입력으로 recovery.json, validation.json, previousBundle.json,
+request.json만 **새 private 디렉터리**에 쓴다. validation.json의 installed commit/tree/source는
+실제 깨끗한 checkout 관찰에서 생성하며 caller의 installed/success boolean을 받지 않는다.
+receipt/intent나 운영 원본을 쓰지 않는다. 같은 입력·출력으로 재호출하면 바이트가 같은 기존
+package를 검증해 재사용한다. 다른 요청이나 불완전한 준비를 덮어쓰지 않는다. 입력 source,
+native transcript와 archive는 private으로 보존하고 PR에 내용을 게시하지 않는다.
+
+### Typed preparation 입력
+
+JSON 최상위는 `kind:"normal-exhaustion-preparation-v4"`, `config`, `sources`, `turns`,
+`validationOrigins`, 선택적인 `logs`다. config는 기존 reconciliation 설정에 다음을 포함한다.
+모든 경로는 canonical absolute이고 원본 refs는 운영 경로와 정확히 같아야 한다.
+
+```json
+{
+  "profile": "controller-budget-exhausted-v4",
+  "repo": "OWNER/REPO", "issue": "34", "base": "main", "pr": 35,
+  "head": "OWNER_HEAD", "tree": "OWNER_TREE", "merge": "OWNER_MERGE",
+  "originalIterations": 3, "originalLimit": 3, "externalIterations": 2, "recoveryIterations": 1,
+  "installation": {"issue":"36","pr":37,"head":"RECOVERY_HEAD","tree":"RECOVERY_TREE","merge":"RECOVERY_MERGE"},
+  "controllerVersion": "RECOVERY_MERGE", "controllerTree": "RECOVERY_TREE",
+  "authority": {"validate":false,"resume":false,"merge":false,"close":false,"reconcile":true,"externalBudget":true},
+  "hold": false, "requiredChecks": [], "requiredReviewers": []
+}
+```
+
+실제 config에는 stateRoot/ledgerRoot/launchRoot/gateRoot/inboxRoot/trustedRoot/tokenFile,
+engineURL, productionProject, engineContainer/image, dataVolume도 기존 계약대로 넣는다.
+runnerSource는 준비 시 검증된 old current bundle/source에서 도출한다. naked override를 받지
+않는다. controllerVersion은 새 설치 tuple이며 running source와 구분한다.
+
+sources의 필수 이름은 다음 표와 같다. 각 값은 private absolute 파일 경로 또는 `{path,hash}`다.
+경로만 주면 준비 명령이 실제 바이트 hash를 고정한다. controllerJournal만 반드시
+`{"path":"ABSOLUTE_ORIGINAL_HOST_JOURNAL","hash":null}`로 부재를 명시한다.
+
+| Sources | 원본과 검증 |
+| --- | --- |
+| ledger/enrollment/manifest/launchJournal/controllerJournal/gate | live 원본 여섯 경로/부재; originalIndex의 각 source/hash와 일치 |
+| originalIndex | 최초 캡처한 원본 index; ledger 등 여섯 이름의 source/hash 포함 |
+| authorization / recoveryAuthorization | 실제 사용자 승인 원문. 각각 external correction total2 및 별도 recovery1. explicit-user-reply와 explicit-user-request를 구분해 원본대로 수용 |
+| correction / recoveryBuild | 실제 frozen build evidence; baseHead, session, budget, 변경 files의 SHA256. recoveryBuild에는 invocation `{issue:36,startedAt:...}`도 포함 |
+| invocation | 별도 복구 시작 record: issue36/execution external/implementationUsed·Limit1/base/startedAt/ownerUsage |
+| review / recoveryReview | 실제 exact-head approving review JSON: repo/issue/pr/head/tree/status approved, findings [], session/buildSession, model/reasoning/settings 근거 |
+| buildNative/reviewNative/recoveryBuildNative/recoveryReviewNative | 각각 native session_meta/turn_context/event_msg task_complete를 보존한 immutable JSONL snapshot |
+| tests/testRequest/recoveryTests/recoveryTestRequest | 고정 host validator 결과와 **그대로 사용한 전체 publication request**. 원래 없던 pr 같은 필드를 추가하지 않음 |
+| ownership / ownershipRequest | 위 새 full host proof와 그 원본 request. old engine/auth의 실제 runtime/mount/kernel/source 및 전체 ledger hash 포함 |
+| previousRunner | old current.commit의 role_runner.ex 실제 바이트. 준비 시 GitHub의 고정 commit source와 대조 |
+| actionResolution | 아래의 명시적 외부 운영자 판단 record |
+
+`turns`는 `{"owner":{"build":"TURN_ID","review":"TURN_ID"},"recovery":{"build":"TURN_ID","review":"TURN_ID"}}`,
+`validationOrigins`는 `{"owner":"PINNED_VALIDATOR_COMMIT","recovery":"PINNED_VALIDATOR_COMMIT"}`다.
+`logs:{"owner":"ABSOLUTE_OWNER_LOG_DIR","recovery":"ABSOLUTE_RECOVERY_LOG_DIR"}`를 주면
+compose/build/contracts/node/sandbox/readiness의 hash-named 여섯 파일씩을 결과에서 찾아 읽는다.
+logs를 생략하면 sources에 ownerLog_NAME/recoveryLog_NAME 12개의 pinned refs를 직접 넣는다.
+결과의 producer/request/head/tree/image, 6개 check exit0, 실제 log hash와 role≥125/Node≥613의
+최종 assertion summary 및 zero failures/skipped를 검사한다. 로그 개수나 모의 검사를 live
+모델·Symphony 검증으로 표시하지 않는다.
+
+build session record는 `id/actualModel/actualReasoning/service_tier/fastOffPolicy/fastOffRuntimeProven/settingsChanged`다.
+budget는 originalUsed/originalLimit3, externalCorrectionUsed/externalCorrectionLimit2,
+separateRecoveryUsed는 correction0/recovery1이다. Sol은 gpt-6.1-sol/medium, 별도 review는
+Astra/high다. 실제 service_tier null은 runtime Fast OFF 증명으로 바꾸지 않는다. build/review는
+다른 session이어야 하고 correction/recovery의 **turn**은 달라야 한다. 같은 Sol thread를 재사용한
+외부 복구도 invocation 시작 시각과 1/1 사용량으로 구분한다. review native 최종 메시지에는
+approved와 정확한 head의 앞 8자가 있어야 하며 scope는 review JSON의 전체 SHA로 검사한다.
+
+Provider server_overloaded로 중단 후 재개했다면 recoveryBuild의
+`transportInterruptions:[{"turnId":"FAILED_TURN","code":"server_overloaded"}]`에 기록한다.
+새로운 구현 횟수로 세지 않는다. 실제 native 실패 task_complete.error/null 결과와 동일
+Sol/medium 설정, 원래 invocation 안의 시각, 뒤따르는 완료 turn을 모두 검사한다. 실패를
+숨기거나 원래 시작 시각을 재개 시각으로 덮어쓰지 않는다.
+
+`actionResolution`은 kind `operator-action-resolution-v4`, actor external-operator,
+authority existing-scope, repo, 정확한 owner/installation tuple, authorizationHash,
+remainingObservation `natural-observation-pending`, 두 리뷰 뒤의 ISO at, 해소한
+`labels:[{"issue":"34","name":"momoflow:needs-decision"}]`를 기록한다. 코드가 판단/승인 원문을
+만들지 않는다. source/hash와 모든 세션·검사 기록은 기존 archive 안에 보존된다.
+
+### 전용 helper와 이후 검증
+
+기존 helper의 독립 lifetime, uid1000, RO root/cap-drop ALL/no-new-privileges, engine network,
+동일 canonical host 경로, live ledger/auth named volume RO, socket group 및 mount correspondence
+계약을 유지한다. config directory/controller는 RO, state/inbox/launch/gate와 /tmp/socket만
+기존대로 RW다. sources 중 원본 여섯을 제외한 **request.evidence의 각 exact 파일**을 각각 RO
+mount한다. 중복 source 경로는 한 번만 mount한다. old ownershipRequest.current.files의
+Compose/WORKFLOW/seccomp **세 파일만** 추가 RO mount하며 key/secret parent는 mount하지 않는다.
+추가 workflow bind는 실제 old engine의 /config/WORKFLOW.md와 같은 filesystem object여야 한다.
+이전 profile의 verified historical receipt가 요구하는 finite RO evidence도 기존 규칙대로 보존한다.
+
+Helper container ID를 docker create 뒤 알게 되는 기존 설치 순서를 위해 v4만 다음 인자를
+지원한다. 이것은 immutable request나 receipt identity를 바꾸지 않는 설치 metadata이며 실제
+self/container/image/group 검사는 그대로다. 임의 경로나 hook 인자는 없다.
+
+```sh
+node /operator/pinned/scripts/reconcile-external.mjs /operator/NEW-prepared-gh36/request.json --check --operator CONTAINER_ID IMAGE_SHA256 SOCKET_GID
+node /operator/pinned/scripts/reconcile-external.mjs /operator/NEW-prepared-gh36/request.json --apply --operator CONTAINER_ID IMAGE_SHA256 SOCKET_GID
+```
+
+적용은 기존 global/per-owner 검사 → source/archive → intent → admission fence/ack → fresh
+양 PR/전체 owner/service/source 재검사 → exact manifest 퇴역/absent ack → 원본 gate 복원/ack
+→ 최종 full 재검사 → v4 receipt다. partial interruption은 같은 archived transaction만 재개한다.
+완료 receipt의 중복 검사는 원본과 archive를 검증하고 새 퇴역·dispatch를 하지 않는다.
+나중에 engine/controller를 합법적으로 업그레이드해도 historical receipt reader는 옛 runtime을
+요구하지 않는다. 캡처한 bundle 바이트를 보존하여 옛 live Compose 경로의 이후 변경과 구분한다.
+원본 ledger/enrollment/launch와 host 부재, private source refs/archive는 계속 검증한다.
