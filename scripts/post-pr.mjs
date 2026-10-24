@@ -1,3 +1,4 @@
+import { writeWorkStatus } from './work-status.mjs';
 // Installed and pinned by an operator OUTSIDE candidate workspaces. No shell evaluation.
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir, rename, open, rm, realpath, lstat } from 'node:fs/promises';
@@ -199,7 +200,9 @@ export async function reconcile(c, io) {
   assert(Array.isArray(engineState.running) && Array.isArray(engineState.retrying), 'Unknown engine state');
   if (engineState.running.length || engineState.retrying.length) return { waiting: 'Symphony worker/claim release' };
   const ledger = await io.ledger();
+  const display = async phase => { try { await io.status?.(ledger, phase); } catch {} };
   if (ledger.stage === 'await_decision') {
+    await display('await_decision');
     const {holdDecision} = await import('./decision.mjs');
     return holdDecision(c,io,ledger);
   }
@@ -231,6 +234,7 @@ export async function reconcile(c, io) {
     if (!pr.merged) assert(!['attempting', 'uncertain', 'confirmed'].includes(journal.mergeAttempt?.state), 'Prior merge attempt requires operator assessment');
     if (!pr.merged) assert(issue.state === 'open' && pr.state === 'open', 'Issue/PR closed without verified completion');
     if (!journal.validation) {
+      await display('validating');
       const result = await io.validate(p);
       validation(c, p, result);
       await save({ validation: result });
@@ -260,6 +264,7 @@ export async function reconcile(c, io) {
       await io.resume(envelope); // Atomic host-owned inbox. Runner owns consumption/count.
       await guardResume(); // Reporting/inbox IO cannot retain revoked dispatch authority.
       await api('POST', `${root}/issues/${c.issue}/labels`, { labels: ['momoflow:ready'] });
+      await display('correction');
       return { waiting: 'Budget-preserving same-PR correction', request: envelope.id };
     }
     if (!pr.merged) {
@@ -269,6 +274,7 @@ export async function reconcile(c, io) {
         await removeReady(c, api);
         await actionLabels(c, p, api, journal, save, gate.waiting.startsWith('Human review') ? 'momoflow:needs-review' : null);
         await report(c, p, api, `대기: ${gate.waiting}; head ${p.head}. 정상 외부 검사/리뷰 대기는 새 모델 실행을 만들지 않습니다.`);
+        await display(gate.waiting.startsWith('Human review') ? 'review_wait' : 'checks_wait');
         return gate;
       }
       await actionLabels(c, p, api, journal, save, null);
@@ -285,6 +291,7 @@ export async function reconcile(c, io) {
         await removeReady(c, api);
         await actionLabels(c, p, api, journal, save, finalGate.waiting.startsWith('Human review') ? 'momoflow:needs-review' : null);
         await report(c, p, api, `대기: ${finalGate.waiting}; head ${p.head}. 정상 외부 검사/리뷰 대기는 새 모델 실행을 만들지 않습니다.`);
+        await display(finalGate.waiting.startsWith('Human review') ? 'review_wait' : 'checks_wait');
         return finalGate;
       }
       await io.authorize?.();
@@ -323,8 +330,10 @@ export async function reconcile(c, io) {
     const closed = await api('GET', `${root}/issues/${c.issue}`);
     assert(c.finish || closed.state === 'closed', 'Issue close not confirmed');
     await save({ done: true });
+    await display('merged');
     return { done: true, merge: pr.merge_commit_sha };
   } catch (e) {
+    await display('blocked');
     await save({ blocker: e.message });
     await removeReady(c, api);
     await actionLabels(c, p, api, journal, save, 'momoflow:needs-decision');
@@ -387,6 +396,7 @@ export async function runConnected(c) {
           assert(Object.keys(m).sort().join() === Object.keys(c.launch).sort().join() && Object.keys(m).every(k => m[k] === c.launch[k]), 'Trusted launch manifest changed/missing');
         }
       },
+      status: (ledger, phase) => writeWorkStatus(c, ledger, phase),
       api, ledger: () => json(join(c.ledgerRoot, `${key}.json`)),
       engine: async () => { const r = await fetch(`${c.engineURL}/api/v1/state`, { signal: AbortSignal.timeout(5000) }); assert(r.ok, 'Engine state unavailable'); return r.json(); },
       load: async () => { try { return await json(join(dir, 'journal.json')); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } },

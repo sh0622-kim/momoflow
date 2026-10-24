@@ -8,6 +8,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { command } from './post-pr-docker.mjs';
 import { fixture } from './post-pr-fixture.mjs';
+import { writeWorkStatus } from './work-status.mjs';
 import { finishConnected } from './finish.mjs';
 import { atomic, digest, keyFor, json } from './post-pr.mjs';
 const mode=process.argv[2];
@@ -60,6 +61,9 @@ if(!process.argv[3]) {
   const ledger=structuredClone(f.ledger);if(drift==='ledger')ledger.stage='blocked';
   const ledgerFile=join(c.ledgerRoot,keyFor(c)+'.json');await atomic(ledgerFile,ledger);await atomic(ledgerFile+'.enrolled',c.launch);
   const manifest=join(c.launchRoot,'active.json');await atomic(manifest,c.launch);
+  await writeWorkStatus(c,ledger,complete?'complete':'merged');
+  const statusFile=join(c.inboxRoot,keyFor(c)+'.status.json');
+  assert.equal((await json(statusFile)).phase,complete?'complete':'merged');
   const original={v:1,phase:'complete',request:digest(c.configContents),evidence:{hash:digest(e)},publication:f.p,target:{commit:e.merge,image:f.result.image},archive:{path:'preserved-original',hash:digest('original')},verification:{passed:true},next:'Original completion verified'};
   const journal=join(dir,'completion.json');if(complete)await atomic(journal,original);
   const originals=new Map();for(const p of [ledgerFile,ledgerFile+'.enrolled',manifest,join(dir,'journal.json')])originals.set(p,await readFile(p));
@@ -79,6 +83,10 @@ if(!process.argv[3]) {
    await assert.rejects(finishConnected(c),drift==='ledger'?/not released/:drift==='host'?/Confirmed exact/:file?/separate exceptional deployment/:/review threads/);
   } finally {globalThis.fetch=oldFetch;}
   const result=await json(journal);
+  const display=await json(statusFile);
+  assert.equal(display.phase,'blocked','actual catch must invalidate even a fresh complete summary');
+  assert.equal(display.head,f.p.head);
+  assert.equal(display.generation,ledger.events.length);
   if(complete){const {recheck,...preserved}=result;assert.deepEqual(preserved,original);assert.equal(recheck.status,'blocked');assert.match(recheck.next,/never replayed/);assert.ok(recheck.reason);}
   else {assert.equal(result.phase,file?'excluded':'blocked');assert.equal(result.target.image,f.result.image);assert.equal(result.publication.head,f.p.head);assert.equal(result.evidence.hash,digest(e));}
   assert.match(f.pad.body,/운영 마무리:/);assert.match(f.pad.body,/다음 행동:/);

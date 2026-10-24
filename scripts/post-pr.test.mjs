@@ -350,3 +350,6 @@ import "./decision.test.mjs";
 
 // Normal budget-stop recovery uses the existing external ownership transaction.
 await import('./reconcile-budget.test.mjs');
+
+// Included in the fixed host Node entrypoint; these use fixture ports, not live operations.
+import './work-status.test.mjs';

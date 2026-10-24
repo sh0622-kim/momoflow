@@ -1,0 +1,72 @@
+diff -ruN a/elixir/lib/symphony_elixir_web/live/dashboard_live.ex b/elixir/lib/symphony_elixir_web/live/dashboard_live.ex
+--- a/elixir/lib/symphony_elixir_web/live/dashboard_live.ex	2026-10-24 13:55:07.098321665 +0000
++++ b/elixir/lib/symphony_elixir_web/live/dashboard_live.ex	2026-10-24 13:58:30.417826421 +0000
+@@ -12,6 +12,8 @@
+   def mount(_params, _session, socket) do
+     socket =
+       socket
++      |> assign(:selected_issue, nil)
++      |> assign(:work_status, SymphonyElixir.WorkStatus.observe())
+       |> assign(:payload, load_payload())
+       |> assign(:now, DateTime.utc_now())
+ 
+@@ -26,7 +28,7 @@
+   @impl true
+   def handle_info(:runtime_tick, socket) do
+     schedule_runtime_tick()
+-    {:noreply, assign(socket, :now, DateTime.utc_now())}
++    {:noreply, socket |> assign(:now, DateTime.utc_now()) |> assign(:work_status, SymphonyElixir.WorkStatus.observe(issue: socket.assigns.selected_issue))}
+   end
+ 
+   @impl true
+@@ -38,6 +40,12 @@
+   end
+ 
+   @impl true
++  def handle_params(params, _uri, socket) do
++    issue = params["issue"]
++    {:noreply, socket |> assign(:selected_issue, issue) |> assign(:work_status, SymphonyElixir.WorkStatus.observe(issue: issue))}
++  end
++
++  @impl true
+   def render(assigns) do
+     ~H"""
+     <section class="dashboard-shell">
+@@ -68,6 +76,26 @@
+         </div>
+       </header>
+ 
++      <section class="section-card" id="current-work" aria-label="Current work and next action">
++        <h2 class="section-title">Current work and next action</h2>
++        <p><%= @work_status.selection %></p>
++        <p :if={@work_status.issue_url}><a href={@work_status.issue_url}>Issue #<%= @work_status.issue %> · workpad</a></p>
++        <p :if={@work_status.pr_url}><a href={@work_status.pr_url}>Verify PR evidence</a></p>
++        <dl>
++          <dt>Stage</dt><dd><%= @work_status.phase %></dd>
++          <dt>Next action</dt><dd><%= @work_status.next_action %></dd>
++          <dt>Actor</dt><dd><%= @work_status.actor %></dd>
++          <dt>Last persisted runner stage (may be stale)</dt><dd><%= @work_status.last_known_phase %></dd>
++          <dt>Source</dt><dd><%= @work_status.source %></dd>
++          <dt>Last observation (UTC)</dt><dd><%= @work_status.observed_at || "Unknown" %></dd>
++          <dt>Runner last persisted (UTC)</dt><dd><%= @work_status.persisted_at || "Unknown" %></dd>
++          <dt>Matching session activity (UTC)</dt><dd><%= @work_status.activity_at || "Unknown" %></dd>
++          <dt>Host connection</dt><dd><%= @work_status.host %></dd>
++        </dl>
++        <p>Read only. No active sessions does not mean completion. PR publication and merge do not prove deployment.</p>
++        <p>Use ?issue=NUMBER to inspect a selected historical issue. Source observations expire after 120 seconds; matching live session events can corroborate a longer role. Re-reading does not refresh source times.</p>
++      </section>
++
+       <%= if @payload[:error] do %>
+         <section class="error-card">
+           <h2 class="error-title">
+diff -ruN a/elixir/lib/symphony_elixir_web/presenter.ex b/elixir/lib/symphony_elixir_web/presenter.ex
+--- a/elixir/lib/symphony_elixir_web/presenter.ex	2026-10-24 13:55:07.098321665 +0000
++++ b/elixir/lib/symphony_elixir_web/presenter.ex	2026-10-24 13:55:07.130456399 +0000
+@@ -13,6 +13,7 @@
+       %{} = snapshot ->
+         %{
+           generated_at: generated_at,
++          work_status: SymphonyElixir.WorkStatus.observe(snapshot: snapshot),
+           admission: Map.get(snapshot, :admission),
+           counts: %{
+             running: length(snapshot.running),
