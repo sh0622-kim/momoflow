@@ -13,13 +13,20 @@ const need=(v,m)=>{if(!v)throw Error(m);};
 const hex=v=>typeof v==='string' && /^[a-f0-9]{64}$/.test(v);
 const sha=v=>typeof v==='string' && /^[a-f0-9]{40}$/.test(v);
 const controllerV2=c=>c.profile==='controller-only-v2';
+const controllerV3=c=>c.profile==='controller-review-interrupted-v3';
+const controllerProfile=c=>controllerV2(c)||controllerV3(c);
+const installation=c=>controllerV3(c)?c.installation:c;
+const tuple=c=>({issue:c.issue,pr:c.pr,head:c.head,tree:c.tree,merge:c.merge});
+const exactTuple=x=>x && /^[1-9][0-9]*$/.test(x.issue) && Number.isSafeInteger(x.pr) && x.pr>0 && [x.head,x.tree,x.merge].every(sha);
+const originalNames=['ledger','enrollment','manifest','launchJournal','controllerJournal','gate'];
+const v3Evidence=['correction','review','tests','authorization','recoveryAuthorization','recoveryReview','recoveryTests','ownership','ownershipRequest'];
 const extendedBudget=c=>controllerV2(c) && c.originalIterations+c.externalIterations>c.originalLimit;
 function controllerBudget(c) {
  if(!extendedBudget(c))return c.externalBudget===undefined;
  const b=c.externalBudget;
  return b && same(Object.keys(b).sort(),['externalLimit','totalLimit']) && Number.isSafeInteger(b.externalLimit) && b.externalLimit>=c.externalIterations && Number.isSafeInteger(b.totalLimit) && b.totalLimit===c.originalIterations+b.externalLimit;
 }
-const evidenceNames=c=>['ledger','enrollment','manifest','launchJournal','controllerJournal','gate','recovery','validation',...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest',...(extendedBudget(c)?['authorization']:[])]:[])];
+const evidenceNames=c=>['ledger','enrollment','manifest','launchJournal','controllerJournal','gate','recovery','validation',...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest',...(extendedBudget(c)?['authorization']:[])]:controllerV3(c)?v3Evidence:[])];
 const optional=async p=>{try{return await json(p);}catch(e){if(e.code==='ENOENT')return null;throw e;}};
 async function privatePath(path,directory=false) {
  need(typeof path==='string' && resolve(path)===path && await realpath(path)===path,'Private canonical evidence path required');
@@ -38,19 +45,20 @@ const paths=c=>{
 };
 export function reconciliationConfig(c) {
  config(c);need(c.authority.reconcile===true && !c.hold,'Explicit external reconciliation authority required');
- need(c.profile===undefined || controllerV2(c),'Unsupported external completion profile');
+ need(c.profile===undefined || controllerProfile(c),'Unsupported external completion profile');
  for(const k of ['launchRoot','gateRoot'])need(typeof c[k]==='string' && resolve(c[k])===c[k],'Absolute reconciliation control roots required');
  need(Number.isSafeInteger(c.pr) && c.pr>0 && [c.head,c.tree,c.merge].every(sha),'Exact external PR/head/tree/merge required');
  need(Number.isInteger(c.originalIterations) && c.originalIterations>=1 && c.originalIterations<=3 && Number.isInteger(c.externalIterations) && c.externalIterations>=1,'Separate original/external iteration history required');
  need(hex(c.engineContainer) && /^sha256:[a-f0-9]{64}$/.test(c.engineImage || '') && typeof c.productionProject==='string','Pinned engine worker identity required');
  if(controllerV2(c))need((c.originalPr===undefined || Number.isSafeInteger(c.originalPr) && c.originalPr>0) && c.originalIterations===2 && c.originalLimit===3 && Number.isSafeInteger(c.externalIterations) && c.externalIterations>=1 && controllerBudget(c) && (!extendedBudget(c) || c.authority.externalBudget===true) && c.controllerVersion===c.merge && c.controllerTree===c.tree && typeof c.dataVolume==='string' && c.dataVolume.length>0,'Controller-only installed version/shared budget mismatch');
+ if(controllerV3(c))need(exactTuple(c.installation) && same(Object.keys(c.installation).sort(),['head','issue','merge','pr','tree']) && c.installation.issue!==c.issue && c.installation.pr!==c.pr && c.originalIterations===3 && c.originalLimit===3 && c.externalIterations===1 && c.recoveryIterations===1 && c.externalBudget===undefined && c.authority.externalBudget===true && c.controllerVersion===c.installation.merge && c.controllerTree===c.installation.tree && typeof c.dataVolume==='string' && c.dataVolume.length>0,'Interrupted-review owner/installation/budget mismatch');
  const p=paths(c),names=evidenceNames(c);
  need(c.evidence && same(Object.keys(c.evidence).sort(),names.sort()),'Complete exact reconciliation evidence required');
- for(const name of names) {const ref=c.evidence[name];need(ref && (name==='controllerJournal'?ref.hash===null || hex(ref.hash):hex(ref.hash)),'Evidence hash required');need(typeof ref.path==='string' && resolve(ref.path)===ref.path,'Absolute evidence path required');if(p[name])need(ref.path===p[name],'Evidence path/scope mismatch');}
+ for(const name of names) {const ref=c.evidence[name];need(ref && (name==='controllerJournal'&&!controllerV3(c)?ref.hash===null || hex(ref.hash):hex(ref.hash)),'Evidence hash required');need(typeof ref.path==='string' && resolve(ref.path)===ref.path,'Absolute evidence path required');if(p[name])need(ref.path===p[name],'Evidence path/scope mismatch');}
  return c;
 }
 function binding(c) {
- return {v:controllerV2(c)?2:1,...(controllerV2(c)?{profile:c.profile,...(c.originalPr!==undefined?{originalPr:c.originalPr}:{}),originalLimit:c.originalLimit,controllerTree:c.controllerTree,dataVolume:c.dataVolume,...(c.externalBudget?{externalBudget:c.externalBudget}:{})}:{}),repo:c.repo,issue:c.issue,base:c.base,pr:c.pr,head:c.head,tree:c.tree,merge:c.merge,originalIterations:c.originalIterations,externalIterations:c.externalIterations,engineContainer:c.engineContainer,engineImage:c.engineImage,runnerSource:c.runnerSource,...(c.configurationHash?{configurationHash:c.configurationHash}:{}),evidence:c.evidence};
+ return {v:controllerV3(c)?3:controllerV2(c)?2:1,...(controllerV2(c)?{profile:c.profile,...(c.originalPr!==undefined?{originalPr:c.originalPr}:{}),originalLimit:c.originalLimit,controllerTree:c.controllerTree,dataVolume:c.dataVolume,...(c.externalBudget?{externalBudget:c.externalBudget}:{})}:controllerV3(c)?{profile:c.profile,originalLimit:c.originalLimit,recoveryIterations:c.recoveryIterations,installation:c.installation,controllerTree:c.controllerTree,dataVolume:c.dataVolume}:{}),repo:c.repo,issue:c.issue,base:c.base,pr:c.pr,head:c.head,tree:c.tree,merge:c.merge,originalIterations:c.originalIterations,externalIterations:c.externalIterations,engineContainer:c.engineContainer,engineImage:c.engineImage,runnerSource:c.runnerSource,...(c.configurationHash?{configurationHash:c.configurationHash}:{}),evidence:c.evidence};
 }
 function validateControllerCompletion(b,ledger,data) {
  const artifact=JSON.parse(data.publishArtifact),attempt=JSON.parse(data.recovery),review=JSON.parse(data.review),tests=JSON.parse(data.tests),install=JSON.parse(data.validation),ownership=JSON.parse(data.ownership),request=JSON.parse(data.ownershipRequest),originalManifest=JSON.parse(data.manifest);
@@ -76,12 +84,42 @@ function validateControllerCompletion(b,ledger,data) {
  }) && services.find(x=>x.service==='symphony').id===b.engineContainer,'Complete engine/auth live identity proof required');
  need(ownership.kind==='deployment-ownership-v1' && ownership.effects==='none' && ownership.repo===b.repo && ownership.base===b.base && ownership.controllerVersion===b.merge && ownership.engine===b.engineContainer && ownership.engineImage===b.engineImage && ownership.dataVolume===b.dataVolume && same(ownership.sourceRequest,b.evidence.ownershipRequest) && ownership.runtimeIdle===true && ownership.controllerLock===false && ownership.manifestContract===digest(originalManifest) && own?.ledgerHash===b.evidence.ledger.hash && own.enrollmentHash===b.evidence.enrollment.hash,'Pinned read-only live ownership evidence mismatch');
 }
+function validateInterruptedReview(b,ledger,data) {
+ const parse=name=>JSON.parse(data[name]),manifest=parse('manifest'),enrollment=parse('enrollment'),launch=parse('launchJournal'),host=parse('controllerJournal');
+ const correction=parse('correction'),recovery=parse('recovery'),authorization=parse('authorization'),recoveryAuthorization=parse('recoveryAuthorization'),install=parse('validation'),proof=parse('ownership'),request=parse('ownershipRequest');
+ const target=b.installation,p=ledger.publication,last=ledger.events?.at(-1),session=ledger.active_session;
+ need(b.v===3 && controllerV3(b) && exactTuple(target) && target.issue!==b.issue && target.pr!==b.pr && b.originalIterations===3 && b.originalLimit===3 && b.externalIterations===1 && b.recoveryIterations===1 && b.controllerTree===target.tree,'Interrupted-review receipt scope/history mismatch');
+ need(ledger.issue===b.issue && ledger.launch?.repo===b.repo && ledger.launch.issue===b.issue && ledger.launch.base===b.base && ledger.launch.limit===3 && same(manifest,ledger.launch) && same(enrollment,manifest) && ledger.iterations===3 && ledger.stage==='review' && ledger.in_flight===true && ['session_id','thread_id','turn_id'].every(k=>typeof session?.[k]==='string' && session[k].length>0) && last?.role==='build' && last.iteration===3 && last.result?.status==='complete' && !ledger.events.some(e=>e.session?.session_id===session.session_id),'Original interrupted review and last completed build required');
+ need(p?.repo===b.repo && p.issue===b.issue && p.pr===b.pr && p.base===b.base && [p.head,p.tree,p.base_head].every(sha) && Number.isSafeInteger(p.generation) && p.generation>0 && p.generation<ledger.events.length && same(ledger.resume?.publication,p) && ledger.resume?.generation===p.generation && host.done!==true && hex(host.request) && same(host.publication,p),'Unchanged original publication/controller journal required');
+ need(launch.contract===digest(manifest) && launch.dispatched===true && launch.observed===true && launch.done!==true && launch.blocker==='Issue has unresolved hold/action','Original dispatched unfinished hold-blocked launch required');
+ const hashes=x=>originalNames.every(k=>x?.[k]===b.evidence[k].hash);
+ const scoped=(x,t)=>x.repo===b.repo && same(tuple(x),tuple(t));
+ const user=x=>x.source==='explicit-user-request' && typeof x.userRequest==='string' && x.userRequest.trim().length>0;
+ need(authorization.kind==='operator-external-budget-v1' && user(authorization) && authorization.repo===b.repo && authorization.issue===Number(b.issue) && authorization.pr===b.pr && authorization.originalUsed===3 && authorization.originalLimit===3 && authorization.externalLimit===1 && authorization.totalLimit===4 && ['ledger','enrollment','manifest'].every(k=>authorization.originalHashes?.[k]===b.evidence[k].hash) && authorization.originalHashes?.launch===b.evidence.launchJournal.hash && authorization.originalHashes?.host===b.evidence.controllerJournal.hash,'Exact original3+external1 user authorization required');
+ need(recoveryAuthorization.kind==='operator-followup-authorization-v1' && user(recoveryAuthorization) && recoveryAuthorization.issue===Number(target.issue) && recoveryAuthorization.ownerIssue===Number(b.issue) && recoveryAuthorization.implementationLimit===1 && same(recoveryAuthorization.originalOwnerUsage,{originalUsed:3,originalLimit:3,externalUsed:1}),'Separate one-attempt recovery user authorization required');
+ const build=x=>x.status==='completed' && x.model==='gpt-6.1-sol' && x.reasoning==='medium' && x.fast===false && typeof x.buildSession==='string' && x.buildSession.length>0;
+ need(correction.kind==='controller-review-interrupted-correction-v3' && scoped(correction,b) && build(correction) && correction.originalUsed===3 && correction.originalLimit===3 && correction.externalUsed===1 && correction.totalUsed===4 && hashes(correction.originalHashes) && correction.authorizationHash===b.evidence.authorization.hash && same(correction.interruptedSession,session) && same(correction.publication,p),'Exact completed owner correction and original history required');
+ need(recovery.kind==='controller-review-interrupted-attempt-v3' && scoped(recovery,target) && same(recovery.owner,tuple(b)) && build(recovery) && recovery.buildSession!==correction.buildSession && recovery.execution==='external' && recovery.implementationUsed===1 && recovery.implementationLimit===1 && same(recovery.originalOwnerUsage,{originalUsed:3,originalLimit:3,externalUsed:1}) && recovery.authorizationHash===b.evidence.recoveryAuthorization.hash && recovery.correctionHash===b.evidence.correction.hash && hashes(recovery.originalHashes),'Separate external recovery implementation-used-one evidence required');
+ for(const [name,t,attempt] of [['review',b,correction],['recoveryReview',target,recovery]]) {
+  const r=parse(name);need(r.kind==='controller-review-interrupted-review-v3' && scoped(r,t) && r.status==='approved' && r.model==='gpt-6-astra' && r.reasoning==='high' && r.fast===false && typeof r.session==='string' && r.session.length>0 && ![correction.buildSession,recovery.buildSession,session.session_id].includes(r.session) && r.buildSession===attempt.buildSession,'Separate exact-head interrupted-review external review required');
+ }
+ for(const [name,t] of [['tests',b],['recoveryTests',target]]) {
+  const r=parse(name);need(r.kind==='controller-review-interrupted-tests-v3' && scoped(r,t) && r.status==='passed' && Number.isSafeInteger(r.tests) && r.tests>=444 && r.failures===0 && r.skipped===0 && ['node','syntax','diff'].every(n=>r.checks?.filter(x=>x.name===n && x.exit===0).length===1 && hex(r.logHashes?.[n])),'Exact-head interrupted-review external test evidence required');
+ }
+ need(scoped(install,target) && install.kind==='controller-review-interrupted-install-v3' && same(install.owner,tuple(b)) && install.status==='installed' && install.commit===target.merge && install.controllerVersion===target.merge && install.controllerTree===target.tree && install.engineUnchanged===true && install.engineContainer===b.engineContainer && install.engineImage===b.engineImage && install.ownershipHash===b.evidence.ownership.hash,'Recovery controller installation tuple mismatch');
+ need(request.ownershipVersion===1 && request.authority?.observe===true && request.repo===b.repo && request.issue===b.issue && request.base===b.base && request.controllerVersion===target.merge && request.dataVolume===b.dataVolume && same(request.manifest,{status:'present',value:manifest}),'Recovery installation ownership request mismatch');
+ const own=proof.ledgerHashes?.filter(r=>r.file===keyFor(b)+'.json'),services=proof.serviceEvidence?.services;
+ need(/^[a-f0-9-]{36}$/.test(proof.serviceEvidence?.kernel || '') && Array.isArray(services) && services.length===2 && ['symphony','github-auth'].every(service=>{
+  const rows=services.filter(x=>x.service===service),x=rows[0];return rows.length===1 && hex(x.id) && /^sha256:[a-f0-9]{64}$/.test(x.image) && hex(x.runtimeHash) && Array.isArray(x.mountHashes) && x.mountHashes.length>0 && x.mountHashes.every(m=>['bind','volume'].includes(m.type) && typeof m.destination==='string' && typeof m.rw==='boolean' && hex(m.identityHash));
+ }) && services.find(x=>x.service==='symphony').id===b.engineContainer && services.find(x=>x.service==='symphony').image===b.engineImage,'Complete recovery engine/auth live identity proof required');
+ need(proof.kind==='deployment-ownership-v1' && proof.effects==='none' && proof.repo===b.repo && proof.base===b.base && proof.controllerVersion===target.merge && proof.engine===b.engineContainer && proof.engineImage===b.engineImage && proof.dataVolume===b.dataVolume && same(proof.sourceRequest,b.evidence.ownershipRequest) && proof.runtimeIdle===true && proof.controllerLock===false && proof.manifestContract===digest(manifest) && own?.length===1 && own[0].ledgerHash===b.evidence.ledger.hash && own[0].enrollmentHash===b.evidence.enrollment.hash,'Pinned recovery read-only ownership evidence mismatch');
+}
 // The receipt is an additional historical fact, never runner completion or a budget reset.
 export async function verifiedExternalReceipt(c,key,observation) {
  const dir=join(c.stateRoot,key),path=join(dir,'external-reconciliation.json');
  const receipt=await optional(path);if(!receipt)return false;
  await privatePath(path);const b=receipt.binding;
- need(((receipt.v===1 && b?.v===1 && b.profile===undefined)||(receipt.v===2 && b?.v===2 && controllerV2(b))) && receipt.status==='externally-reconciled' && receipt.done===true && sha(receipt.controllerVersion) && b.repo===c.repo && b.base===c.base && key===keyFor(b) && receipt.id===digest(b) && [b.head,b.tree,b.merge].every(sha),'Invalid external reconciliation receipt');
+ need(((receipt.v===1 && b?.v===1 && b.profile===undefined)||(receipt.v===2 && b?.v===2 && controllerV2(b))||(receipt.v===3 && b?.v===3 && controllerV3(b))) && receipt.status==='externally-reconciled' && receipt.done===true && sha(receipt.controllerVersion) && b.repo===c.repo && b.base===c.base && key===keyFor(b) && receipt.id===digest(b) && [b.head,b.tree,b.merge].every(sha),'Invalid external reconciliation receipt');
  need(same(Object.keys(b.evidence).sort(),evidenceNames(b).sort()),'Incomplete reconciliation receipt');
  const scope={...c,issue:b.issue},expected=paths(scope);
  need(receipt.archive===join(dir,'external-reconciliation',receipt.id),'Reconciliation archive path mismatch');
@@ -97,11 +135,12 @@ export async function verifiedExternalReceipt(c,key,observation) {
   const archived={path:join(receipt.archive,name),hash:ref.hash};await bytes(archived);
  }
  const ledger=JSON.parse(observation?Buffer.from(observation.rows.find(r=>r.file===key+'.json').bytes,'base64'):await readFile(b.evidence.ledger.path));
- need(ledger.issue===b.issue && ledger.launch?.repo===b.repo && ledger.launch.base===b.base && ledger.launch.limit===(controllerV2(b)?b.originalLimit:b.originalIterations) && keyFor(ledger.launch)===key && ledger.iterations===b.originalIterations,'Receipt ledger scope/history mismatch');
+ need(ledger.issue===b.issue && ledger.launch?.repo===b.repo && ledger.launch.base===b.base && ledger.launch.limit===(controllerProfile(b)?b.originalLimit:b.originalIterations) && keyFor(ledger.launch)===key && ledger.iterations===b.originalIterations,'Receipt ledger scope/history mismatch');
  need(same(JSON.parse(await readFile(join(receipt.archive,'manifest'))),ledger.launch),'Archived manifest scope mismatch');
- if(controllerV2(b)) {
+ if(controllerProfile(b)) {
   const data={};for(const name of evidenceNames(b))if(b.evidence[name].hash!==null)data[name]=await readFile(join(receipt.archive,name));
-  need(receipt.controllerVersion===b.merge,'Receipt controller version mismatch');validateControllerCompletion(b,ledger,data);
+  need(receipt.controllerVersion===installation(b).merge,'Receipt controller version mismatch');
+  if(controllerV3(b))validateInterruptedReview(b,ledger,data);else validateControllerCompletion(b,ledger,data);
  } else {
   const recovery=JSON.parse(await readFile(b.evidence.recovery.path)),validation=JSON.parse(await readFile(b.evidence.validation.path));
   need(recovery.issue===Number(b.issue) && recovery.pr===b.pr && recovery.head===b.head && recovery.tree===b.tree && recovery.previous_iterations===b.originalIterations && recovery.additional_iterations_used===b.externalIterations && validation.commit===b.merge && validation.head===b.head && validation.tree===b.tree,'Receipt external completion/history mismatch');
@@ -165,14 +204,15 @@ export async function reconcileExternal(c,io,{check=false}={}) {
   if(intent) {data[name]=await bytes({path:join(archive,name),hash:c.evidence[name].hash});}
  }
  const ledger=JSON.parse(data.ledger),manifest=JSON.parse(data.manifest),launch=JSON.parse(data.launchJournal),recovery=JSON.parse(data.recovery),validation=JSON.parse(data.validation),originalGate=JSON.parse(data.gate);
- need(ledger.issue===c.issue && ledger.launch?.repo===c.repo && ledger.launch.issue===c.issue && ledger.launch.base===c.base && same(ledger.launch,manifest) && ledger.iterations===c.originalIterations && ledger.launch.limit===(controllerV2(c)?c.originalLimit:c.originalIterations) && ledger.in_flight===true && ledger.stage==='blocked' && ledger.active_session && Array.isArray(ledger.events),'Exact interrupted runner history required');
+ need(ledger.issue===c.issue && ledger.launch?.repo===c.repo && ledger.launch.issue===c.issue && ledger.launch.base===c.base && same(ledger.launch,manifest) && ledger.iterations===c.originalIterations && ledger.launch.limit===(controllerProfile(c)?c.originalLimit:c.originalIterations) && ledger.in_flight===true && ledger.stage===(controllerV3(c)?'review':'blocked') && ledger.active_session && Array.isArray(ledger.events),'Exact interrupted runner history required');
  need(launch.contract===digest(manifest) && launch.dispatched===true && !launch.done,'Original interrupted launch journal required');
- if(controllerV2(c)) {
-  validateControllerCompletion(b,ledger,data);
-  need(same(await io.installedController(),{commit:c.merge,tree:c.tree}),'Installed controller commit/tree changed');
+ if(controllerProfile(c)) {
+  if(controllerV3(c))validateInterruptedReview(b,ledger,data);else validateControllerCompletion(b,ledger,data);
+  const installed=installation(c);
+  need(same(await io.installedController(),{commit:installed.merge,tree:installed.tree}),'Installed controller commit/tree changed');
   const live=await io.ownership({retired:!!intent && !await optional(p.manifest)});
   const proof=JSON.parse(data.ownership);
-  need(live.kind===proof.kind && live.effects==='none' && live.engine===c.engineContainer && live.engineImage===c.engineImage && live.dataVolume===c.dataVolume && live.controllerVersion===c.merge && same(live.sourceRequest,c.evidence.ownershipRequest) && same(live.ledgerHashes,proof.ledgerHashes) && same(live.serviceEvidence,proof.serviceEvidence) && live.runtimeIdle===true,'Current live ownership changed');
+  need(live.kind===proof.kind && live.effects==='none' && live.engine===c.engineContainer && live.engineImage===c.engineImage && live.dataVolume===c.dataVolume && live.controllerVersion===installed.merge && same(live.sourceRequest,c.evidence.ownershipRequest) && same(live.ledgerHashes,proof.ledgerHashes) && same(live.serviceEvidence,proof.serviceEvidence) && live.runtimeIdle===true,'Current live ownership changed');
  } else {
   need(recovery.issue===Number(c.issue) && recovery.pr===c.pr && recovery.head===c.head && recovery.tree===c.tree && recovery.previous_iterations===c.originalIterations && recovery.additional_iterations_used===c.externalIterations && recovery.status==='fourth-complete-validated' && recovery.original_ledger_unchanged===true && recovery.docker_tests?.failed===0 && recovery.docker_tests.tests>0,'External recovery history/validation mismatch');
   need(validation.status==='deployed' && validation.commit===c.merge && validation.head===c.head && validation.tree===c.tree && validation.image===c.engineImage && validation.original_interrupted_ledger_preserved===true,'Pinned external completion validation mismatch');
@@ -184,6 +224,13 @@ export async function reconcileExternal(c,io,{check=false}={}) {
  need(pr.merged===true && pr.state==='closed' && pr.head?.sha===c.head && pr.head.repo?.full_name===c.repo && pr.base?.ref===c.base && pr.base.repo?.full_name===c.repo && pr.merge_commit_sha===c.merge,'Exact merged external PR mismatch');
  const [head,merge]=await Promise.all([c.head,c.merge].map(s=>io.api('GET',`/repos/${c.repo}/git/commits/${s}`)));
  need(head.tree?.sha===c.tree && merge.tree?.sha===c.tree && merge.parents?.some(p=>p.sha===c.head),'External head/tree/merge mismatch');
+ if(controllerV3(c)) {
+  const t=c.installation,issue=await io.api('GET',`/repos/${c.repo}/issues/${t.issue}`),pr=await io.api('GET',`/repos/${c.repo}/pulls/${t.pr}`);
+  need(['open','closed'].includes(issue.state) && String(issue.number)===t.issue && !issue.pull_request && Array.isArray(issue.labels) && !issue.labels.some(l=>['momoflow:ready','momoflow:needs-decision','momoflow:needs-review'].includes(l.name)),'Recovery issue is not safely non-ready/without hold');
+  need(pr.merged===true && pr.state==='closed' && pr.head?.sha===t.head && pr.head.repo?.full_name===c.repo && pr.base?.ref===c.base && pr.base.repo?.full_name===c.repo && pr.merge_commit_sha===t.merge,'Exact merged recovery PR mismatch');
+  const [head,merge]=await Promise.all([t.head,t.merge].map(s=>io.api('GET',`/repos/${c.repo}/git/commits/${s}`)));
+  need(head.tree?.sha===t.tree && merge.tree?.sha===t.tree && merge.parents?.some(p=>p.sha===t.head),'Recovery head/tree/merge mismatch');
+ }
  need((await list(io.api,`/repos/${c.repo}/issues?state=open&labels=momoflow%3Aready`)).length===0,'Another issue is executable');
  need(await io.workers()===true,'Active or uncertain engine processes');
  const active=await optional(p.manifest),gate=await json(p.gate);
@@ -232,7 +279,7 @@ export async function reconciliationPorts(c) {
  const io={api,engine,authorize:async()=>{await privatePath(c.configFile);need(digest(await readFile(c.configFile))===settings,'Reconciliation authority/config changed');await verifyInstall(c);await operator();},
   workers:()=>observeReconciliationWorkers(c,docker),
   ack:async(manifest,gate)=>{const end=Date.now()+10000;for(;;){try{idle(c,await engine(),manifest,gate);return;}catch(e){if(Date.now()>=end)throw e;await new Promise(r=>setTimeout(r,100));}}}};
- if(controllerV2(c)) {
+ if(controllerProfile(c)) {
   io.installedController=async()=>{
    const r=await command('git',['-C',c.trustedRoot,'rev-parse','HEAD','HEAD^{tree}']);need(r.exit===0,'Controller version observation unavailable');
    const [commit,tree]=r.output.toString().trim().split('\n');return {commit,tree};
@@ -298,7 +345,7 @@ export async function verifyReconciliationOperator(c,{docker,containerized,hostn
  const image=await inspect(c.operatorImage);
  need(image?.Id===c.operatorImage && same([...(operator.Config.Env || [])].sort(),[...(image.Config?.Env || [])].sort()),'Operator image environment overridden');
  need(c.ledgerRoot==='/engine-data/log/roles' && c.tokenFile==='/run/momoflow-auth/token.json','Live operator ledger/auth paths required');
- const binds=[[c.trustedRoot,false],[dirname(c.configFile),false],[c.stateRoot,true],[c.inboxRoot,true],[c.launchRoot,true],[c.gateRoot,true],['/tmp',true],['/var/run/docker.sock',true],[c.evidence.recovery.path,false],[c.evidence.validation.path,false],...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest',...(extendedBudget(c)?['authorization']:[])].map(k=>[c.evidence[k].path,false]):[])];
+ const binds=[[c.trustedRoot,false],[dirname(c.configFile),false],[c.stateRoot,true],[c.inboxRoot,true],[c.launchRoot,true],[c.gateRoot,true],['/tmp',true],['/var/run/docker.sock',true],[c.evidence.recovery.path,false],[c.evidence.validation.path,false],...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest',...(extendedBudget(c)?['authorization']:[])]:controllerV3(c)?v3Evidence:[]).map(k=>[c.evidence[k].path,false])];
  for(const ref of await historicalEvidence(c)) {
   const existing=binds.find(([path])=>path===ref.path);
   need(!existing || existing[1]===false,'Historical evidence must be read-only');if(!existing)binds.push([ref.path,false]);

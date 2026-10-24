@@ -463,3 +463,72 @@ host 병합 후 마무리를 연결한다. host/launch의 done은 계속 코드 
 [설정·journal·중복·복구 계약](deployment.md#gh-30-후보-최초-launch에-묶는-정상-마무리)을
 따른다. 외부 exact-head 검증·별도 리뷰·예외 설치 전이며, 이번 호스트/정책 변경 자체를
 일반 자동 배포 성공으로 표시하지 않는다. 기존 GH20/GH24 원본과 receipt를 수정하지 않는다.
+
+### Review-interrupted controller receipt v3 (GH-32 후보)
+
+`profile:"controller-review-interrupted-v3"`는 GH30의 **리뷰 도중 중단된 원본**을 보존하고,
+사용자가 승인한 외부 수정 1회와 별도 GH32 복구 구현 1회의 완료를 연결한다. v1 및
+`controller-only-v2`의 상태·예산·증거 계약은 그대로다. runner를 재개하거나 review 완료,
+숫자 publication 오류 또는 배포 성공을 원본에 만들어 쓰지 않는다. 이 후보의 병합·고정
+설치·실제 CLI 정리는 각각 별도 검증이며, Node 모의 효과 테스트는 실제 정리 증거가 아니다.
+
+설정의 `issue/pr/head/tree/merge`는 **원래 완료한 GH30/PR31의 최종 reviewed head/tree와
+merge**다. `installation:{issue,pr,head,tree,merge}`는 **GH32 복구 PR의 별도 tuple**이며
+issue는 문자열이다. 실제 recovery PR 번호와 merge가 정해진 뒤 운영자가 고정한다.
+두 PR 모두 현재 GitHub의 merged/closed, repo/base, head/tree/merge 부모를 다시 확인하고,
+원래 owner 이슈는 closed/non-ready여야 한다. recovery 이슈는 정리 성공 전까지 open일 수
+있으며 open/closed 모두 허용하지만 ready/needs-decision/needs-review는 없어야 한다.
+정리 전 recovery 이슈를 먼저 닫지 않는다. owner와 installation의 issue/PR은 달라야 한다.
+`controllerVersion:installation.merge`, `controllerTree:installation.tree`와 clean checkout의
+실제 HEAD/tree가 일치해야 한다. GH30 merge를 controllerVersion으로 대체하지 않는다.
+
+`originalIterations:3`, `originalLimit:3`, `externalIterations:1`, `recoveryIterations:1`,
+`authority.externalBudget:true`를 명시한다. v2의 `externalBudget` object를 사용하지 않는다.
+GH30의 3+1과 GH32의 외부 구현 1회를 하나의 runner 예산으로 합치거나 초기화하지 않는다.
+
+원본 여섯 evidence는 기존 canonical 설치 경로의 `ledger`, `enrollment`, `manifest`,
+`launchJournal`, `controllerJournal`, `gate`다. 모두 정확한 원본 바이트 hash가 필수이며
+controller journal의 부재는 이 profile에서 허용하지 않는다. 원본은 다음 상태여야 한다.
+
+- ledger: stage review, iterations/launch.limit 3, in_flight true, session_id/thread_id/turn_id를
+  가진 active_session 유지. 마지막 event는 iteration 3의 완료된 build이며 active_session의
+  완료 event는 없어야 한다. enrollment·manifest·ledger.launch는 키 순서와 무관하게 같다.
+- 원래 publication은 string issue와 기존 PR, head/tree/base_head/generation을 유지하고,
+  resume publication/generation 및 미완료 controller journal의 publication과 일치한다.
+  이전 publication을 최종 외부 head로 바꾸지 않는다.
+- launch journal: dispatched/observed true, done 아님, 원본 manifest contract와
+  `blocker:"Issue has unresolved hold/action"` 유지. 실제 source 바이트가 달라지면 차단한다.
+
+나머지 evidence 이름과 record는 아래와 같다. 모든 ref는 `{path,hash}`이며 hash는 원본
+바이트 SHA-256이다. `scope`는 `repo`와 해당 tuple의 string issue/pr/head/tree/merge를 뜻한다.
+`originalHashes`는 원본 여섯 evidence 이름을 모두 포함한다.
+
+| Evidence | 필수 record |
+| --- | --- |
+| authorization | 기존 GH30 `operator-external-budget-v1` 원본: explicit-user-request/userRequest, repo/numeric issue/pr, originalUsed 3/originalLimit 3/externalLimit 1/totalLimit 4. originalHashes의 ledger/enrollment/manifest 및 launch/host가 현재 원본 launchJournal/controllerJournal hash와 정확히 같음 |
+| correction | `controller-review-interrupted-correction-v3`, owner scope, completed, originalUsed 3/originalLimit 3/externalUsed 1/totalUsed 4, originalHashes, authorizationHash, 원본 interruptedSession와 publication |
+| recoveryAuthorization | 기존 GH32 `operator-followup-authorization-v1` 원본: explicit-user-request/userRequest, numeric issue 32와 ownerIssue 30, implementationLimit 1, originalOwnerUsage `{originalUsed:3,originalLimit:3,externalUsed:1}` |
+| recovery | `controller-review-interrupted-attempt-v3`, installation scope, completed, owner tuple, execution external, implementationUsed/implementationLimit 1, originalOwnerUsage, originalHashes, recoveryAuthorization의 authorizationHash와 correctionHash |
+| review / recoveryReview | `controller-review-interrupted-review-v3`, 각각 owner/installation scope, approved, model gpt-6-astra/reasoning high/fast false, buildSession 및 그 build들과 중단된 runner session과 다른 session |
+| tests / recoveryTests | `controller-review-interrupted-tests-v3`, 각각 owner/installation scope, passed, tests ≥444/failures 0/skipped 0, node/syntax/diff 각각 exit 0과 logHashes |
+| validation | `controller-review-interrupted-install-v3`, installation scope, owner tuple, installed, commit/controllerVersion installation.merge, controllerTree installation.tree, engineUnchanged true, engineContainer/engineImage, ownershipHash |
+| ownership / ownershipRequest | 기존 full host ownership CLI의 결과와 원본 요청. controllerVersion은 installation.merge, request issue는 owner issue, manifest는 원본 present value. 현재 engine/auth의 전체 live runtime/mount identity 및 ledger/enrollment hash를 포함 |
+
+correction과 recovery의 build record는 서로 다른 실제 buildSession,
+model gpt-6.1-sol/reasoning medium/fast false를 기록한다. 승인 원본 두 파일은 재작성하지
+않는다. GH30 승인에 묶인 host 원본이 현재 controller journal과 다르면 이전 snapshot으로
+대체해 진행하지 않는다. 정확한 원본·권한과 운영자 판단이 먼저 필요하다.
+
+v2와 동일하게 full host에서 `deploy.mjs <ownershipRequest> --ownership-check`를 실행하여
+깨끗한 recovery controller 버전의 proof를 만든다. 이때 원래 중단 owner 때문에 ownersIdle가
+false인 것을 고치지 않는다. 기존 reconciliation helper의 보안·network·live ledger/auth volume
+계약을 그대로 쓰고, recovery/validation 외에 위 나머지 9개 evidence 파일만 같은 absolute
+경로로 각각 RO 연결한다. 키·secret parent·새 임의 mount는 허용하지 않는다. helper는 live
+ledger/enrollment 및 양 서비스의 kernel/runtime/mount hash를 매 transaction 검사에서 다시 읽는다.
+
+명령은 기존 `reconcile-external.mjs <private-config> --check|--apply`다. --check는 읽기 전용이고,
+--apply는 기존 shared lock 아래 원본·증거 전체 fsync archive → admission fence/ack → 원격
+두 PR 및 live owner 재검사 → exact manifest만 퇴역 → absent ack → 원본 gate 복원/ack → v3
+receipt 순서다. 기존 중복·crash checkpoint를 재사용한다. 원본 ledger/enrollment/launch/host,
+active_session, in_flight 및 사용 횟수는 수정하지 않는다. 후속 다른 이슈의 launch/deploy만
+동일 receipt/source/archive를 다시 검증하여 이 과거 owner를 인정할 수 있다. 자동 dispatch는 없다.

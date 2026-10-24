@@ -167,6 +167,16 @@ test('trusted existing helper adapter proves current read-only ledger/auth backi
  const f=operatorFixture();await f.verify();assert.ok(f.calls.every(a=>a[0]==='inspect'));
  await verifyReconciliationOperator(f.c,{containerized:false,docker:async()=>assert.fail('host must not adopt a helper')});
 });
+test('interrupted-review helper adds only the exact immutable evidence RO mounts',async()=>{
+ const f=operatorFixture();f.c.profile='controller-review-interrupted-v3';
+ for(const name of ['correction','review','tests','authorization','recoveryAuthorization','recoveryReview','recoveryTests','ownership','ownershipRequest']) {
+  const path='/evidence/'+name+'.json',m={Type:'bind',Source:path,Destination:path,RW:false};f.c.evidence[name]={path,hash:hex(7)};f.operator.Mounts.push(m);f.context.mounted.set(m,{identity:path});
+ }
+ await f.verify();const auth=f.operator.Mounts.find(m=>m.Destination===f.c.evidence.authorization.path);
+ auth.RW=true;await assert.rejects(f.verify(),/source\/authority/);auth.RW=false;
+ auth.Source='/copied-authorization';await assert.rejects(f.verify(),/source\/authority/);auth.Source=auth.Destination;
+ f.operator.Mounts.push({Type:'bind',Source:'/private-key',Destination:'/private-key',RW:false});await assert.rejects(f.verify(),/Unexpected operator mounts/);
+});
 test('alternate state bind with copied journals and self-consistent helper backing is rejected before context or effects',async()=>{
  const f=operatorFixture(),state=f.operator.Mounts.find(m=>m.Destination===f.c.stateRoot),originalHost=f.context.host;
  state.Source='/another-operator-state';f.context.mounted.set(state,{identity:state.Source});
@@ -284,6 +294,126 @@ async function controllerSetup() {
  f.io.installedController=async()=>({commit:c.merge,tree:c.tree});f.io.ownership=async()=>JSON.parse(await readFile(f.paths.ownership));f.pin=pin;
  return f;
 }
+async function interruptedReviewSetup({ordered=false}={}) {
+ const f=await controllerSetup(),c=f.c;
+ Object.assign(c,{profile:'controller-review-interrupted-v3',originalIterations:3,originalLimit:3,externalIterations:1,recoveryIterations:1,installation:{issue:'32',pr:33,head:sha(6),tree:sha(7),merge:sha(8)},controllerVersion:sha(8),controllerTree:sha(7)});c.authority.externalBudget=true;
+ delete c.evidence.publishArtifact;
+ const publication={repo:c.repo,issue:c.issue,pr:c.pr,base:c.base,head:sha(9),tree:sha(9),base_head:sha(0),generation:2};
+ Object.assign(f.ledger,{iterations:3,stage:'review',active_session:{session_id:'interrupted-review',thread_id:'review-thread',turn_id:'review-turn'},events:[{role:'plan'},{role:'build',iteration:2,result:{status:'complete'},session:{session_id:'old-build'}},{role:'build',iteration:3,result:{status:'complete'},session:{session_id:'original-third-build'}}],publication,resume:{generation:2,publication}});delete f.ledger.reason;
+ if(ordered)f.ledger.launch=Object.fromEntries(Object.entries(f.manifest).sort(([a],[b])=>a.localeCompare(b)));
+ await f.pin('ledger',f.ledger);await f.pin('enrollment',f.ledger.launch);
+ await f.pin('launchJournal',{contract:digest(f.manifest),dispatched:true,observed:true,blocker:'Issue has unresolved hold/action'});
+ await f.pin('controllerJournal',{request:hex(7),publication,validation:{kind:'passed',head:publication.head,tree:publication.tree}});
+ const originalHashes=Object.fromEntries(['ledger','enrollment','manifest','launchJournal','controllerJournal','gate'].map(k=>[k,c.evidence[k].hash]));
+ const owner={issue:c.issue,pr:c.pr,head:c.head,tree:c.tree,merge:c.merge},scope={repo:c.repo,...owner},target={repo:c.repo,...c.installation};
+ await f.pin('authorization',{kind:'operator-external-budget-v1',repo:c.repo,issue:Number(c.issue),pr:c.pr,source:'explicit-user-request',userRequest:'추가 1회 승인',originalUsed:3,originalLimit:3,externalLimit:1,totalLimit:4,originalHashes:{ledger:originalHashes.ledger,enrollment:originalHashes.enrollment,manifest:originalHashes.manifest,launch:originalHashes.launchJournal,host:originalHashes.controllerJournal}});
+ await f.pin('recoveryAuthorization',{kind:'operator-followup-authorization-v1',issue:32,ownerIssue:Number(c.issue),source:'explicit-user-request',userRequest:'#32 복구 1회 승인',implementationLimit:1,originalOwnerUsage:{originalUsed:3,originalLimit:3,externalUsed:1}});
+ const build={status:'completed',model:'gpt-6.1-sol',reasoning:'medium',fast:false};
+ await f.pin('correction',{kind:'controller-review-interrupted-correction-v3',...scope,...build,buildSession:'owner-external-build',originalUsed:3,originalLimit:3,externalUsed:1,totalUsed:4,originalHashes,authorizationHash:c.evidence.authorization.hash,interruptedSession:f.ledger.active_session,publication});
+ await f.pin('recovery',{kind:'controller-review-interrupted-attempt-v3',...target,...build,buildSession:'recovery-external-build',owner,execution:'external',implementationUsed:1,implementationLimit:1,originalOwnerUsage:{originalUsed:3,originalLimit:3,externalUsed:1},originalHashes,authorizationHash:c.evidence.recoveryAuthorization.hash,correctionHash:c.evidence.correction.hash});
+ for(const [name,s,attempt] of [['review',scope,'owner-external-build'],['recoveryReview',target,'recovery-external-build']])await f.pin(name,{kind:'controller-review-interrupted-review-v3',...s,status:'approved',model:'gpt-6-astra',reasoning:'high',fast:false,buildSession:attempt,session:name+'-separate-session'});
+ for(const [name,s] of [['tests',scope],['recoveryTests',target]])await f.pin(name,{kind:'controller-review-interrupted-tests-v3',...s,status:'passed',tests:444,failures:0,skipped:0,checks:['node','syntax','diff'].map(name=>({name,exit:0})),logHashes:{node:hex(1),syntax:hex(2),diff:hex(3)}});
+ const request=JSON.parse(await readFile(f.paths.ownershipRequest));Object.assign(request,{issue:c.issue,controllerVersion:c.installation.merge,manifest:{status:'present',value:f.manifest}});await f.pin('ownershipRequest',request);
+ const proof=JSON.parse(await readFile(f.paths.ownership));Object.assign(proof,{controllerVersion:c.installation.merge,sourceRequest:c.evidence.ownershipRequest,ledgerHashes:[{file:keyFor(c)+'.json',ledgerHash:c.evidence.ledger.hash,enrollmentHash:c.evidence.enrollment.hash}]});await f.pin('ownership',proof);
+ await f.pin('validation',{kind:'controller-review-interrupted-install-v3',...target,owner,status:'installed',commit:c.installation.merge,controllerVersion:c.installation.merge,controllerTree:c.installation.tree,engineUnchanged:true,engineContainer:c.engineContainer,engineImage:c.engineImage,ownershipHash:c.evidence.ownership.hash});
+ f.io.installedController=async()=>({commit:c.installation.merge,tree:c.installation.tree});
+ const api=f.io.api;f.io.api=async(m,p)=>{
+  if(p.endsWith('/issues/32')){f.calls.push({method:m,path:p});return {number:32,state:'open',labels:[]};}
+  if(p.endsWith('/pulls/33')){f.calls.push({method:m,path:p});return {state:'closed',merged:true,merge_commit_sha:c.installation.merge,head:{sha:c.installation.head,repo:{full_name:c.repo}},base:{ref:c.base,repo:{full_name:c.repo}}};}
+  if([c.installation.head,c.installation.merge].some(s=>p.endsWith('/git/commits/'+s))){f.calls.push({method:m,path:p});return {tree:{sha:c.installation.tree},parents:[{sha:c.installation.head}]};}
+  return api(m,p);
+ };
+ return f;
+}
+test('interrupted review v3 with open non-ready recovery issue preserves original3+external1 and one recovery implementation',async()=>{
+ const f=await interruptedReviewSetup();try {
+  const before=await snapshot(f.root);const check=await reconcileExternal(f.c,f.io,{check:true});assert.equal(check.status,'eligible');assert.deepEqual(await snapshot(f.root),before);
+  await f.run();const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));
+  assert.equal(r.v,3);assert.equal(r.binding.pr,21);assert.equal(r.binding.installation.pr,33);assert.equal(r.binding.originalIterations,3);assert.equal(r.binding.externalIterations,1);assert.equal(r.binding.recoveryIterations,1);assert.equal(r.controllerVersion,f.c.installation.merge);
+  for(const name of ['ledger','enrollment','launchJournal','controllerJournal','gate'])assert.equal(digest(await readFile(f.paths[name])),before[f.paths[name].slice(f.root.length)]);
+  assert.equal(JSON.parse(await readFile(f.paths.ledger)).stage,'review');
+  for(const name of Object.keys(f.c.evidence))assert.equal(digest(await readFile(join(r.archive,name))),f.c.evidence[name].hash);
+  const observation=await liveObservation(f);assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);assert.equal(await deploymentOwnersIdle(f.c,observation.rows,observation),true);
+  await foreignOwners({...f.c,issue:'34'});const after=await snapshot(f.root);assert.equal((await f.run()).unchanged,true);assert.deepEqual(await snapshot(f.root),after);
+  assert.ok(f.calls.some(x=>x.path.endsWith('/pulls/21')));assert.ok(f.calls.some(x=>x.path.endsWith('/pulls/33')));assert.ok(f.calls.every(x=>x.method==='GET'));
+ }finally{await f.clean();}
+});
+test('interrupted review v3 accepts original manifest/enrollment key-order difference without changing bytes',async()=>{
+ const f=await interruptedReviewSetup({ordered:true});try {
+  assert.notEqual(digest(f.manifest),digest(f.ledger.launch));assert.deepEqual(f.manifest,f.ledger.launch);
+  const ledger=await readFile(f.paths.ledger),enrollment=await readFile(f.paths.enrollment),manifest=await readFile(f.paths.manifest);
+  await f.run();assert.deepEqual(await readFile(f.paths.ledger),ledger);assert.deepEqual(await readFile(f.paths.enrollment),enrollment);
+  const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));assert.deepEqual(await readFile(join(r.archive,'manifest')),manifest);assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
+ }finally{await f.clean();}
+});
+for(const phase of ['intent','fence-written','fenced','manifest-retired','gate-restored','receipt'])test('interrupted review v3 retains existing crash checkpoint '+phase,async()=>{
+ const f=await interruptedReviewSetup();try {
+  let failed=false;f.io.checkpoint=async p=>{if(p===phase&&!failed){failed=true;throw Error('crash');}};
+  await assert.rejects(f.run(),/crash/);await f.run();assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
+  assert.deepEqual(JSON.parse(await readFile(f.paths.gate)),f.gate);
+ }finally{await f.clean();}
+});
+const editEvidence=async(f,name,change)=>{const value=JSON.parse(await readFile(f.paths[name]));change(value);await f.pin(name,value);};
+for(const [name,change] of [
+ ['blocked stage',f=>editEvidence(f,'ledger',x=>{x.stage='blocked';})],
+ ['wrong original count',f=>{f.c.originalIterations=2;}],['extra owner correction',f=>{f.c.externalIterations=2;}],['extra recovery implementation',f=>{f.c.recoveryIterations=2;}],
+ ['missing active session',f=>editEvidence(f,'ledger',x=>{delete x.active_session;})],
+ ['completed active session',f=>editEvidence(f,'ledger',x=>{x.active_session.session_id='original-third-build';})],
+ ['completed review instead of last build',f=>editEvidence(f,'ledger',x=>{x.events.at(-1).role='review';})],
+ ['wrong last build iteration',f=>editEvidence(f,'ledger',x=>{x.events.at(-1).iteration=2;})],
+ ['changed publication',f=>editEvidence(f,'ledger',x=>{x.publication.pr=99;})],
+ ['changed controller publication',f=>editEvidence(f,'controllerJournal',x=>{x.publication.head=sha(4);})],
+ ['manufactured enrollment',f=>editEvidence(f,'enrollment',x=>{x.limit=2;})],
+ ['completed launch',f=>editEvidence(f,'launchJournal',x=>{x.done=true;})],
+ ['different launch blocker',f=>editEvidence(f,'launchJournal',x=>{x.blocker='different';})],
+ ['absent controller journal',f=>{f.c.evidence.controllerJournal.hash=null;}],
+ ['owner authorization source',f=>editEvidence(f,'authorization',x=>{x.source='label';})],
+ ['owner authorization hash',f=>editEvidence(f,'authorization',x=>{x.originalHashes.host=hex(9);})],
+ ['recovery authorization owner',f=>editEvidence(f,'recoveryAuthorization',x=>{x.ownerIssue=99;})],
+ ['recovery authorization allocation',f=>editEvidence(f,'recoveryAuthorization',x=>{x.implementationLimit=2;})],
+ ['missing external authority',f=>{f.c.authority.externalBudget=false;}],
+ ['owner correction counter',f=>editEvidence(f,'correction',x=>{x.externalUsed=2;})],
+ ['owner correction session',f=>editEvidence(f,'correction',x=>{x.interruptedSession.turn_id='other';})],
+ ['recovery uses runner',f=>editEvidence(f,'recovery',x=>{x.execution='runner';})],
+ ['recovery used count',f=>editEvidence(f,'recovery',x=>{x.implementationUsed=0;})],
+ ['recovery wrong owner',f=>editEvidence(f,'recovery',x=>{x.owner.pr=99;})],
+ ['review wrong owner head',f=>editEvidence(f,'review',x=>{x.head=sha(4);})],
+ ['review wrong recovery head',f=>editEvidence(f,'recoveryReview',x=>{x.head=sha(4);})],
+ ['recovery self review',f=>editEvidence(f,'recoveryReview',x=>{x.session='recovery-external-build';})],
+ ['failed owner tests',f=>editEvidence(f,'tests',x=>{x.failures=1;})],
+ ['skipped recovery tests',f=>editEvidence(f,'recoveryTests',x=>{x.skipped=1;})],
+ ['installed owner instead of recovery',f=>{f.io.installedController=async()=>({commit:f.c.merge,tree:f.c.tree});}],
+ ['installation tuple equals owner',f=>{f.c.installation={issue:f.c.issue,pr:f.c.pr,head:f.c.head,tree:f.c.tree,merge:f.c.merge};}],
+ ['installation proof uses owner merge',f=>editEvidence(f,'validation',x=>{x.commit=f.c.merge;})],
+ ['ownership request uses owner controller',f=>editEvidence(f,'ownershipRequest',x=>{x.controllerVersion=f.c.merge;})],
+ ['stale live ledger',f=>{const own=f.io.ownership;f.io.ownership=async()=>({...await own(),ledgerHashes:[]});}],
+ ['changed live auth',f=>{const own=f.io.ownership;f.io.ownership=async()=>({...await own(),serviceEvidence:{kernel:'changed',services:[]}});}],
+ ['active workers',f=>{f.workers=false;}],
+ ['foreign owner',async f=>atomic(join(f.c.ledgerRoot,hex(9)+'.json'),{stage:'review',in_flight:true})],
+ ['foreign controller lock',async f=>atomic(join(f.dir,'lock'),{pid:999})],
+ ...['momoflow:ready','momoflow:needs-decision','momoflow:needs-review'].map(label=>['recovery issue '+label,f=>{
+  const api=f.io.api;f.io.api=async(m,p)=>p.endsWith('/issues/32')?{...await api(m,p),labels:[{name:label}]}:api(m,p);
+ }]),
+ ['open owner issue',f=>{const api=f.io.api;f.io.api=async(m,p)=>p.endsWith('/issues/1')?{...await api(m,p),state:'open'}:api(m,p);}],
+ ...['owner','recovery'].flatMap(which=>['head','tree','merge'].map(field=>[which+' remote '+field,f=>{
+  const api=f.io.api,t=which==='owner'?f.c:f.c.installation;
+  f.io.api=async(m,p)=>{
+   const r=await api(m,p);
+   if(field==='head'&&p.endsWith('/pulls/'+t.pr))return {...r,head:{sha:sha(4),repo:{full_name:f.c.repo}}};
+   if(field==='tree'&&p.endsWith('/git/commits/'+t.head))return {...r,tree:{sha:sha(4)}};
+   if(field==='merge'&&p.endsWith('/pulls/'+t.pr))return {...r,merge_commit_sha:sha(4)};
+   return r;
+  };
+ }]))
+])test('interrupted review v3 rejects '+name+' before effects',async()=>{
+ const f=await interruptedReviewSetup();try{await change(f);const before=await snapshot(f.root);await assert.rejects(f.run());assert.deepEqual(await snapshot(f.root),before);}finally{await f.clean();}
+});
+for(const name of ['ledger','enrollment','launchJournal','controllerJournal','authorization','recoveryAuthorization','correction','recovery','review','recoveryReview','tests','recoveryTests','ownership','ownershipRequest'])for(const location of ['source','archive'])test('interrupted review receipt rejects changed '+location+' '+name,async()=>{
+ const f=await interruptedReviewSetup();try {
+  await f.run();const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json'))),path=location==='source'?f.paths[name]:join(r.archive,name);
+  await rm(path);await writeFile(path,'changed',{mode:0o600});await assert.rejects(verifiedExternalReceipt(f.c,keyFor(f.c)),/bytes changed/);
+ }finally{await f.clean();}
+});
 test('versioned controller completion preserves numeric publish failure and shared2+1 budget without a deployment record',async()=>{
  const f=await controllerSetup();try {
   const original=digest(await readFile(f.paths.ledger)),artifact=digest(await readFile(f.paths.publishArtifact));
