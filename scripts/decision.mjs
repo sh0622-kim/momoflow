@@ -55,6 +55,19 @@ async function note(c,io,d,text) {
   const updated=from<0?`${body}\n\n${section}`:body.slice(0,from)+section+body.slice(to+end.length);
   if(updated!==body) await io.api('PATCH',`${root}/comments/${pads[0].id}`,{body:updated});
 }
+// Runner consumption is independent confirmation of the exact already-written envelope.
+// JSON map ordering may change when Elixir persists it; field values and cardinality may not.
+function consumedDecision(c,l,d,r) {
+  budget(c,l);
+  assert(l.issue===c.issue,'Decision issue scope changed');
+  const consumed=l.decisions?.filter(x=>x.decision_id===d.id)??[];
+  if(!consumed.length)return false;
+  const envelope={...r,kind:'decision',id:d.id,repo:c.repo,issue:c.issue};
+  assert(consumed.length===1 && isDeepStrictEqual(consumed[0].response,envelope),'Decision consumption changed');
+  assert(Array.isArray(l.events) && l.events.length>=d.generation,'Decision generation regressed');
+  decisionReceipt(c,{...l,stage:'await_decision',in_flight:false,active_session:null,decision:d,publication:d.publication,events:l.events.slice(0,d.generation)});
+  return true;
+}
 // A confirmed signal is already owned by the runner. Observations here are read-only:
 // claim and durable consumption can occur between any two host reads.
 async function dispatched(c,io,d,prior) {
@@ -68,16 +81,7 @@ async function dispatched(c,io,d,prior) {
     const workers=[...s.running,...s.retrying];
     assert(workers.every(x=>x.issue_id===c.issue),'Other Symphony worker/claim');
     const l=await io.ledger();
-    budget(c,l);
-    assert(l.issue===c.issue,'Decision issue scope changed');
-    const consumed=l.decisions?.filter(x=>x.decision_id===d.id)??[];
-    if(consumed.length) {
-      const envelope={...prior.response,kind:'decision',id:d.id,repo:c.repo,issue:c.issue};
-      assert(consumed.length===1 && isDeepStrictEqual(consumed[0].response,envelope),'Decision consumption changed');
-      assert(Array.isArray(l.events) && l.events.length>=d.generation,'Decision generation regressed');
-      decisionReceipt(c,{...l,stage:'await_decision',in_flight:false,active_session:null,decision:d,publication:d.publication,events:l.events.slice(0,d.generation)});
-      return {claimed:workers.length>0,consumed:true};
-    }
+    if(consumedDecision(c,l,d,prior.response))return {claimed:workers.length>0,consumed:true};
     assert(same(decisionReceipt(c,l),d),'Decision changed');
     return {claimed:workers.length>0,consumed:false};
   };
@@ -160,9 +164,22 @@ export async function applyDecision(c,io,r) {
   // Intent precedes dispatch. Lost responses are deliberately not replayed.
   record.state='dispatching';await io.saveDecision(d.id,record);
   await io.api('POST',root,{labels:['momoflow:ready']});
-  assert((await list(io.api,root)).some(x=>x.name==='momoflow:ready'),'Decision ready grant unconfirmed');
+  let confirmation='ready grant confirmed; runner consumption pending';
+  if(!(await list(io.api,root)).some(x=>x.name==='momoflow:ready')) {
+    // A successful POST may already have been consumed, including no-model publication
+    // continuations. Only a fresh exact consumption confirms absent ready; never regrant.
+    await io.authorize();
+    assert(!c.hold && c.authority.resume===true,'Existing resume authority unavailable/hold');
+    const engine=await io.engine();
+    assert(Array.isArray(engine.running)&&Array.isArray(engine.retrying),'Unknown engine state');
+    assert([...engine.running,...engine.retrying].every(x=>x.issue_id===c.issue),'Other Symphony worker/claim');
+    assert(consumedDecision(c,await io.ledger(),d,r),'Decision ready grant unconfirmed');
+    const issue=await io.api('GET',`/repos/${c.repo}/issues/${c.issue}`);
+    assert(issue.state==='open' && !issue.pull_request && String(issue.number)===c.issue,'Decision issue closed/scope changed');
+    confirmation='ready grant confirmed by exact runner consumption';
+  }
   record.state='dispatched';await io.saveDecision(d.id,record);
-  await io.preserve({...record,result:'ready grant confirmed; runner consumption pending'});
+  await io.preserve({...record,result:confirmation});
   await note(c,io,d,`재개 신호 부여 확인: ${r.action}; source ${r.source}. 동일 요청 소비/다음 역할의 실제 결과는 runner ledger에서 확인.`);
   return {decision:d.id,state:'dispatched'};
 }
