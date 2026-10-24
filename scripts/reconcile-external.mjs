@@ -9,6 +9,8 @@ import {mountContext} from './deploy-mount-identity.mjs';
 const need=(v,m)=>{if(!v)throw Error(m);};
 const hex=v=>typeof v==='string' && /^[a-f0-9]{64}$/.test(v);
 const sha=v=>typeof v==='string' && /^[a-f0-9]{40}$/.test(v);
+const controllerV2=c=>c.profile==='controller-only-v2';
+const evidenceNames=c=>['ledger','enrollment','manifest','launchJournal','controllerJournal','gate','recovery','validation',...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest']:[])];
 const optional=async p=>{try{return await json(p);}catch(e){if(e.code==='ENOENT')return null;throw e;}};
 async function privatePath(path,directory=false) {
  need(typeof path==='string' && resolve(path)===path && await realpath(path)===path,'Private canonical evidence path required');
@@ -27,25 +29,46 @@ const paths=c=>{
 };
 export function reconciliationConfig(c) {
  config(c);need(c.authority.reconcile===true && !c.hold,'Explicit external reconciliation authority required');
+ need(c.profile===undefined || controllerV2(c),'Unsupported external completion profile');
  for(const k of ['launchRoot','gateRoot'])need(typeof c[k]==='string' && resolve(c[k])===c[k],'Absolute reconciliation control roots required');
  need(Number.isSafeInteger(c.pr) && c.pr>0 && [c.head,c.tree,c.merge].every(sha),'Exact external PR/head/tree/merge required');
  need(Number.isInteger(c.originalIterations) && c.originalIterations>=1 && c.originalIterations<=3 && Number.isInteger(c.externalIterations) && c.externalIterations>=1,'Separate original/external iteration history required');
  need(hex(c.engineContainer) && /^sha256:[a-f0-9]{64}$/.test(c.engineImage || '') && typeof c.productionProject==='string','Pinned engine worker identity required');
- const p=paths(c),names=['ledger','enrollment','manifest','launchJournal','controllerJournal','gate','recovery','validation'];
+ if(controllerV2(c))need(c.originalIterations===2 && c.originalLimit===3 && c.externalIterations===1 && c.originalIterations+c.externalIterations<=c.originalLimit && c.controllerVersion===c.merge && c.controllerTree===c.tree && typeof c.dataVolume==='string' && c.dataVolume.length>0,'Controller-only installed version/shared budget mismatch');
+ const p=paths(c),names=evidenceNames(c);
  need(c.evidence && same(Object.keys(c.evidence).sort(),names.sort()),'Complete exact reconciliation evidence required');
  for(const name of names) {const ref=c.evidence[name];need(ref && (name==='controllerJournal'?ref.hash===null || hex(ref.hash):hex(ref.hash)),'Evidence hash required');need(typeof ref.path==='string' && resolve(ref.path)===ref.path,'Absolute evidence path required');if(p[name])need(ref.path===p[name],'Evidence path/scope mismatch');}
  return c;
 }
 function binding(c) {
- return {v:1,repo:c.repo,issue:c.issue,base:c.base,pr:c.pr,head:c.head,tree:c.tree,merge:c.merge,originalIterations:c.originalIterations,externalIterations:c.externalIterations,engineContainer:c.engineContainer,engineImage:c.engineImage,runnerSource:c.runnerSource,...(c.configurationHash?{configurationHash:c.configurationHash}:{}),evidence:c.evidence};
+ return {v:controllerV2(c)?2:1,...(controllerV2(c)?{profile:c.profile,originalLimit:c.originalLimit,controllerTree:c.controllerTree,dataVolume:c.dataVolume}:{}),repo:c.repo,issue:c.issue,base:c.base,pr:c.pr,head:c.head,tree:c.tree,merge:c.merge,originalIterations:c.originalIterations,externalIterations:c.externalIterations,engineContainer:c.engineContainer,engineImage:c.engineImage,runnerSource:c.runnerSource,...(c.configurationHash?{configurationHash:c.configurationHash}:{}),evidence:c.evidence};
+}
+function validateControllerCompletion(b,ledger,data) {
+ const artifact=JSON.parse(data.publishArtifact),attempt=JSON.parse(data.recovery),review=JSON.parse(data.review),tests=JSON.parse(data.tests),install=JSON.parse(data.validation),ownership=JSON.parse(data.ownership),request=JSON.parse(data.ownershipRequest);
+ const scoped=x=>x.repo===b.repo && x.issue===b.issue && x.pr===b.pr && x.head===b.head && x.tree===b.tree;
+ need(b.v===2 && controllerV2(b) && b.originalIterations===2 && b.originalLimit===3 && b.externalIterations===1 && b.originalIterations+b.externalIterations<=b.originalLimit && ledger.launch.limit===b.originalLimit && ledger.iterations===b.originalIterations,'Controller-only shared attempt history mismatch');
+ need(ledger.stage==='blocked' && ledger.in_flight===true && ledger.active_session && ledger.reason==='Missing exact reviewed publication' && ledger.events?.at(-1)?.role==='review' && ledger.events.at(-1).result?.status==='complete','Original blocked publish failure required');
+ const p=artifact.publication;
+ need(artifact.status==='complete' && p?.repo===b.repo && p.issue===Number(b.issue) && p.pr===b.pr && p.base===b.base && sha(p.head),'Original numeric publication artifact required');
+ need(scoped(attempt) && attempt.kind==='controller-external-attempt-v2' && attempt.status==='completed' && attempt.originalUsed===2 && attempt.limit===3 && attempt.externalUsed===1 && attempt.totalUsed===3 && attempt.originalHead===p.head && typeof attempt.buildSession==='string' && attempt.buildSession.length>0 && ['ledger','publishArtifact','launchJournal','manifest'].every(k=>attempt.originalHashes?.[k]===b.evidence[k].hash),'External controller attempt/original hashes mismatch');
+ need(scoped(review) && review.kind==='controller-external-review-v2' && review.status==='approved' && review.model==='gpt-6-astra' && review.reasoning==='high' && review.fast===false && typeof review.session==='string' && review.session.length>0 && review.session!==attempt.buildSession,'Separate exact-head external review required');
+ need(scoped(tests) && tests.kind==='controller-external-tests-v2' && tests.status==='passed' && Number.isInteger(tests.tests) && tests.tests>=356 && tests.failures===0 && tests.skipped===0 && ['node','syntax','diff'].every(name=>tests.checks?.filter(x=>x.name===name && x.exit===0).length===1 && hex(tests.logHashes?.[name])),'Exact-head external test evidence required');
+ need(scoped(install) && install.kind==='controller-install-v2' && install.status==='installed' && install.commit===b.merge && install.controllerVersion===b.merge && install.controllerTree===b.tree && b.controllerTree===b.tree && install.engineUnchanged===true && install.engineContainer===b.engineContainer && install.engineImage===b.engineImage && install.ownershipHash===b.evidence.ownership.hash,'Pinned controller-only installation required');
+ need(request.ownershipVersion===1 && request.authority?.observe===true && request.controllerVersion===b.merge && request.repo===b.repo && request.base===b.base && request.dataVolume===b.dataVolume,'Pinned current-only ownership request mismatch');
+ const own=ownership.ledgerHashes?.find(r=>r.file===keyFor(b)+'.json');
+ const services=ownership.serviceEvidence?.services;
+ need(/^[a-f0-9-]{36}$/.test(ownership.serviceEvidence?.kernel || '') && Array.isArray(services) && services.length===2 && ['symphony','github-auth'].every(service=>{
+  const rows=services.filter(x=>x.service===service),x=rows[0];return rows.length===1 && hex(x.id) && /^sha256:[a-f0-9]{64}$/.test(x.image) && hex(x.runtimeHash) && Array.isArray(x.mountHashes) && x.mountHashes.length>0 && x.mountHashes.every(m=>['bind','volume'].includes(m.type) && typeof m.destination==='string' && typeof m.rw==='boolean' && hex(m.identityHash));
+ }) && services.find(x=>x.service==='symphony').id===b.engineContainer,'Complete engine/auth live identity proof required');
+ need(ownership.kind==='deployment-ownership-v1' && ownership.effects==='none' && ownership.repo===b.repo && ownership.base===b.base && ownership.controllerVersion===b.merge && ownership.engine===b.engineContainer && ownership.engineImage===b.engineImage && ownership.dataVolume===b.dataVolume && same(ownership.sourceRequest,b.evidence.ownershipRequest) && ownership.runtimeIdle===true && ownership.controllerLock===false && ownership.manifestContract===digest(ledger.launch) && own?.ledgerHash===b.evidence.ledger.hash && own.enrollmentHash===b.evidence.enrollment.hash,'Pinned read-only live ownership evidence mismatch');
 }
 // The receipt is an additional historical fact, never runner completion or a budget reset.
 export async function verifiedExternalReceipt(c,key,observation) {
  const dir=join(c.stateRoot,key),path=join(dir,'external-reconciliation.json');
  const receipt=await optional(path);if(!receipt)return false;
  await privatePath(path);const b=receipt.binding;
- need(receipt.v===1 && receipt.status==='externally-reconciled' && receipt.done===true && sha(receipt.controllerVersion) && b?.v===1 && b.repo===c.repo && b.base===c.base && key===keyFor(b) && receipt.id===digest(b) && [b.head,b.tree,b.merge].every(sha),'Invalid external reconciliation receipt');
- need(same(Object.keys(b.evidence).sort(),['controllerJournal','enrollment','gate','launchJournal','ledger','manifest','recovery','validation'].sort()),'Incomplete reconciliation receipt');
+ need(((receipt.v===1 && b?.v===1 && b.profile===undefined)||(receipt.v===2 && b?.v===2 && controllerV2(b))) && receipt.status==='externally-reconciled' && receipt.done===true && sha(receipt.controllerVersion) && b.repo===c.repo && b.base===c.base && key===keyFor(b) && receipt.id===digest(b) && [b.head,b.tree,b.merge].every(sha),'Invalid external reconciliation receipt');
+ need(same(Object.keys(b.evidence).sort(),evidenceNames(b).sort()),'Incomplete reconciliation receipt');
  const scope={...c,issue:b.issue},expected=paths(scope);
  need(receipt.archive===join(dir,'external-reconciliation',receipt.id),'Reconciliation archive path mismatch');
  await privatePath(receipt.archive,true);
@@ -60,10 +83,15 @@ export async function verifiedExternalReceipt(c,key,observation) {
   const archived={path:join(receipt.archive,name),hash:ref.hash};await bytes(archived);
  }
  const ledger=JSON.parse(observation?Buffer.from(observation.rows.find(r=>r.file===key+'.json').bytes,'base64'):await readFile(b.evidence.ledger.path));
- need(ledger.issue===b.issue && ledger.launch?.repo===b.repo && ledger.launch.base===b.base && ledger.launch.limit===b.originalIterations && keyFor(ledger.launch)===key && ledger.iterations===b.originalIterations,'Receipt ledger scope/history mismatch');
+ need(ledger.issue===b.issue && ledger.launch?.repo===b.repo && ledger.launch.base===b.base && ledger.launch.limit===(controllerV2(b)?b.originalLimit:b.originalIterations) && keyFor(ledger.launch)===key && ledger.iterations===b.originalIterations,'Receipt ledger scope/history mismatch');
  need(same(JSON.parse(await readFile(join(receipt.archive,'manifest'))),ledger.launch),'Archived manifest scope mismatch');
- const recovery=JSON.parse(await readFile(b.evidence.recovery.path)),validation=JSON.parse(await readFile(b.evidence.validation.path));
- need(recovery.issue===Number(b.issue) && recovery.pr===b.pr && recovery.head===b.head && recovery.tree===b.tree && recovery.previous_iterations===b.originalIterations && recovery.additional_iterations_used===b.externalIterations && validation.commit===b.merge && validation.head===b.head && validation.tree===b.tree,'Receipt external completion/history mismatch');
+ if(controllerV2(b)) {
+  const data={};for(const name of evidenceNames(b))if(b.evidence[name].hash!==null)data[name]=await readFile(join(receipt.archive,name));
+  need(receipt.controllerVersion===b.merge,'Receipt controller version mismatch');validateControllerCompletion(b,ledger,data);
+ } else {
+  const recovery=JSON.parse(await readFile(b.evidence.recovery.path)),validation=JSON.parse(await readFile(b.evidence.validation.path));
+  need(recovery.issue===Number(b.issue) && recovery.pr===b.pr && recovery.head===b.head && recovery.tree===b.tree && recovery.previous_iterations===b.originalIterations && recovery.additional_iterations_used===b.externalIterations && validation.commit===b.merge && validation.head===b.head && validation.tree===b.tree,'Receipt external completion/history mismatch');
+ }
  const manifest=observation?observation.manifest:await optional(expected.manifest);
  need(manifest===null || (manifest && typeof manifest==='object'),'Live manifest observation required');
  need(!manifest || !same(manifest,ledger.launch),'Reconciled manifest is still active');
@@ -123,10 +151,18 @@ export async function reconcileExternal(c,io,{check=false}={}) {
   if(intent) {data[name]=await bytes({path:join(archive,name),hash:c.evidence[name].hash});}
  }
  const ledger=JSON.parse(data.ledger),manifest=JSON.parse(data.manifest),launch=JSON.parse(data.launchJournal),recovery=JSON.parse(data.recovery),validation=JSON.parse(data.validation),originalGate=JSON.parse(data.gate);
- need(ledger.issue===c.issue && ledger.launch?.repo===c.repo && ledger.launch.issue===c.issue && ledger.launch.base===c.base && same(ledger.launch,manifest) && ledger.iterations===c.originalIterations && ledger.launch.limit===c.originalIterations && ledger.in_flight===true && ledger.stage==='blocked' && ledger.active_session && Array.isArray(ledger.events),'Exact interrupted runner history required');
+ need(ledger.issue===c.issue && ledger.launch?.repo===c.repo && ledger.launch.issue===c.issue && ledger.launch.base===c.base && same(ledger.launch,manifest) && ledger.iterations===c.originalIterations && ledger.launch.limit===(controllerV2(c)?c.originalLimit:c.originalIterations) && ledger.in_flight===true && ledger.stage==='blocked' && ledger.active_session && Array.isArray(ledger.events),'Exact interrupted runner history required');
  need(launch.contract===digest(manifest) && launch.dispatched===true && !launch.done,'Original interrupted launch journal required');
- need(recovery.issue===Number(c.issue) && recovery.pr===c.pr && recovery.head===c.head && recovery.tree===c.tree && recovery.previous_iterations===c.originalIterations && recovery.additional_iterations_used===c.externalIterations && recovery.status==='fourth-complete-validated' && recovery.original_ledger_unchanged===true && recovery.docker_tests?.failed===0 && recovery.docker_tests.tests>0,'External recovery history/validation mismatch');
- need(validation.status==='deployed' && validation.commit===c.merge && validation.head===c.head && validation.tree===c.tree && validation.image===c.engineImage && validation.original_interrupted_ledger_preserved===true,'Pinned external completion validation mismatch');
+ if(controllerV2(c)) {
+  validateControllerCompletion(b,ledger,data);
+  need(same(await io.installedController(),{commit:c.merge,tree:c.tree}),'Installed controller commit/tree changed');
+  const live=await io.ownership({retired:!!intent && !await optional(p.manifest)});
+  const proof=JSON.parse(data.ownership);
+  need(live.kind===proof.kind && live.effects==='none' && live.engine===c.engineContainer && live.engineImage===c.engineImage && live.dataVolume===c.dataVolume && live.controllerVersion===c.merge && same(live.sourceRequest,c.evidence.ownershipRequest) && same(live.ledgerHashes,proof.ledgerHashes) && same(live.serviceEvidence,proof.serviceEvidence) && live.runtimeIdle===true,'Current live ownership changed');
+ } else {
+  need(recovery.issue===Number(c.issue) && recovery.pr===c.pr && recovery.head===c.head && recovery.tree===c.tree && recovery.previous_iterations===c.originalIterations && recovery.additional_iterations_used===c.externalIterations && recovery.status==='fourth-complete-validated' && recovery.original_ledger_unchanged===true && recovery.docker_tests?.failed===0 && recovery.docker_tests.tests>0,'External recovery history/validation mismatch');
+  need(validation.status==='deployed' && validation.commit===c.merge && validation.head===c.head && validation.tree===c.tree && validation.image===c.engineImage && validation.original_interrupted_ledger_preserved===true,'Pinned external completion validation mismatch');
+ }
  need(originalGate.v===1 && hex(originalGate.generation) && typeof originalGate.paused==='boolean','Original admission gate invalid');
  await foreignOwners(c,{own:true,existing:true});
  const issue=await io.api('GET',`/repos/${c.repo}/issues/${c.issue}`),pr=await io.api('GET',`/repos/${c.repo}/pulls/${c.pr}`);
@@ -152,7 +188,7 @@ export async function reconcileExternal(c,io,{check=false}={}) {
  await io.ack(active,fence);idle(c,await io.engine(),active,fence);need(await io.workers()===true,'Worker appeared under fence');
  await checkpoint('fenced');
  await reconcileExternal(c,io,{check:true});
- for(const name of ['ledger','enrollment','launchJournal','controllerJournal','recovery','validation'])await bytes(c.evidence[name]);
+ for(const name of evidenceNames(c).filter(n=>!['manifest','gate'].includes(n)))await bytes(c.evidence[name]);
  if(active!==null) {await bytes(c.evidence.manifest);await rm(p.manifest);const d=await open(c.launchRoot,'r');try{await d.sync();}finally{await d.close();}}
  await checkpoint('manifest-retired');
  await io.ack(null,fence);idle(c,await io.engine(),null,fence);
@@ -160,9 +196,9 @@ export async function reconcileExternal(c,io,{check=false}={}) {
  await io.authorize();
  await atomicBytes(p.gate,data.gate);await checkpoint('gate-restored');
  await io.ack(null,originalGate);idle(c,await io.engine(),null,originalGate);
- for(const name of ['ledger','enrollment','launchJournal','controllerJournal','recovery','validation'])await bytes(c.evidence[name]);
+ for(const name of evidenceNames(c).filter(n=>!['manifest','gate'].includes(n)))await bytes(c.evidence[name]);
  need(await io.workers()===true,'Worker appeared before reconciliation completion');
- await atomic(p.receipt,{v:1,id,binding:b,status:'externally-reconciled',done:true,archive,controllerVersion:c.controllerVersion,checks:['original-bytes','merged-pr-head-tree','engine-processes-idle','admission-fence','manifest-absent','original-gate-restored']});
+ await atomic(p.receipt,{v:b.v,id,binding:b,status:'externally-reconciled',done:true,archive,controllerVersion:c.controllerVersion,checks:['original-bytes','merged-pr-head-tree','engine-processes-idle','admission-fence','manifest-absent','original-gate-restored']});
  await checkpoint('receipt');
  need(await verifiedExternalReceipt(c,keyFor(c)),'Final reconciliation receipt invalid');
  return {status:'externally-reconciled',id,originalIterations:ledger.iterations,externalIterations:c.externalIterations};
@@ -182,6 +218,33 @@ export async function reconciliationPorts(c) {
  const io={api,engine,authorize:async()=>{await privatePath(c.configFile);need(digest(await readFile(c.configFile))===settings,'Reconciliation authority/config changed');await verifyInstall(c);await operator();},
   workers:()=>observeReconciliationWorkers(c,docker),
   ack:async(manifest,gate)=>{const end=Date.now()+10000;for(;;){try{idle(c,await engine(),manifest,gate);return;}catch(e){if(Date.now()>=end)throw e;await new Promise(r=>setTimeout(r,100));}}}};
+ if(controllerV2(c)) {
+  io.installedController=async()=>{
+   const r=await command('git',['-C',c.trustedRoot,'rev-parse','HEAD','HEAD^{tree}']);need(r.exit===0,'Controller version observation unavailable');
+   const [commit,tree]=r.output.toString().trim().split('\n');return {commit,tree};
+  };
+  io.ownership=async()=>{
+   const request=JSON.parse(await bytes(c.evidence.ownershipRequest));
+   for(const k of ['repo','base','stateRoot','inboxRoot','launchRoot','gateRoot','trustedRoot','controllerVersion','dataVolume','engineURL'])need(request[k]===c[k],'Ownership request installation/scope mismatch');
+   need(request.ownershipVersion===1 && request.project===c.productionProject,'Explicit current-only live ownership request required');
+   const containers=async()=>{
+    const text=await docker(['ps','-a','--filter','label=com.docker.compose.project='+request.project,'--format','json']),all={};
+    for(const line of text.trim().split('\n').filter(Boolean)) {
+     const row=JSON.parse(line),x=JSON.parse(await docker(['inspect',row.ID]))[0],service=x.Config?.Labels?.['com.docker.compose.service'];
+     need(['symphony','github-auth'].includes(service) && !all[service] && x.Config.Labels['com.docker.compose.project']===request.project,'Unexpected ownership service');all[service]=x;
+    }
+    need(all.symphony?.Id===c.engineContainer && all['github-auth'],'Ownership engine/auth missing or changed');return all;
+   };
+   const {deploymentConfig,observeDeploymentOwners,runtimeOwnersIdle,ownershipServiceEvidence}=await import('./deploy.mjs');
+   deploymentConfig(request,{ownership:true});
+   const all=await containers(),observation=await observeDeploymentOwners(request,{containers,docker}),s=await engine();
+   // The pinned full CLI proof authenticated canonical host binds. Fresh hashes
+   // reauthenticate those same live objects without copying key custody here.
+   const serviceEvidence=await ownershipServiceEvidence(all,docker),after=await containers();
+   need(observation.engine===all.symphony.Id && ['symphony','github-auth'].every(k=>after[k].Id===all[k].Id && same(after[k].Mounts,all[k].Mounts) && same(after[k].Config,all[k].Config) && same(after[k].HostConfig,all[k].HostConfig) && after[k].Image===all[k].Image && after[k].State?.Running===true && after[k].State.Health?.Status==='healthy'),'Ownership services changed during observation');
+   return {kind:'deployment-ownership-v1',effects:'none',engine:observation.engine,engineImage:all.symphony.Image,dataVolume:c.dataVolume,controllerVersion:c.controllerVersion,sourceRequest:c.evidence.ownershipRequest,ledgerHashes:observation.rows.map(r=>({file:r.file,ledgerHash:digest(Buffer.from(r.bytes,'base64')),enrollmentHash:r.enrollment===null?null:digest(Buffer.from(r.enrollment,'base64'))})).sort((a,b)=>a.file.localeCompare(b.file)),serviceEvidence,runtimeIdle:runtimeOwnersIdle(s)};
+  };
+ }
  return io;
 }
 function engineIdentity(c,x) {
@@ -205,7 +268,7 @@ export async function verifyReconciliationOperator(c,{docker,containerized,hostn
  const image=await inspect(c.operatorImage);
  need(image?.Id===c.operatorImage && same([...(operator.Config.Env || [])].sort(),[...(image.Config?.Env || [])].sort()),'Operator image environment overridden');
  need(c.ledgerRoot==='/engine-data/log/roles' && c.tokenFile==='/run/momoflow-auth/token.json','Live operator ledger/auth paths required');
- const binds=[[c.trustedRoot,false],[dirname(c.configFile),false],[c.stateRoot,true],[c.inboxRoot,true],[c.launchRoot,true],[c.gateRoot,true],['/tmp',true],['/var/run/docker.sock',true],[c.evidence.recovery.path,false],[c.evidence.validation.path,false]];
+ const binds=[[c.trustedRoot,false],[dirname(c.configFile),false],[c.stateRoot,true],[c.inboxRoot,true],[c.launchRoot,true],[c.gateRoot,true],['/tmp',true],['/var/run/docker.sock',true],[c.evidence.recovery.path,false],[c.evidence.validation.path,false],...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest'].map(k=>[c.evidence[k].path,false]):[])];
  need(new Set(binds.map(([path])=>path)).size===binds.length,'Overlapping operator mount destinations');
  const mounts=operator.Mounts;
  need(Array.isArray(mounts) && mounts.length===binds.length+2 && new Set(mounts.map(m=>m.Destination)).size===mounts.length,'Unexpected operator mounts');

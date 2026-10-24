@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { command } from './post-pr-docker.mjs';
 import { fixtureSource, fixtureEvidence, fixtureLabels, integrationPlan, isolatedResources } from './deploy-fixture.mjs';
-import { connected, integrationIsolation, replaceConnectedBundle, fixtureHTTP, fixtureHTTPProbe, observeDeploymentOwners, deploymentOwnersIdle } from './deploy.mjs';
+import { connected, integrationIsolation, replaceConnectedBundle, fixtureHTTP, fixtureHTTPProbe, observeDeploymentOwners, deploymentOwnersIdle, matchDeploymentBundle } from './deploy.mjs';
 import { digest } from './post-pr.mjs';
 const sha=n=>String(n).repeat(40),hash=n=>String(n).repeat(64);
 async function localFixture() {
@@ -611,4 +611,21 @@ namespaceTest('recovery probe rejects changed bind correspondence, volumes, prod
    if(fault==='runtime') assert.ok(!x.effects.some(a=>a[0]==='run'),'reject unsafe runtime before inheriting mounts');
   } finally {await x.clean();}
  }
+});
+
+namespaceTest('ordinary engine and auth match opaque Desktop sources only through fresh filesystem proof',async()=>{
+ const x=await namespaceFixture();try {
+  const engine=x.production[0],auth=x.production[1],all={symphony:engine,'github-auth':auth};
+  for(const live of Object.values(all)) {live.Config={};live.HostConfig={};live.State={Running:true,Health:{Status:'healthy'}};live.Image='sha256:'+hash(1);}
+  const b={inspect:Object.fromEntries(Object.entries(all).map(([k,live])=>{const expected=runtimeIdentity(live);expected.mounts[0].source=x.root+(k==='symphony'?'/prod':'/key');return [k,expected];}))};
+  const ports={containers:async()=>all,docker:x.docker};
+  await matchDeploymentBundle({},b,ports);
+  for(const service of ['symphony','github-auth']) {
+   const probe=x.probes.get(all[service].Id),ino=probe.points[0].ino;probe.points[0].ino='9999999999';
+   await assert.rejects(matchDeploymentBundle({},b,ports),/correspondence/);probe.points[0].ino=ino;
+   const rw=all[service].Mounts[0].RW;all[service].Mounts[0].RW=true;await assert.rejects(matchDeploymentBundle({},b,ports),/authority/);all[service].Mounts[0].RW=rw;
+  }
+  const changed=structuredClone(all);changed['github-auth'].Config.User='changed';let calls=0;
+  await assert.rejects(matchDeploymentBundle({},b,{...ports,containers:async()=>++calls===1?all:changed}),/changed/);
+ } finally {await rm(x.root,{recursive:true,force:true});}
 });

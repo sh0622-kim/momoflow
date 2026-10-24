@@ -100,9 +100,9 @@ export async function mountContext(docker,containers,{recoveryProbes=new Map()}=
  };
  return {mounted,volumes,host};
 }
-// Fixture-only normalization. Prove each expected bind is the mounted object first;
+// Prove each expected bind is the mounted object before normalizing its Source;
 // preserve destination/type/RW and every non-path runtime field in the caller.
-export async function fixtureMountSources(live,expected,docker,options) {
+export async function verifiedMountSources(live,expected,docker,options) {
  const context=await mountContext(docker,[live],options);
  return Promise.all(live.Mounts.map(async m=>{
   if(m.Type!=='bind') return m;
@@ -113,3 +113,4 @@ export async function fixtureMountSources(live,expected,docker,options) {
   return {...m,Source:e[0].source};
  }));
 }
+export const fixtureMountSources=verifiedMountSources;

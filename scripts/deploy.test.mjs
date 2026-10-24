@@ -331,6 +331,7 @@ test('live ownership adapter reads identified volume and current manifest; no ho
    calls.push(args.slice(0,4));assert.deepEqual(args.slice(0,4),['exec',engine.Id,'node','-e']);let out;
    runInNewContext(args[4],{require:name=>{assert.equal(name,'fs');return mapped;},process:{stdout:{write:s=>{out=s;}}}});return out;
   }};
+  ports.contextFor=async()=>({host:async path=>({device:'8:1',path,inode:'42'}),mounted:new Map([[current.Mounts[1],{device:'8:1',path:c.launchRoot,inode:'42'}]])});
   const first=await observeDeploymentOwners(c,ports);
   assert.equal(first.engine,engine.Id);assert.equal(first.manifest,null);assert.equal(first.rows[0].bytes,Buffer.from(JSON.stringify(ledger)).toString('base64'));
   assert.equal(first.rows[0].enrollment,Buffer.from('enrolled').toString('base64'));
@@ -357,4 +358,17 @@ test('deployment re-observes owner evidence after drain before replacement',asyn
  f.io.ownersIdle=async()=>++observations===1;
  assert.equal((await deploy(f.c,f.io)).phase,'deferred');
  assert.ok(observations>=2);assert.ok(!f.calls.some(x=>x.startsWith('replace:')));
+});
+
+test('ordinary Compose accepts only the observed empty default IPAM serialization',async()=>{
+ const x=await composeFixture();try {
+  x.doc.networks.default.ipam={};await x.persist();await bundleFiles(x.c,x.b,x.docker);
+  for(const ipam of [null,[],{driver:'default'},{config:[]}]) {x.doc.networks.default.ipam=ipam;await x.persist();await assert.rejects(bundleFiles(x.c,x.b,x.docker),/Unsupported Compose field/);}
+ } finally {await rm(x.root,{recursive:true,force:true});}
+});
+
+test('current-only ownership config cannot authorize deployment or substitute previous/target',()=>{
+ const c=fixture().c;c.ownershipVersion=1;c.authority={observe:true};c.current=c.previous;c.launchRoot='/operator/launch';delete c.previous;delete c.target;
+ assert.equal(deploymentConfig(c,{ownership:true}),c);assert.throws(()=>deploymentConfig(c),/authority/);
+ for(const change of [x=>x.authority.observe=false,x=>x.target=x.current,x=>x.previous=x.current,x=>x.current.authImage='latest',x=>x.current.files={},x=>x.fixtureMode='credential-free-v1']) {const x=structuredClone(c);change(x);assert.throws(()=>deploymentConfig(x,{ownership:true}));}
 });

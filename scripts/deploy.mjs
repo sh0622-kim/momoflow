@@ -1,7 +1,7 @@
 // Install this CLI from a reviewed, pinned checkout OUTSIDE the engine/candidate workspace.
 // There is deliberately no build, pull, shell command hook, policy editor or ledger writer.
 import { verifiedExternalReceipt } from './reconcile-external.mjs';
-import { fixtureMountSources } from './deploy-mount-identity.mjs';
+import { fixtureMountSources, verifiedMountSources, mountContext } from './deploy-mount-identity.mjs';
 import { readFile, readdir, lstat, realpath, mkdir, open, rm, copyFile } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -19,10 +19,20 @@ const iid = x => /^sha256:[a-f0-9]{64}$/.test(x || '');
 const same = isDeepStrictEqual;
 const optional = async p => { try { return await json(p); } catch(e) { if(e.code === 'ENOENT') return null; throw e; } };
 const sleep = ms => new Promise(r => setTimeout(r,ms));
-export function deploymentConfig(c,{fixture=false}={}) {
+export function deploymentConfig(c,{fixture=false,ownership=false}={}) {
+  const currentOnly=ownership && c.ownershipVersion===1;
+  if(currentOnly) {
+    require(!fixture && !c.fixtureMode && !c.fixtureSource && !c.fixtureRepository && c.current && !c.previous && !c.target,'Current-only ownership request required');
+    require(c.authority?.observe===true && c.hold===false && /^[\w.-]+\/[\w.-]+$/.test(c.repo) && /^[1-9][0-9]*$/.test(c.issue) && typeof c.base==='string' && c.base.length>0,'Explicit read-only ownership authority/scope required');
+    for(const k of ['stateRoot','inboxRoot','launchRoot','gateRoot','trustedRoot','ledgerRoot','tokenFile'])require(typeof c[k]==='string' && resolve(c[k])===c[k],'Absolute ownership path required: '+k);
+    require(sha(c.controllerVersion) && /^[a-z0-9][a-z0-9_-]+$/.test(c.project) && /^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/.test(c.dataVolume || '') && /^http:\/\/(127\.0\.0\.1|host\.docker\.internal):[0-9]+$/.test(c.engineURL) && Number.isInteger(c.verifyMs) && c.verifyMs>=1 && c.verifyMs<=300000,'Pinned ownership installation/deadline required');
+    const b=c.current;
+    require(sha(b.commit) && iid(b.image) && iid(b.authImage) && hex(b.runnerSource) && hex(b.composeHash) && typeof b.composeFile==='string' && resolve(b.composeFile)===b.composeFile && b.files?.[b.composeFile]===b.composeHash && Object.values(b.files).every(hex) && b.inspect?.symphony && b.inspect?.['github-auth'],'Complete pinned current engine/auth bundle required');
+    return c;
+  }
   require(fixture ? c.fixtureMode==='credential-free-v1' && c.fixtureSource && c.fixtureRepository && c.integration && c.repo==='smoke/fixture' && same(c.manifest,{status:'absent'}) && c.tokenFile===undefined : !c.fixtureMode && !c.fixtureSource && !c.fixtureRepository, 'Fixture requests require the separate isolated integration entrypoint');
   require(hex(c.deploymentId) && /^[\w.-]+\/[\w.-]+$/.test(c.repo) && /^[1-9][0-9]*$/.test(c.issue), 'Explicit deployment scope required');
-  require(c.authority?.deploy === true && c.hold === false && c.compatibility === 'unchanged-data' && c.exceptional === false, 'Explicit deployment authority, unchanged data and ordinary scope required; exceptional changes need separate handling');
+  require(c.authority?.deploy===true && c.hold === false && c.compatibility === 'unchanged-data' && c.exceptional === false, 'Explicit deployment authority, unchanged data and ordinary scope required; exceptional changes need separate handling');
   require(/^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/.test(c.dataVolume || ''),'Explicit data named volume required');
   require(/^[a-z0-9][a-z0-9_-]+$/.test(c.project), 'Explicit Compose project required');
   for(const k of ['stateRoot','deploymentRoot','gateRoot','trustedRoot',...(fixture?['launchRoot']:['tokenFile']),'inboxRoot','ledgerRoot']) require(typeof c[k] === 'string' && resolve(c[k]) === c[k], `Absolute operator path required: ${k}`);
@@ -206,6 +216,17 @@ export function runtimeIdentity(x,{fixture=false}={}) {
     securityOpt:securityIdentity(x.HostConfig.SecurityOpt),networkMode:x.HostConfig.NetworkMode,readonly:x.HostConfig.ReadonlyRootfs,
     ports:x.HostConfig.PortBindings || {},environmentHash:digest([...(x.Config.Env || [])].sort())};
 }
+export async function matchDeploymentBundle(c,b,{containers,docker,fixture=false}) {
+  const all=await containers(),services=fixture?['symphony']:['symphony','github-auth'];
+  for(const service of services) {
+    const x=all[service];require(x && b.inspect[service],'Missing expected deployment service');
+    const normalized={...x,Mounts:await verifiedMountSources(x,b.inspect[service],docker)};
+    require(same(runtimeIdentity(normalized,{fixture}),b.inspect[service]) && x.State.Running && x.State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
+  }
+  const after=await containers();
+  for(const service of services)require(after[service]?.Id===all[service].Id && same(runtimeIdentity(after[service],{fixture}),runtimeIdentity(all[service],{fixture})) && after[service].State.Running && after[service].State.Health?.Status==='healthy','Deployment service changed during proof');
+  return all;
+}
 export function safeRuntime(c,b,{fixture=false}={}) {
   if(fixture) return fixtureRuntime(c,b);
   const e=b.inspect.symphony, a=b.inspect['github-auth'];
@@ -235,10 +256,10 @@ export function composeIdentity(c,b,doc,images,profiles={}, {fixture=false}={}) 
   const keys=(x,allowed)=>require(x && typeof x==='object' && !Array.isArray(x) && Object.keys(x).every(k=>allowed.includes(k)),'Unsupported Compose field');
   keys(doc,['name','services','volumes','networks']);
   require(doc.name===c.project && Object.keys(doc.services).sort().join()===(fixture?'symphony':'github-auth,symphony'),'Compose project/services mismatch');
-  keys(doc.networks,['default']);keys(doc.networks.default,['name','external',...(fixture?['internal','ipam']:[])]);
-  // Compose emits an empty IPAM object for this fixture's default network.
+  keys(doc.networks,['default']);keys(doc.networks.default,['name','external','ipam',...(fixture?['internal']:[])]);
+  // Compose emits an empty IPAM object for the default network.
   // Accept only that serialization default; address/driver settings remain forbidden.
-  if(fixture && Object.hasOwn(doc.networks.default,'ipam')) keys(doc.networks.default.ipam,[]);
+  if(Object.hasOwn(doc.networks.default,'ipam')) keys(doc.networks.default.ipam,[]);
   if(fixture) require(doc.networks.default.internal===true && !doc.networks.default.external,'Fixture network must block external traffic');
   const network=doc.networks.default.name;
   require(network===`${c.project}_default`,'Compose network mismatch');
@@ -348,7 +369,7 @@ export function readRoleRows(fs,root) {
   });
 }
 // Executed only in the identified engine. Never read a host ledger mirror.
-export async function observeDeploymentOwners(c,{containers,docker,fixture=false}) {
+export async function observeDeploymentOwners(c,{containers,docker,fixture=false,contextFor=mountContext}) {
   const all=await containers(),engine=all.symphony;
   require(engine.Mounts.some(m=>m.Destination==='/data' && m.Type==='volume' && m.Name===c.dataVolume && m.RW),'Live data volume mismatch');
   let mounts=engine.Mounts;
@@ -358,7 +379,14 @@ export async function observeDeploymentOwners(c,{containers,docker,fixture=false
     mounts=await fixtureMountSources(engine,b.inspect.symphony,docker);
   }
   const launch=mounts.find(m=>m.Destination==='/run/momoflow-launch');
-  if(c.launchRoot) require(launch?.Type==='bind' && launch.Source===c.launchRoot && launch.RW===false,'Live launch mount mismatch');
+  if(c.launchRoot) {
+    require(launch?.Type==='bind' && launch.RW===false,'Live launch mount mismatch');
+    if(fixture)require(launch.Source===c.launchRoot,'Live launch mount mismatch');
+    else {
+      const context=await contextFor(docker,Object.values(all)),host=await context.host(c.launchRoot),actual=context.mounted.get(launch);
+      require(actual && host.inode && same(actual,host),'Live launch mount correspondence mismatch');
+    }
+  }
   const script=`const fs=require('fs');const rows=(${readRoleRows.toString()})(fs,'/data');let manifest=null;
     if(${!!launch}) { const p='/run/momoflow-launch/active.json';try {
       const st=fs.lstatSync(p);if(!st.isFile() || st.isSymbolicLink() || fs.realpathSync(p)!==p || (st.mode&0o022)) throw Error('Invalid live manifest');
@@ -366,8 +394,11 @@ export async function observeDeploymentOwners(c,{containers,docker,fixture=false
     }catch(e){if(e.code!=='ENOENT')throw e;}}
     process.stdout.write(JSON.stringify({rows,manifest}));`;
   const observation=JSON.parse(await docker(['exec',engine.Id,'node','-e',script]));
-  const after=(await containers()).symphony;
-  require(after.Id===engine.Id && same(after.Mounts,engine.Mounts),'Ownership engine/mount changed');
+  const after=await containers();
+  for(const [service,x] of Object.entries(all)) {
+    const y=after[service];
+    require(y?.Id===x.Id && ['Mounts','Image','Config','HostConfig'].every(k=>same(y[k],x[k])) && y.State?.Running===x.State?.Running,'Ownership engine/mount changed');
+  }
   if(fixture) require(observation.rows.length===0,'Credential-free fixture must not contain role ledgers');
   return {...observation,engine:engine.Id};
 }
@@ -376,6 +407,33 @@ export function runtimeOwnersIdle(s) {
   return ['running','retrying'].every(k=>Array.isArray(s[k]) && s[k].length===0) &&
     a?.contract===1 && a.configured===true && !a.error && a.pending_dispatch===false &&
     ['running','retrying','claimed','blocked'].every(k=>Array.isArray(a[k]) && a[k].length===0);
+}
+// Hashed live metadata only: no key, token, Env or role body is emitted. A host
+// proof authenticates canonical binds; a helper can recheck the same objects
+// without mounting the auth private key into its own namespace.
+export async function ownershipServiceEvidence(all,docker) {
+  const context=await mountContext(docker,Object.values(all)),kernel=(await readFile('/proc/sys/kernel/random/boot_id','utf8')).trim();
+  const services=Object.entries(all).sort(([a],[b])=>a.localeCompare(b)).map(([service,x])=>{
+    require(x.State?.Running && x.State.Health?.Status==='healthy','Ownership service unhealthy');
+    const runtime=runtimeIdentity(x);
+    const mountHashes=x.Mounts.map(m=>{const identity=context.mounted.get(m);require(identity,'Missing ownership mount identity');return {type:m.Type,destination:m.Destination,rw:m.RW,identityHash:digest(identity)};}).sort((a,b)=>a.destination.localeCompare(b.destination));
+    return {service,id:x.Id,image:x.Image,runtimeHash:digest({...runtime,mounts:runtime.mounts.map(m=>m.type==='bind'?{...m,source:null}:m)}),mountHashes};
+  });
+  return {kernel,services};
+}
+export async function deploymentOwnershipCheck(c,{containers,docker,state,fixture=false,request,expectedManifest=c.manifest}) {
+  deploymentConfig(c,{fixture,ownership:true});const b=c.ownershipVersion===1?c.current:c.previous;
+  await bundleFiles(c,b,docker,{fixture});const all=await matchDeploymentBundle(c,b,{containers,docker,fixture});
+  const s=await state();require(hex(s.admission?.generation) && typeof s.admission?.paused==='boolean','Admission observation unknown');
+  activeContract({...c,manifest:expectedManifest,deploymentId:s.admission.generation},b,s,s.admission.paused);
+  const observation=await observeDeploymentOwners(c,{containers,docker,fixture});
+  const reconciled=await reconciledDeploymentOwners(c,observation.rows,observation),historicalOwnersIdle=await deploymentOwnersIdle(c,observation.rows,observation);
+  let controllerLock=false;try{await lstat(join(c.stateRoot,'controller.lock'));controllerLock=true;}catch(e){if(e.code!=='ENOENT')throw e;}
+  const runtimeIdle=runtimeOwnersIdle(s);
+  const serviceEvidence=await ownershipServiceEvidence(all,docker);
+  const after=await containers();
+  require(observation.engine===all.symphony.Id && Object.keys(all).every(k=>after[k]?.Id===all[k].Id && same(runtimeIdentity(after[k],{fixture}),runtimeIdentity(all[k],{fixture})) && after[k].State?.Running===true && after[k].State.Health?.Status==='healthy'), 'Ownership services changed during observation');
+  return {kind:'deployment-ownership-v1',effects:'none',repo:c.repo,base:c.base,project:c.project,controllerVersion:c.controllerVersion,engine:observation.engine,engineImage:all.symphony.Image,dataVolume:c.dataVolume,...(request?{sourceRequest:request}:{}),ledgerHashes:observation.rows.map(r=>({file:r.file,ledgerHash:digest(Buffer.from(r.bytes,'base64')),enrollmentHash:r.enrollment===null?null:digest(Buffer.from(r.enrollment,'base64'))})).sort((a,b)=>a.file.localeCompare(b.file)),serviceEvidence,manifestContract:observation.manifest?digest(observation.manifest):null,reconciledOwners:[...reconciled].sort(),historicalOwnersIdle,runtimeIdle,controllerLock,ownersIdle:historicalOwnersIdle && runtimeIdle && !controllerLock};
 }
 export async function reconciledDeploymentOwners(c,rows,observation) {
   const reconciled=new Set();
@@ -486,7 +544,7 @@ export async function replaceConnectedBundle(c,b,{files,isolation,docker,contain
 }
 
 async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false}={}) {
-  deploymentConfig(c,{fixture});
+  deploymentConfig(c,{fixture,ownership:preflight==='ownership'});
   await privateFile(requestFile);
   const requestBytes=await readFile(requestFile), api=github(c);
   require(same(JSON.parse(requestBytes),c),'Request bytes/config mismatch');
@@ -528,14 +586,10 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
   };
   const files=b=>bundleFiles(c,b,docker,{fixture});
   const observed=async()=>Object.fromEntries(Object.entries(await containers()).map(([k,x])=>[k,{...runtimeIdentity(x,{fixture}),running:x.State.Running,health:x.State.Health?.Status}]));
-  const match=async b=>{
-    const all=await containers();
-    for(const service of (fixture?['symphony']:['symphony','github-auth'])) {
-      const x=all[service], normalized=fixture?{...x,Mounts:await fixtureMountSources(x,b.inspect[service],docker)}:x;
-      require(same(runtimeIdentity(normalized,{fixture}),b.inspect[service]) && x.State.Running && x.State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
-    }
-    return all;
-  };
+  const match=b=>matchDeploymentBundle(c,b,{containers,docker,fixture});
+  if(preflight==='ownership') {
+    await authorize();return deploymentOwnershipCheck(c,{containers,docker,state,fixture,request:{path:requestFile,hash:digest(requestBytes)}});
+  }
   const observeOwners=async()=>observeDeploymentOwners(c,{containers,docker,fixture});
   const ownersIdle=async()=>{
     const observation=await observeOwners();
@@ -634,19 +688,6 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
       await api(found.length?'PATCH':'POST',found.length?`/repos/${c.repo}/issues/comments/${found[0].id}`:path,{body});
     }
   };
-  if(preflight==='ownership') {
-    await authorize();await files(c.previous);await match(c.previous);
-    const s=await state();
-    require(hex(s.admission?.generation) && typeof s.admission?.paused==='boolean','Admission observation unknown');
-    activeContract({...c,deploymentId:s.admission.generation},c.previous,s,s.admission.paused);
-    const observation=await observeOwners();
-    const reconciled=await reconciledDeploymentOwners(c,observation.rows,observation);
-    const historicalOwnersIdle=await deploymentOwnersIdle(c,observation.rows,observation);
-    let controllerLock=false;
-    try {await lstat(join(c.stateRoot,'controller.lock'));controllerLock=true;}catch(e){if(e.code!=='ENOENT')throw e;}
-    const runtimeIdle=runtimeOwnersIdle(s);
-    return {effects:'none',engine:observation.engine,dataVolume:c.dataVolume,reconciledOwners:[...reconciled],historicalOwnersIdle,runtimeIdle,controllerLock,ownersIdle:historicalOwnersIdle && runtimeIdle && !controllerLock};
-  }
   if(preflight) return deploy(c,io,{preflight:true,fixture});
   return withDeploymentLock(c,async()=>{controllerOwned=true;return deploy(c,io,{fixture});});
 }

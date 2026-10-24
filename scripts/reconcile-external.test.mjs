@@ -265,3 +265,52 @@ test('verified historical owner never excuses active or unknown runtime work',as
   assert.equal(runtimeOwnersIdle({...state,admission:{...state.admission,pending_dispatch:true}}),false);
  }finally{await f.clean();}
 });
+
+async function controllerSetup() {
+ const f=await setup(),c=f.c;
+ Object.assign(c,{profile:'controller-only-v2',originalIterations:2,originalLimit:3,externalIterations:1,controllerVersion:c.merge,controllerTree:c.tree,dataVolume:'live-data'});
+ Object.assign(f.ledger,{iterations:2,reason:'Missing exact reviewed publication',events:[{role:'review',result:{status:'complete'}}]});
+ const pin=async(name,value)=>{const path=f.paths[name] || join(f.root,name+'.json');f.paths[name]=path;await atomic(path,value);c.evidence[name]={path,hash:digest(await readFile(path))};};
+ await pin('ledger',f.ledger);
+ const scope={repo:c.repo,issue:c.issue,pr:c.pr,head:c.head,tree:c.tree};
+ await pin('publishArtifact',{status:'complete',publication:{repo:c.repo,issue:Number(c.issue),pr:c.pr,base:c.base,head:sha(9)}});
+ await pin('review',{kind:'controller-external-review-v2',...scope,status:'approved',model:'gpt-6-astra',reasoning:'high',fast:false,session:'independent-review'});
+ await pin('tests',{kind:'controller-external-tests-v2',...scope,status:'passed',tests:400,failures:0,skipped:0,checks:['node','syntax','diff'].map(name=>({name,exit:0})),logHashes:{node:hex(1),syntax:hex(2),diff:hex(3)}});
+ await pin('ownershipRequest',{ownershipVersion:1,authority:{observe:true},repo:c.repo,base:c.base,controllerVersion:c.merge,dataVolume:c.dataVolume});
+ await pin('recovery',{kind:'controller-external-attempt-v2',...scope,status:'completed',originalUsed:2,limit:3,externalUsed:1,totalUsed:3,originalHead:sha(9),buildSession:'external-build',originalHashes:Object.fromEntries(['ledger','publishArtifact','launchJournal','manifest'].map(k=>[k,c.evidence[k].hash]))});
+ const serviceEvidence={kernel:'11111111-1111-1111-1111-111111111111',services:['symphony','github-auth'].map((service,i)=>({service,id:i?hex(9):c.engineContainer,image:c.engineImage,runtimeHash:hex(i+1),mountHashes:[{type:'volume',destination:'/data',rw:true,identityHash:hex(i+1)}]}))};
+ await pin('ownership',{kind:'deployment-ownership-v1',effects:'none',...scope,base:c.base,controllerVersion:c.merge,engine:c.engineContainer,engineImage:c.engineImage,dataVolume:c.dataVolume,sourceRequest:c.evidence.ownershipRequest,ledgerHashes:[{file:keyFor(c)+'.json',ledgerHash:c.evidence.ledger.hash,enrollmentHash:c.evidence.enrollment.hash}],serviceEvidence,manifestContract:digest(f.manifest),runtimeIdle:true,controllerLock:false});
+ await pin('validation',{kind:'controller-install-v2',...scope,commit:c.merge,controllerVersion:c.merge,controllerTree:c.tree,status:'installed',engineUnchanged:true,engineContainer:c.engineContainer,engineImage:c.engineImage,ownershipHash:c.evidence.ownership.hash});
+ f.io.installedController=async()=>({commit:c.merge,tree:c.tree});f.io.ownership=async()=>JSON.parse(await readFile(f.paths.ownership));f.pin=pin;
+ return f;
+}
+test('versioned controller completion preserves numeric publish failure and shared2+1 budget without a deployment record',async()=>{
+ const f=await controllerSetup();try {
+  const original=digest(await readFile(f.paths.ledger)),artifact=digest(await readFile(f.paths.publishArtifact));
+  const before=await snapshot(f.root);assert.equal((await reconcileExternal(f.c,f.io,{check:true})).status,'eligible');assert.deepEqual(await snapshot(f.root),before);
+  await f.run();const receipt=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));
+  assert.equal(receipt.v,2);assert.equal(receipt.binding.originalLimit,3);assert.equal(receipt.binding.originalIterations+receipt.binding.externalIterations,3);
+  assert.equal(digest(await readFile(f.paths.ledger)),original);assert.equal(digest(await readFile(f.paths.publishArtifact)),artifact);
+  assert.equal(JSON.parse(await readFile(f.paths.publishArtifact)).publication.issue,1);
+  assert.equal(await verifiedExternalReceipt({...f.c,controllerVersion:sha(8),engineContainer:hex(8),engineImage:'sha256:'+hex(8)},keyFor(f.c)),true);
+  await atomic(f.paths.manifest,{issue:'another-scope'});assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
+ }finally{await f.clean();}
+});
+for(const phase of ['intent','fence-written','fenced','manifest-retired','gate-restored','receipt'])test('controller-only retry is safe after '+phase,async()=>{
+ const f=await controllerSetup();try {
+  let failed=false;f.io.checkpoint=async p=>{if(p===phase&&!failed){failed=true;throw Error('crash');}};
+  await assert.rejects(f.run(),/crash/);await f.run();assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
+ }finally{await f.clean();}
+});
+for(const [name,change] of [
+ ['extra external build',f=>{f.c.externalIterations=2;}],['different limit',f=>{f.c.originalLimit=4;}],
+ ['unknown profile',f=>{f.c.profile='blocked-anything';}],['wrong installed controller',f=>{f.io.installedController=async()=>({commit:sha(8),tree:f.c.tree});}],
+ ['stale live ledger',f=>{const own=f.io.ownership;f.io.ownership=async()=>({...await own(),ledgerHashes:[]});}],
+ ['changed auth runtime',f=>{const own=f.io.ownership;f.io.ownership=async()=>({...await own(),serviceEvidence:{kernel:'changed',services:[]}});}],
+ ['synthetic fixed publication',async f=>{const a=JSON.parse(await readFile(f.paths.publishArtifact));a.publication.issue=f.c.issue;await f.pin('publishArtifact',a);}],
+ ['stale reviewed head',async f=>{const r=JSON.parse(await readFile(f.paths.review));r.head=sha(8);await f.pin('review',r);}],
+ ['failed external tests',async f=>{const r=JSON.parse(await readFile(f.paths.tests));r.failures=1;await f.pin('tests',r);}],
+ ['build self-review',async f=>{const r=JSON.parse(await readFile(f.paths.review));r.session='external-build';await f.pin('review',r);}],
+])test('controller profile blocks '+name+' without effects',async()=>{
+ const f=await controllerSetup();try {await change(f);const before=await snapshot(f.root);await assert.rejects(f.run());assert.deepEqual(await snapshot(f.root),before);}finally{await f.clean();}
+});
