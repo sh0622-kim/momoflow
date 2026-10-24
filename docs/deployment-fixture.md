@@ -323,3 +323,14 @@ GitHub head/merge/review/auth와 모델 호출이 없으며 결과도 `not-exerc
 회귀는 외부 효과를 모의했으며 위 실 Docker 실행은 외부 운영자 검증 항목이다. 중간 실패는
 manifest/journal/격리 자원을 보존하고 재실행하지 않는다. GH-30의 정책·host controller 설치는
 이 실험과 별도 예외 작업이며 자기 승인하지 않는다.
+
+
+GH-30의 독립 helper 설치 회귀는 실제 `finishConnected` subprocess와
+`deploy.mjs --ownership-check` subprocess에서 config/module/파일 경로를 실행한다.
+canonical 키 경로 없이 고정 host proof를 사용하는 성공, proof/sourceRequest 변조,
+auth restart/runtime/mount drift, 다른 bind 대응 실패, 다른 helper와 network 공유,
+helper의 secret parent 노출 거부를 확인한다. 로컬 회귀의 Docker/HTTP 및 kernel 좌표는
+명시적 모의 자료다. 이것을 live host proof나 일반 GitHub 배포 자격으로 사용하지 않는다.
+외부 운영자는 새 exact PR head의 독립 bridge helper에서 키/secret parent mount 없이
+full `--ownership-check`를 실행하고, 이 문서의 격리 finish lifecycle과 함께 PR에 기록한다.
+고정 host proof 생성/설정 계약은 [배포 문서](deployment.md#gh-30-후보-최초-launch에-묶는-정상-마무리)를 따른다.

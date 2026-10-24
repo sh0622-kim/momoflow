@@ -1,3 +1,4 @@
+import { hostname } from 'node:os';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { command } from './post-pr-docker.mjs';
@@ -50,7 +51,20 @@ test('production and isolated completion connections reject mixed scopes before 
  const c={repo:'smoke/fixture',issue:'18',base:'main',fixtureSource:'a',fixtureRepository:'/unused',integration:{}};
  await assert.rejects(connectedFixtureCompletion(c,'/unused',{status:'present',value:{v:1,id:'a'.repeat(64),repo:'smoke/fixture',issue:'19',base:'main',limit:3}},()=>assert.fail()),/Exact isolated completion manifest/);
 });
-for(const mode of ['policy','recheck']) test(`actual pinned finishConnected subprocess: ${mode} (mock GitHub; no Docker effects)`,async()=>{
+for(const mode of ['policy','recheck','bridge']) test(`actual pinned finishConnected subprocess: ${mode} (mock GitHub; no Docker effects)`,async()=>{
  const r=await command(process.execPath,[fileURLToPath(new URL('./finish-connected-fixture.mjs',import.meta.url)),mode],{timeout:90000});
- assert.equal(r.exit,0,r.output.toString());const row=JSON.parse(r.output);assert.equal(row.mode,mode);assert.ok(row.checked>=4);
+ assert.equal(r.exit,0,r.output.toString());const row=JSON.parse(r.output);assert.equal(row.mode,mode);assert.ok(row.checked>=(mode==='bridge'?1:4));
+});
+
+import { config, verifyIndependentOperator } from './post-pr.mjs';
+test('host bridge address requires explicit finish delegation and fixed helper; remote addresses stay rejected',async()=>{
+ const {c}=setup();c.engineURL='http://host.docker.internal:4000';c.operatorContainer='helper';assert.equal(finishConfig(c),c);
+ for(const mutate of [x=>delete x.finish,x=>x.authority.finish=false,x=>delete x.operatorContainer,x=>x.engineURL='http://example.org:4000',x=>x.engineURL='http://host.docker.internal.evil:4000',x=>x.engineURL='http://192.168.1.2:4000']) {const x=structuredClone(c);mutate(x);assert.throws(()=>config(x));}
+ const old=process.env.HOSTNAME;process.env.HOSTNAME=hostname();
+ try {
+  const self={Id:'a'.repeat(64),Config:{Hostname:hostname()},HostConfig:{NetworkMode:'operator_bridge'},State:{Running:true}};
+  const docker=async()=>JSON.stringify([self]);assert.equal((await verifyIndependentOperator(c,docker)).Id,self.Id);
+  for(const mutate of [x=>x.HostConfig.NetworkMode='host',x=>x.HostConfig.NetworkMode='container:engine',x=>x.State.Running=false,x=>x.Config.Hostname='other',x=>x.Config.Labels={'com.docker.compose.service':'symphony'},x=>x.Config.Labels={'com.docker.compose.service':'github-auth'}]) {const x=structuredClone(self);mutate(x);await assert.rejects(verifyIndependentOperator(c,async()=>JSON.stringify([x])));}
+  await assert.rejects(verifyIndependentOperator(c,async args=>JSON.stringify([{...self,Id:args[1]===hostname()?'other':self.Id}])) ,/not this process/);
+ } finally {if(old===undefined)delete process.env.HOSTNAME;else process.env.HOSTNAME=old;}
 });

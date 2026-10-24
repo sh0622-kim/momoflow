@@ -358,6 +358,36 @@ canonical regular 경로이며 group/world write를 금지한다. 설정을 나�
 ```
 
 위 previous는 설명용 축약이다. 실제로는 이 문서의 **완전한 previous bundle**을 제공한다.
+독립 helper에서는 최초 launch 설정의 `engineURL`을 literal
+`http://host.docker.internal:PORT`, `operatorContainer`를 실제 자기 컨테이너로 지정할 수 있다.
+이는 명시적 `finish`/`authority.finish:true`에만 허용하며, 설치 검사에서 Docker inspect로
+실제 자기 hostname/ID, running 및 독립 network를 확인한다. host network와
+`--network container:ENGINE`은 지원하지 않는다. 임의 원격 주소나 engine/auth 컨테이너는 거부한다.
+
+helper에 canonical auth 키 경로가 없으면 최초 `finish` object에 다음 선택 필드를 고정한다.
+
+```json
+{"authBindProof":{"path":"/operator/evidence/host-ownership.json","hash":"<exact bytes SHA256>","sourceRequest":{"path":"/operator/evidence/host-ownership-request.json","hash":"<exact bytes SHA256>"}}}
+```
+
+원본은 canonical 키 경로를 직접 확인할 수 있는 호스트에서 **full**
+`deploy.mjs /operator/evidence/host-ownership-request.json --ownership-check`로 생성한다.
+request는 `ownershipVersion:1`, `authority.observe:true`, `current`의 완전한 현재 bundle을
+사용하고 `authBindProof`를 포함하지 않는다. stdout JSON의 정확한 바이트를 private regular
+파일로 보존하고 두 파일의 바이트 hash를 최초 launch 설정에 묶는다. proof의 `sourceRequest`
+path/hash도 이 원본과 일치해야 한다. 기존 host proof를 사용할 때도 이 계약을 확인한다.
+두 파일은 helper에 read-only로 제공하며, 키나 secret 상위 디렉터리는 mount하지 않는다.
+token은 기존 live token volume의 read-only mount를 유지하고 ledger는 실제 live data volume을
+사용한다. token/ledger 복사본으로 대체하지 않는다.
+
+이 proof는 변경 없는 auth의 `/run/secrets/github-app.pem:ro` bind에만 적용한다.
+매 bundle 검사에서 원본 두 파일의 hash/범위와 auth bundle을 확인하고, 현재 커널 boot ID,
+auth container ID/image, 전체 runtime 및 모든 auth mount의 kernel identity hash를 새로 대조한다.
+helper의 mount도 새로 조회하여 키/secret parent와 겹치면 거부한다. 다른 bind는 계속
+canonical host stat과 live mount의 직접 대응을 요구한다. auth 재시작·키/mount/runtime drift,
+proof 누락·변조·연쇄 proof는 차단한다. 변경 시 원본 host full check와 새 운영자 설정이 필요하며
+실행 중 launch 설정을 바꾸거나 기존 완료/실패 기록을 고쳐서 재개하지 않는다.
+
 일반 적격 변경은 WORKFLOW/runner/auth/권한을 보존하므로 이전 bundle에서 symphony image만
 검사한 image ID로 바꾼 새 Compose를 생성하고 나머지 파일/기대 runtime을 그대로 검증한다.
 image의 기본 command/user/env 등이 달라 기대 runtime과 불일치하면 기존 검사가 차단한다.

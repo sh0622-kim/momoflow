@@ -1,8 +1,9 @@
 // Installed and pinned by an operator OUTSIDE candidate workspaces. No shell evaluation.
 import { createHash } from 'node:crypto';
-import { readFile, writeFile, mkdir, rename, open, rm, realpath } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, open, rm, realpath, lstat } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { hostname } from 'node:os';
 import { validateDocker, command, validationKind, checkOutcome } from './post-pr-docker.mjs';
 
 export const digest = x => createHash('sha256').update(typeof x === 'string' || Buffer.isBuffer(x) ? x : JSON.stringify(x)).digest('hex');
@@ -25,7 +26,8 @@ export function config(c) {
   for (const k of ['stateRoot', 'inboxRoot', 'ledgerRoot', 'tokenFile', 'trustedRoot']) {
     assert(typeof c[k] === 'string' && c[k] === resolve(c[k]), `Absolute trusted path required: ${k}`);
   }
-  assert(sha(c.controllerVersion) && typeof c.engineURL === 'string' && /^http:\/\/(127\.0\.0\.1|localhost):[0-9]+$/.test(c.engineURL), 'Pinned controller/local engine required');
+  const bridge=c.finish?.previous && ['finish','deploy','retire','close'].every(k=>c.authority?.[k]===true) && typeof c.operatorContainer==='string' && /^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/.test(c.operatorContainer) && /^http:\/\/host\.docker\.internal:[0-9]+$/.test(c.engineURL);
+  assert(sha(c.controllerVersion) && typeof c.engineURL === 'string' && (/^http:\/\/(127\.0\.0\.1|localhost):[0-9]+$/.test(c.engineURL) || bridge), 'Pinned controller/local engine required');
   assert(Array.isArray(c.requiredChecks) && c.requiredChecks.every(x => typeof x.name === 'string' && Number.isSafeInteger(x.appId) && x.appId > 0), 'Explicit trusted external check producers required');
   assert(new Set(c.requiredChecks.map(x => x.name)).size === c.requiredChecks.length, 'Duplicate check names');
   assert(Array.isArray(c.requiredReviewers), 'Explicit required reviewers required');
@@ -327,6 +329,15 @@ export async function reconcile(c, io) {
   }
 }
 
+export async function verifyIndependentOperator(c,docker) {
+  assert(c.operatorContainer && process.env.HOSTNAME,'Container operator identity required');
+  const self=JSON.parse(await docker(['inspect',c.operatorContainer]))[0];
+  assert(self?.Id && self.State?.Running===true && self.Config.Hostname===process.env.HOSTNAME && self.Config.Hostname===hostname() && !self.HostConfig.NetworkMode.startsWith('container:') && !['host','none'].includes(self.HostConfig.NetworkMode) && !['symphony','github-auth'].includes(self.Config.Labels?.['com.docker.compose.service']), 'Operator must have an independent container lifetime/network');
+  // The named container must be this process, not another helper with a copied hostname.
+  const own=JSON.parse(await docker(['inspect',process.env.HOSTNAME]))[0];
+  assert(own?.Id===self.Id,'Operator container is not this process');
+  return self;
+}
 export async function verifyInstall(c) {
   assert(await realpath(join(c.trustedRoot, 'scripts/post-pr.mjs')) === await realpath(new URL(import.meta.url)), 'Controller must run from pinned trusted checkout');
   const head = await command('git', ['-C', c.trustedRoot, 'rev-parse', 'HEAD']);
@@ -334,6 +345,10 @@ export async function verifyInstall(c) {
   assert(head.exit === 0 && head.output.toString().trim() === c.controllerVersion && status.exit === 0 && status.output.length === 0, 'Controller checkout version/cleanliness mismatch');
   for (const path of [c.stateRoot, c.inboxRoot, c.ledgerRoot, c.tokenFile])
     assert(!resolve(path).startsWith(c.trustedRoot + '/'), 'Operational data must be outside controller checkout');
+  if(c.finish && /^http:\/\/host\.docker\.internal:/.test(c.engineURL)) {
+    await lstat('/.dockerenv');
+    await verifyIndependentOperator(c,async args=>{const r=await command('docker',args,{dockerConfig:c.dockerConfig,timeout:5000});assert(r.exit===0,'Operator identity inspect failed');return r.output.toString();});
+  }
 }
 
 // Shared by legacy reconcile/watch and launch: ownership lasts across watch sleeps.

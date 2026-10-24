@@ -1,12 +1,12 @@
 // Install this CLI from a reviewed, pinned checkout OUTSIDE the engine/candidate workspace.
 // There is deliberately no build, pull, shell command hook, policy editor or ledger writer.
 import { verifiedExternalReceipt } from './reconcile-external.mjs';
-import { fixtureMountSources, verifiedMountSources, mountContext } from './deploy-mount-identity.mjs';
+import { fixtureMountSources, verifiedMountSources, mountContext, identitiesOverlap } from './deploy-mount-identity.mjs';
 import { readFile, readdir, lstat, realpath, mkdir, open, rm, copyFile } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { atomic, digest, json, receipt, validation, list, github, verifyInstall } from './post-pr.mjs';
+import { atomic, digest, json, receipt, validation, list, github, verifyInstall, verifyIndependentOperator } from './post-pr.mjs';
 import { command } from './post-pr-docker.mjs';
 import { fixtureEvidence, inspectIsolation, fixtureRuntime, fixtureEnvironment, fixtureEmptyState } from './deploy-fixture.mjs';
 export class DeploymentError extends Error {}
@@ -20,6 +20,10 @@ const same = isDeepStrictEqual;
 const optional = async p => { try { return await json(p); } catch(e) { if(e.code === 'ENOENT') return null; throw e; } };
 const sleep = ms => new Promise(r => setTimeout(r,ms));
 export function deploymentConfig(c,{fixture=false,ownership=false}={}) {
+  if(c.authBindProof!==undefined) {
+    const p=c.authBindProof;
+    require(!fixture && p && same(Object.keys(p).sort(),['hash','path','sourceRequest']) && p.sourceRequest && same(Object.keys(p.sourceRequest).sort(),['hash','path']) && [p,p.sourceRequest].every(x=>hex(x.hash) && typeof x.path==='string' && resolve(x.path)===x.path && !x.path.startsWith('/data/workspaces/')) && typeof c.operatorContainer==='string','Pinned host auth bind proof/sourceRequest and independent operator required');
+  }
   const currentOnly=ownership && c.ownershipVersion===1;
   if(currentOnly) {
     require(!fixture && !c.fixtureMode && !c.fixtureSource && !c.fixtureRepository && c.current && !c.previous && !c.target,'Current-only ownership request required');
@@ -220,9 +224,10 @@ export function runtimeIdentity(x,{fixture=false}={}) {
 }
 export async function matchDeploymentBundle(c,b,{containers,docker,fixture=false}) {
   const all=await containers(),services=fixture?['symphony']:['symphony','github-auth'];
+  const authKeyIdentityHash=c.authBindProof?await boundAuthKeyProof(c,b,all,docker):null;
   for(const service of services) {
     const x=all[service];require(x && b.inspect[service],'Missing expected deployment service');
-    const normalized={...x,Mounts:await verifiedMountSources(x,b.inspect[service],docker)};
+    const normalized={...x,Mounts:await verifiedMountSources(x,b.inspect[service],docker,service==='github-auth'?{authKeyIdentityHash}:undefined)};
     require(same(runtimeIdentity(normalized,{fixture}),b.inspect[service]) && x.State.Running && x.State.Health?.Status==='healthy','Actual image/config/security/health mismatch');
   }
   const after=await containers();
@@ -423,6 +428,34 @@ export async function ownershipServiceEvidence(all,docker) {
   });
   return {kernel,services};
 }
+// Operator-bound, original full host check. Only the unchanged auth key bind may
+// use this proof; every other bind still requires fresh host/live correspondence.
+export async function boundAuthKeyProof(c,b,all,docker) {
+  const binding=c.authBindProof;
+  require(binding && !c.fixtureMode,'Host auth bind proof required');
+  const read=async ref=>{await privateFile(ref.path);const bytes=await readFile(ref.path);require(digest(bytes)===ref.hash,'Host auth proof/sourceRequest bytes changed');return JSON.parse(bytes);};
+  const proof=await read(binding),source=await read(binding.sourceRequest);
+  require(!source.authBindProof && source.ownershipVersion===1,'Original full host ownership check required; no chained proof');
+  deploymentConfig(source,{ownership:true});
+  require(proof.kind==='deployment-ownership-v1' && proof.effects==='none' && same(proof.sourceRequest,binding.sourceRequest) && proof.controllerVersion===source.controllerVersion && proof.engineImage===source.current.image && proof.dataVolume===source.dataVolume && proof.repo===source.repo && proof.base===source.base && proof.project===source.project && ['repo','base','project','dataVolume'].every(k=>source[k]===c[k]),'Host ownership proof scope/sourceRequest mismatch');
+  require(b.authImage===source.current.authImage && same(b.inspect['github-auth'],source.current.inspect['github-auth']),'Auth bundle changed from full host proof');
+  const live=await ownershipServiceEvidence(all,docker),auth=live.services.find(x=>x.service==='github-auth'),pinned=proof.serviceEvidence?.services?.filter(x=>x.service==='github-auth');
+  require(live.kernel===proof.serviceEvidence?.kernel && pinned?.length===1 && same(auth,pinned[0]),'Auth service/kernel/runtime/mount changed from host proof');
+  const key=b.inspect['github-auth'].mounts.filter(m=>m.destination==='/run/secrets/github-app.pem');
+  require(key.length===1 && key[0].type==='bind' && key[0].rw===false,'Exact unchanged auth private-key bind required');
+  const self=await verifyIndependentOperator(c,docker);
+  require(!Object.values(all).some(x=>x.Id===self.Id),'Operator cannot be a managed service');
+  // Compare live kernel identities too: opaque Docker Source names and aliases
+  // cannot conceal a key or its parent mounted into the operator helper.
+  const context=await mountContext(docker,[all['github-auth'],self]);
+  const mounted=all['github-auth'].Mounts.find(m=>m.Destination==='/run/secrets/github-app.pem');
+  const identity=context.mounted.get(mounted);
+  require(identity && !self.Mounts.some(m=>{
+    const a=context.mounted.get(m);return !a || identitiesOverlap(a,identity);
+  }),'Operator must not mount auth key or secret parent');
+  const hash=auth.mountHashes.filter(m=>m.destination==='/run/secrets/github-app.pem' && m.type==='bind' && m.rw===false);
+  require(hash.length===1,'Host auth key mount evidence missing');return hash[0].identityHash;
+}
 export async function deploymentOwnershipCheck(c,{containers,docker,state,fixture=false,request,expectedManifest=c.manifest}) {
   deploymentConfig(c,{fixture,ownership:true});const b=c.ownershipVersion===1?c.current:c.previous;
   await bundleFiles(c,b,docker,{fixture});const all=await matchDeploymentBundle(c,b,{containers,docker,fixture});
@@ -592,9 +625,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     await verifyInstall(fixture?{...c,tokenFile:join(c.stateRoot,'unused-token-path')}:c);
     try {
       await lstat('/.dockerenv');
-      require(c.operatorContainer && process.env.HOSTNAME,'Container operator identity required; never execute inside the engine');
-      const self=await inspect(c.operatorContainer);
-      require(self.Config.Hostname===process.env.HOSTNAME && !self.HostConfig.NetworkMode.startsWith('container:') && self.HostConfig.NetworkMode!=='host' && self.Config.Labels?.['com.docker.compose.service']!=='symphony','Operator must have an independent container lifetime/network');
+      await verifyIndependentOperator(c,docker);
     } catch(e) {if(e.code!=='ENOENT') throw e;}
   };
   const files=b=>bundleFiles(c,b,docker,{fixture});

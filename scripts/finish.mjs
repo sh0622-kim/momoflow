@@ -13,7 +13,7 @@ export function finishConfig(c) {
   config(c);
   require(c.authority.finish===true && c.authority.deploy===true && c.authority.retire===true && c.authority.close===true && !c.hold,'Explicit finish/deploy/retire/close authority required');
   require(c.launch && same(c.launch,{v:1,id:c.launchId,repo:c.repo,issue:c.issue,base:c.base,limit:c.iterationLimit}) && /^[a-f0-9]{64}$/.test(c.launchId) && [1,2,3].includes(c.iterationLimit),'Exact launch scope/limit required');
-  require(c.finish && same(Object.keys(c.finish).sort(),['dataVolume','deploymentRoot','drainMs','gateRoot','previous','project','verifyMs'].sort()),'Fixed completion bundle/operation policy required; unknown finish fields forbidden');
+  require(c.finish && same(Object.keys(c.finish).filter(k=>k!=='authBindProof').sort(),['dataVolume','deploymentRoot','drainMs','gateRoot','previous','project','verifyMs'].sort()),'Fixed completion bundle/operation policy required; unknown finish fields forbidden');
   for(const k of ['launchRoot', 'configFile']) require(typeof c[k]==='string' && resolve(c[k])===c[k],'Canonical completion path required: '+k);
   for(const k of ['deploymentRoot','gateRoot']) require(typeof c.finish[k]==='string' && resolve(c.finish[k])===c.finish[k],'Canonical completion root required: '+k);
   require(Number.isInteger(c.finish.drainMs) && c.finish.drainMs>=1 && c.finish.drainMs<=3600000,'Bounded completion drain deadline required');

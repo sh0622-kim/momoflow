@@ -1,3 +1,4 @@
+import { hostname } from 'node:os';
 // Actual pinned finishConnected path in a subprocess. Only GitHub is mocked;
 // every case must stop before Docker or deployment/retirement effects.
 import assert from 'node:assert/strict';
@@ -29,6 +30,14 @@ if(!process.argv[3]) {
   const root=await mkdtemp(join(install,'case-')),f=fixture();f.merged=true;
   const c={...f.c,trustedRoot:trusted,controllerVersion:head.output.toString().trim(),launchId:'a'.repeat(64),iterationLimit:3,authority:{...f.c.authority,finish:true,deploy:true,retire:true}};
   for(const k of ['stateRoot','inboxRoot','ledgerRoot','launchRoot']){c[k]=join(root,k);await mkdir(c[k],{mode:0o700});}
+  if(mode==='bridge') {
+   process.env.HOSTNAME=hostname();c.operatorContainer='helper';c.engineURL='http://host.docker.internal:4000';
+   const bin=join(root,'bin');await mkdir(bin);
+   const self={Id:'a'.repeat(64),Config:{Hostname:process.env.HOSTNAME},HostConfig:{NetworkMode:'operator_bridge'},State:{Running:true}};
+   const {writeFile}=await import('node:fs/promises');
+   await writeFile(join(bin,'docker'),'#!'+process.execPath+'\nrequire("fs").writeSync(1,'+JSON.stringify(JSON.stringify([self]))+');',{mode:0o700});
+   process.env.PATH=bin+':'+process.env.PATH;
+  }
   c.configFile=join(root,'config.json');c.tokenFile=join(root,'mock-token.json');
   await atomic(c.tokenFile,{token:'isolated-unused-token',expires_at:new Date(Date.now()+3600000).toISOString()});
   const composeFile=join(root,'previous-compose.json');await atomic(composeFile,{services:{symphony:{image:'sha256:'+'a'.repeat(64)}}});
@@ -90,6 +99,6 @@ if(!process.argv[3]) {
  } else if(mode==='recheck') {
   for(const drift of ['ledger','host',undefined])await run({complete:true,drift});
   await run({complete:true,file:'engine/admission.ex'});
- } else assert.fail('Unknown connected fixture mode');
+ } else if(mode==='bridge') {await run({});} else assert.fail('Unknown connected fixture mode');
  writeSync(1,JSON.stringify({mode,checked,evidenceKind:'mock-github-real-finishConnected-subprocess-files-locks-no-docker'})+'\n');
 }
