@@ -306,16 +306,16 @@ export async function reconcile(c, io) {
     const reportedIssue = await api('GET', `${root}/issues/${c.issue}`);
     const issueNote = reportedIssue.state === 'closed' && reportedIssue.state_reason && reportedIssue.state_reason !== 'completed'
       ? ` 원본 이슈 상태 closed (${reportedIssue.state_reason}); 기존 종료 사유를 보존합니다.` : '';
-    const text = `완료: PR #${p.pr}, 검증 head ${p.head}, tree ${p.tree}, merge ${pr.merge_commit_sha}. 독립 검토·호스트/필수 검사 근거 ${journal.request} 보존. 배포는 별도입니다.${issueNote}`;
+    const text = `${c.finish ? '병합 완료 (운영 마무리 대기)' : '완료'}: PR #${p.pr}, 검증 head ${p.head}, tree ${p.tree}, merge ${pr.merge_commit_sha}. 독립 검토·호스트/필수 검사 근거 ${journal.request} 보존. ${c.finish ? '배포·운영 확인·manifest 정리 전이며 이슈는 열어 둡니다.' : '배포는 별도입니다.'}${issueNote}`;
     await actionLabels(c, p, api, journal, save, null);
     await report(c, p, api, text);
     await removeReady(c, api);
     await io.authorize?.();
     assert(c.authority.close, 'Close authority missing');
     const issueBeforeClose = await api('GET', `${root}/issues/${c.issue}`);
-    if (issueBeforeClose.state !== 'closed') await api('PATCH', `${root}/issues/${c.issue}`, { state: 'closed', state_reason: 'completed' });
+    if (!c.finish && issueBeforeClose.state !== 'closed') await api('PATCH', `${root}/issues/${c.issue}`, { state: 'closed', state_reason: 'completed' });
     const closed = await api('GET', `${root}/issues/${c.issue}`);
-    assert(closed.state === 'closed', 'Issue close not confirmed');
+    assert(c.finish || closed.state === 'closed', 'Issue close not confirmed');
     await save({ done: true });
     return { done: true, merge: pr.merge_commit_sha };
   } catch (e) {

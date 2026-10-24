@@ -107,7 +107,9 @@ export async function deploymentEvidence(c, e, api, log) {
   const source=await api('GET',`${root}/contents/engine/role_runner.ex?ref=${c.target.commit}`);
   require(source.encoding==='base64' && digest(Buffer.from(source.content,'base64'))===c.target.runnerSource,'Runner source does not match exact merged candidate');
   const files=await list(api,`${root}/pulls/${p.pr}/files`);
-  const policy=/^(AGENTS\.md|WORKFLOW\.md|docs\/(agent-policy|constitution|deployment)\.md|security\/|\.github\/|scripts\/(post-pr|launch|test-role-flow)|engine\/role_runner\.ex|patches\/role-flow\.patch)/;
+  // Engine, auth, host execution and their verification/configuration remain exceptional.
+  // Check both sides of renames; preserving runtime shape does not prove unchanged policy.
+  const policy=/^(AGENTS\.md$|WORKFLOW\.md$|README\.md$|Dockerfile(?:\.|$)|compose(?:\.[^/]+)?\.ya?ml$|\.dockerignore$|\.env(?:\.|$)|docs\/(agent-policy|constitution|deployment|deployment-fixture|post-pr|github-flow|human-actions|records)\.md$|security\/|\.github\/|\.codex\/|\.agents\/|scripts\/|engine\/|patches\/)/;
   require(!files.some(x=>policy.test(x.filename) || (x.previous_filename && policy.test(x.previous_filename))),'Policy/check/permission/budget changes require separate exceptional deployment');
   const [owner,name]=c.repo.split('/');
   const response=await api('POST','/graphql',{query:'query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved} pageInfo{hasNextPage}}}}}',variables:{owner,name,number:p.pr}});
@@ -472,6 +474,11 @@ export async function connected(c,requestFile,preflight=false,{isolatedStop=fals
   require(!c.fixtureMode && !c.fixtureSource && !c.fixtureRepository, 'Fixture requests require the separate isolated integration entrypoint');
   return connect(c,requestFile,preflight,{isolatedStop});
 }
+// Fixed completion module retains the same deployment/controller lock across retirement.
+export async function connectedCompletion(c,requestFile,action) {
+  require(!c.fixtureMode && !c.fixtureSource && !c.fixtureRepository,'Production completion requires GitHub evidence');
+  return connect(c,requestFile,false,{completion:action});
+}
 // No fixture CLI flag or generic evidence callback. Isolation is mandatory here and
 // production authorization is never represented by local fixture provenance.
 export async function connectedFixture(c,requestFile,preflight=false,{isolatedStop=false}={}) {
@@ -480,6 +487,12 @@ export async function connectedFixture(c,requestFile,preflight=false,{isolatedSt
 }
 // Real fixture HTTP on its isolated loopback; never substitute another container
 // or fall back to the host endpoint when the exact pinned runtime is unavailable.
+// Separate isolated-only completion harness. Never accepts GitHub deployment credentials/evidence.
+export async function connectedFixtureCompletion(c,requestFile,manifest,action) {
+  require(c.fixtureSource && c.fixtureRepository && c.integration && c.repo==='smoke/fixture','Explicit isolated completion fixture required');
+  require(manifest?.status==='present' && manifest.value?.v===1 && hex(manifest.value.id) && manifest.value.repo===c.repo && manifest.value.issue===c.issue && manifest.value.base===c.base && [1,2,3].includes(manifest.value.limit) && same(Object.keys(manifest.value).sort(),['base','id','issue','limit','repo','v']),'Exact isolated completion manifest required');
+  return connect(c,requestFile,false,{fixture:true,completion:action,completionManifest:manifest});
+}
 export const fixtureHTTPProbe=`fetch('http://127.0.0.1:4000'+process.argv[1],{signal:AbortSignal.timeout(Number(process.argv[2]))}).then(async r=>{process.stdout.write(JSON.stringify({status:r.status,...(process.argv[1]==='/api/v1/state'?{state:await r.json()}: {})}));}).catch(()=>process.exit(1));`;
 export async function fixtureHTTP(c,b,x,docker,path,timeout=5000) {
   require(c.fixtureMode==='credential-free-v1' && c.repo==='smoke/fixture' && c.integration && [c.previous,c.target].some(v=>same(v,b)),'Explicit fixture HTTP scope required');
@@ -543,10 +556,10 @@ export async function replaceConnectedBundle(c,b,{files,isolation,docker,contain
   }
 }
 
-async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false}={}) {
+async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false,completion=null,completionManifest=null}={}) {
   deploymentConfig(c,{fixture,ownership:preflight==='ownership'});
   await privateFile(requestFile);
-  const requestBytes=await readFile(requestFile), api=github(c);
+  const requestBytes=await readFile(requestFile), api=github(c), expectedManifest=completionManifest || c.manifest;
   require(same(JSON.parse(requestBytes),c),'Request bytes/config mismatch');
   let operationDeadline=null;
   const remaining=()=>operationDeadline ? Math.max(1,operationDeadline-Date.now()) : c.verifyMs;
@@ -600,7 +613,10 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     const all=await containers();
     const network=JSON.parse(await docker(['network','inspect',`${c.project}_default`]))[0];
     require(network.Internal===true,'Fixture external traffic is not blocked');
-    await docker(['exec',all.symphony.Id,'node','-e',fixtureEmptyState]);
+    const script=completionManifest ? fixtureEmptyState.replace("'/run/momoflow-launch',",'')+`
+      const p='/run/momoflow-launch',names=fs.readdirSync(p);if(names.some(n=>n!=='active.json'))throw Error('Unexpected fixture launch files');
+      if(names.length){const f=p+'/active.json',s=fs.lstatSync(f);if(!s.isFile()||s.isSymbolicLink()||(s.mode&0o022)||JSON.stringify(JSON.parse(fs.readFileSync(f)))!==JSON.stringify(${JSON.stringify(completionManifest.value)}))throw Error('Different fixture manifest');}` : fixtureEmptyState;
+    await docker(['exec',all.symphony.Id,'node','-e',script]);
   };
   let controllerOwned=false;
   const preflightCheck=async()=>{
@@ -630,7 +646,7 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     if(fixture) await fixtureState();
     const s=await state();
     require(s.admission?.contract===1 && s.admission.configured===true && !s.admission.error,'Admission installation/bootstrap required before automated deployment');
-    activeContract({...c,deploymentId:s.admission.generation},c.previous,s,s.admission.paused);
+    activeContract({...c,manifest:expectedManifest,deploymentId:s.admission.generation},c.previous,s,s.admission.paused);
     require(c.manifest?.status==='absent' || (c.manifest?.status==='present' && [1,2,3].includes(c.manifest.value?.limit)),'Explicit manifest status required');
     await lstat(c.gateRoot); await readdir(c.stateRoot);
     if(!controllerOwned) {
@@ -659,12 +675,12 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
         '--entrypoint','tar',c.previous.image,'-cf','/backup/data.tar','-C','/snapshot','.']);
     },
     replace:b=>replaceConnectedBundle(c,b,{files,isolation,docker,containers,isolatedStop}),
-    verify:async(b,paused)=>{
+    verify:async(b,paused,manifest=expectedManifest)=>{
       const deadline=Date.now()+c.verifyMs; operationDeadline=deadline;
       try { while(true) {
         try {
           await files(b);
-          const all=await match(b), s=fixture?(await fixtureRequest('/api/v1/state',b,all)).state:await state(); activeContract(c,b,s,paused);
+          const all=await match(b), s=fixture?(await fixtureRequest('/api/v1/state',b,all)).state:await state(); activeContract({...c,manifest},b,s,paused);
           if(paused) require(drained(s,c.deploymentId),'Work appeared while fenced');
           if(fixture) await fixtureRequest('/',b,all);
           else {const dashboard=await fetch(c.engineURL,{signal:AbortSignal.timeout(Math.min(5000,remaining()))});require(dashboard.ok,'Dashboard unavailable');}
@@ -689,7 +705,11 @@ async function connect(c,requestFile,preflight,{isolatedStop=false,fixture=false
     }
   };
   if(preflight) return deploy(c,io,{preflight:true,fixture});
-  return withDeploymentLock(c,async()=>{controllerOwned=true;return deploy(c,io,{fixture});});
+  return withDeploymentLock(c,async()=>{
+    controllerOwned=true;
+    if(completion) return completion({...io,execute:()=>deploy(c,io,{fixture}),observeOwners,files,match,docker,containers,isolation});
+    return deploy(c,io,{fixture});
+  });
 }
 export async function controllersIdle(stateRoot,reconciled=new Set()) {
   for(const entry of await readdir(stateRoot,{withFileTypes:true})) {

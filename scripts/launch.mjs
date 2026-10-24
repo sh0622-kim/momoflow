@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { config, json, digest, atomic, keyFor, github, list, verifyInstall, withControllerLock, runConnected } from './post-pr.mjs';
 import { validateComposeImage } from './post-pr-docker.mjs';
+import { finishConfig, finishConnected } from './finish.mjs';
 import { foreignOwners } from './reconcile-external.mjs';
 const assert = (v, reason) => { if (!v) throw Error(reason); };
 const same = (a,b) => a && b && Object.keys(a).sort().join() === Object.keys(b).sort().join() && Object.keys(a).every(k => a[k] === b[k]);
@@ -17,6 +18,7 @@ export function launchConfig(c) {
   assert(/^[a-f0-9]{64}$/.test(c.launchId), 'Explicit stable launchId required');
   assert(typeof c.launchRoot === 'string' && resolve(c.launchRoot) === c.launchRoot, 'Absolute trusted launchRoot required');
   c.launch = {v:1,id:c.launchId,repo:c.repo,issue:c.issue,base:c.base,limit:c.iterationLimit};
+  if(c.finish) finishConfig(c);
   return c;
 }
 export function runtime(c, s, allowOwn = false, expectedManifest = null) {
@@ -112,7 +114,7 @@ export async function launch(c, io, {preflight=false}={}) {
       if(ledger) {
         if(!intent.observed) {intent.observed=true; await io.save(intent);}
         const result=await io.reconcile();
-        if(result.done) {intent.done=true;await io.save(intent);return result;}
+        if(result.done) {intent.done=true;if(c.finish) intent.finishSettings=digest(c.configContents);await io.save(intent);return c.finish?{...result,finishPending:true}:result;}
       } else {
         assert(Date.now()-intent.started < 300000,'Runner ledger not created within preparation deadline; inspect polling/auth/mounts');
         await note(c,io,'대기: ready 부여 확인; runner ledger 생성 전 정상 준비 대기. 다음 행동: Symphony polling/claim 관찰; 5분 기한 초과 시 운영자 확인.');
@@ -183,6 +185,10 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
     if(preflight) {
       assert(!await optional(join(c.stateRoot,'controller.lock')),'Controller ownership already held');
       console.log(JSON.stringify(await launch(c,io,{preflight:true})));
-    } else console.log(JSON.stringify(await withControllerLock(c,()=>launch(c,io))));
+    } else {
+      const result=await withControllerLock(c,()=>launch(c,io));
+      // runConnected returned its scope lock; withControllerLock has returned the global lock.
+      console.log(JSON.stringify(result.finishPending ? await finishConnected(c) : result));
+    }
   } catch(e) {console.error(e.message);process.exitCode=1;}
 }

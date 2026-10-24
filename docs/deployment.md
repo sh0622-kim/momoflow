@@ -332,3 +332,77 @@ GH20의 owner key는 `sha256("sh0622-kim/momoflow:20")`다. 이를 `reconciledOw
 증거가 없거나 변조되면 명령은 비정상 종료하며 성공 목록을 출력하지 않는다.
 운영 기록에는 설치 commit, 현재 엔진 ID/볼륨, 관찰 시각, 명령 출력과 GH20 key를 보존한다.
 이 후보의 격리 회귀는 실운영 GH20 검사와 다르다. 외부 설치·live 관찰·전체 배포는 미실행이다.
+
+## GH-30 후보: 최초 launch에 묶는 정상 마무리
+
+별도 고정 호스트 설치 전 후보이며 일반 자동 배포를 활성화했다는 기록이 아니다.
+`launch.mjs`의 opt-in `finish` 설정은 병합 뒤 controller/scope lock을 반환하고 같은
+호스트 프로세스에서 `finish.mjs`로 인계한다. 호스트 또는 독립 operator helper가 실행하며
+엔진의 수명/network namespace를 공유하지 않는다. 실행 중인 코딩 세션에서 사용하지 않는다.
+
+운영자는 최초 launch의 기존 설정에 `authority.finish/deploy/retire:true`와 다음 `finish`
+object를 함께 고정한다. 기존 launch/validate/merge/close 권한도 필요하다. 데이터/request는
+canonical regular 경로이며 group/world write를 금지한다. 설정을 나중에 바꾸어 과거 launch의
+마무리 권한을 추가할 수 없다. 미래 head/target Compose/운영 명령을 후보에게 받지 않는다.
+
+```json
+{
+  "deploymentRoot": "/operator/deployments",
+  "gateRoot": "/operator/admission",
+  "project": "momoflow",
+  "dataVolume": "momoflow-data",
+  "drainMs": 300000,
+  "verifyMs": 60000,
+  "previous": {"commit": "<previous SHA>", "image": "sha256:<image ID>", "authImage": "sha256:<auth ID>", "runnerSource": "<source hash>", "composeFile": "/operator/bundles/previous/compose.json", "composeHash": "<bytes hash>", "files": {}, "inspect": {}}
+}
+```
+
+위 previous는 설명용 축약이다. 실제로는 이 문서의 **완전한 previous bundle**을 제공한다.
+일반 적격 변경은 WORKFLOW/runner/auth/권한을 보존하므로 이전 bundle에서 symphony image만
+검사한 image ID로 바꾼 새 Compose를 생성하고 나머지 파일/기대 runtime을 그대로 검증한다.
+image의 기본 command/user/env 등이 달라 기대 runtime과 불일치하면 기존 검사가 차단한다.
+불일치를 해소하려고 후보의 inspect/Compose를 채택하지 않는다.
+
+마무리는 정확한 launch 설정 hash/limit, released runner publication/generation 및 별도 리뷰,
+confirmed host merge journal, 보존된 evidence/logs를 대조한다. 실제 GitHub의 head/merge 부모/
+tree/review/check를 기존 `deploymentEvidence()`로 다시 조회하고 tested image만 선택한다.
+`finish-compose-ID.json`, `finish-request-ID.json`은 동일 바이트만 재사용한다. 신규 finish/deploy
+제어 코드도 일반 자동 배포 제외 gate에 포함하며 GH-30 자체는 예외 설치다.
+엔진 전체(`engine/`, `patches/`), 인증·호스트 실행·검증 스크립트 전체(`scripts/`),
+Dockerfile/Compose/환경 설정과 운영·권한 정책 문서는 별도 예외 판단이 필요하다.
+PR files의 현재 경로와 rename 이전 경로를 모두 검사한다. runner hash나 runtime shape가
+같다는 이유로 접수·인증·권한 변경을 일반 적격으로 간주하지 않는다.
+
+| 기록 | 의미 |
+| --- | --- |
+| host journal `done`, launch `done` | 코드 병합·근거 보존 완료; 운영 반영의 증거가 아님 |
+| `stateRoot/scope/completion.json`의 `prepared` | 고정 설정과 배포 근거 준비; 배포 전 |
+| `deployment_result` / `deploymentPhase` | 기존 deploy journal 결과; rolled_back은 대상 반영 실패 |
+| `excluded` / `blocked` | 예외 변경·권한/근거 오류 또는 배포/정리 장애; 이유·준비 근거·다음 행동을 같은 workpad에 표시 |
+| `retired` | 원본 바이트 fsync 보존과 exact active.json 퇴역; 아직 전체 완료가 아님 |
+| `complete` | 대상 운영 검증, live manifest absent, 접수 재개 확인; 이후에만 이슈 종료 |
+
+배포는 기존 CLI의 검토·exact image·권한·deployment/controller lock·pause/drain·전체 live
+owner·backup·auth·rollback 검사를 유지한다. 정리는 같은 lock 안에서 다시 pause/drain하고
+실제 mount/engine의 manifest와 전체 owner를 재조회한다. 동일 scope의 원본 바이트를
+`completed-manifest-ID.json`에 fsync 보존한 뒤 active.json 하나만 지우고 live absent를 검사한다.
+다른 manifest, 활성/불명 owner는 정리하지 않는다. ledger/enrollment/과거 journal/실패 원본 및
+외부 완료 receipt는 수정하지 않는다. 롤백·복구 실패 시 manifest를 보존한다.
+
+정상 자동 인계에는 추가 명령이 필요 없다. 완료 결과의 읽기 재검사/보고 또는 명시적
+운영 인계에는 같은 최초 설정으로 다음 CLI를 사용한다. 완료 재호출은 target+absent를
+검사하고 workpad/이슈 종료 결과만 확인한다. 준비 단계의 launch/host/ledger/merge 또는
+GitHub gate 재검사가 실패해도 기존 complete와 원본 근거·완료 효과를 보존하고
+같은 completion journal의 `recheck=blocked`에 사유·다음 행동을 기록해 workpad에 표시한다.
+현재 고정 설정을 인증할 수 없거나 다른 설정의 완료 기록이면 그 기록을 덮어쓰지 않는다.
+gate/배포/삭제를 반복하지 않는다. 중간/blocked
+journal은 효과를 재실행하지 않고 운영자 복구를 요구한다. crash recovery나 다음 이슈 선택은 없다.
+
+```sh
+node /operator/momoflow/scripts/finish.mjs /operator/requests/launch.json
+```
+
+별도 세션 리뷰와 exact PR head의 외부 격리 Docker/CLI 검증 및 고정 controller 설치는
+필수 후속 gate다. 로컬 Node 회귀는 실제 subprocess/module/filesystem/lock을 실행하지만
+Docker/GitHub 효과는 모의한다. 실 모델·실운영 배포 검증으로 기록하지 않는다.
+격리 실행은 [전용 마무리 fixture](deployment-fixture.md#gh-30-후보-마무리-cli의-격리-실행)를 따른다.

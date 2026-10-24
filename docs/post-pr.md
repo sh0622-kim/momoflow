@@ -451,3 +451,15 @@ CLI top-level await 중 지연 deploy import가 같은 receipt module을 다시 
 cycle에서 exit 13을 일으킬 수 있으므로 runtime dynamic import를 사용하지 않는다. 별도 Node process에서 실제 CLI/module/adapter 경로의 effect-free 성공과
 관찰 실패(exit 1)를 검사한다. 이 회귀의 외부 command/fetch/mount metadata는 모의이며
 실제 설치 helper 검증을 대신하지 않는다.
+
+## GH-30 후보: 병합 이후 정상 마무리 인계
+
+운영자가 최초 launch에 고정한 `finish`와 finish/deploy/retire 권한이 있을 때만
+host 병합 후 마무리를 연결한다. host/launch의 done은 계속 코드 단계 완료이며, opt-in에서는
+배포·운영 확인·exact manifest 퇴역 전 이슈를 닫지 않는다. scope lock과 controller lock을
+반환한 뒤 외부 `finish.mjs`가 기존 deployment lock 순서로 인계받는다. lock을 지우거나
+코딩 세션에서 엔진을 교체하지 않는다. 비활성 launch의 기존 병합/종료 경로는 유지한다.
+
+[설정·journal·중복·복구 계약](deployment.md#gh-30-후보-최초-launch에-묶는-정상-마무리)을
+따른다. 외부 exact-head 검증·별도 리뷰·예외 설치 전이며, 이번 호스트/정책 변경 자체를
+일반 자동 배포 성공으로 표시하지 않는다. 기존 GH20/GH24 원본과 receipt를 수정하지 않는다.

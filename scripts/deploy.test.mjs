@@ -89,6 +89,14 @@ for(const [name,change] of [
 ]) test(`deployment rejects ${name} mismatch without any remote mutation`,async()=>{
  const x=evidenceFixture();change(x);x.c.evidence.hash=digest(x.e);await assert.rejects(deploymentEvidence(x.c,x.e,x.f.io.api,async()=>Buffer.from('log')));assert.ok(x.f.calls.every(x=>x.method==='GET'));
 });
+for(const filename of ['scripts/finish.mjs','scripts/finish-isolated.mjs','scripts/deploy.mjs','engine/admission.ex','patches/admission.patch','patches/github-token-file.patch','Dockerfile','Dockerfile.auth','compose.github-app.yaml','scripts/git-askpass.sh','scripts/reconcile-external.mjs','scripts/github-app-auth.mjs','scripts/start-local.sh','scripts/smoke.sh']) test(`engine/auth/host/check control remains excluded from ordinary deployment: ${filename}`,async()=>{
+ const {f,c,e}=evidenceFixture();
+ f.responses.set('GET /repos/fixture/repo/pulls/2/files?per_page=100',[{filename}]);
+ await assert.rejects(deploymentEvidence(c,e,f.io.api,async()=>Buffer.from('log')),/separate exceptional deployment/);
+ assert.ok(f.calls.every(x=>x.method==='GET'));
+ f.responses.set('GET /repos/fixture/repo/pulls/2/files?per_page=100',[{filename:'app.js',previous_filename:filename}]);
+ await assert.rejects(deploymentEvidence(c,e,f.io.api,async()=>Buffer.from('log')),/separate exceptional deployment/);
+});
 test('deployment rejects corrupt host logs',async()=>{
  const {f,c,e}=evidenceFixture();await assert.rejects(deploymentEvidence(c,e,f.io.api,async()=>Buffer.from('changed')),/log corrupt/);
 });
