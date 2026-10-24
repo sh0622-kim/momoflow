@@ -64,10 +64,16 @@ defmodule SymphonyElixir.RoleRunner do
       case Client.resolved_repo(Config.settings!().tracker) do
         {:ok, repo} ->
           key = Base.encode16(:crypto.hash(:sha256, repo <> ":" <> issue.id), case: :lower)
-          File.exists?(Path.join(Keyword.get(opts, :state_root, "/data/log/roles"), key <> ".json.enrolled"))
+
+          File.exists?(
+            Path.join(Keyword.get(opts, :state_root, "/data/log/roles"), key <> ".json.enrolled")
+          )
+
         _ ->
           # Token expiry/unknown scope must not turn an enrolled execution into a single session.
-          Path.wildcard(Path.join(Keyword.get(opts, :state_root, "/data/log/roles"), "*.json.enrolled")) != []
+          Path.wildcard(
+            Path.join(Keyword.get(opts, :state_root, "/data/log/roles"), "*.json.enrolled")
+          ) != []
       end
     end
   end
@@ -106,14 +112,31 @@ defmodule SymphonyElixir.RoleRunner do
         halt!("Existing terminal or interrupted role flow; inspect ledger before resuming")
       end
 
-      advance(path, state, workspace, issue, prompt, on_message, opts)
+      case state["stage"] do
+        "await_decision" ->
+          decision_hold(state, issue, opts)
+
+        "await_validation" ->
+          save(path, state)
+
+          Keyword.get(opts, :halt, fn i, r ->
+            halt_issue(i, r, Keyword.put(opts, :waiting, true))
+          end).(issue, "Decision consumed; host validation pending")
+
+        _ ->
+          advance(path, state, workspace, issue, prompt, on_message, opts)
+      end
     rescue
       error ->
         state = stop_state(path, issue)
 
         save(
           path,
-          Map.merge(state, %{"stage" => "blocked", "reason" => Exception.message(error)})
+          Map.merge(state, %{
+            "stage" =>
+              if(state["stage"] == "await_decision", do: "await_decision", else: "blocked"),
+            "reason" => Exception.message(error)
+          })
         )
 
         Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, opts) end).(
@@ -151,7 +174,12 @@ defmodule SymphonyElixir.RoleRunner do
       manifest = launch_manifest!(issue, opts)
       marker = path <> ".enrolled"
       if File.exists?(marker), do: halt!("Enrolled ledger missing; operator recovery required")
-      used = if manifest, do: 0, else: Keyword.get(opts, :initial_count, fn -> workpad_count!(issue, opts) end).()
+
+      used =
+        if manifest,
+          do: 0,
+          else: Keyword.get(opts, :initial_count, fn -> workpad_count!(issue, opts) end).()
+
       if not is_integer(used) or used not in 0..3, do: halt!("Invalid shared iteration count")
 
       state = %{
@@ -169,6 +197,7 @@ defmodule SymphonyElixir.RoleRunner do
         IO.binwrite(marker_file, Jason.encode!(manifest))
         File.close(marker_file)
       end
+
       save(path, state)
       state
     end
@@ -203,6 +232,7 @@ defmodule SymphonyElixir.RoleRunner do
         else: prompt
 
     role_prompt = role_prompt(prompt, state, result_path, before)
+
     role_prompt =
       if role == "publish" and inbox(opts),
         do: role_prompt <> publication_contract(state, issue, opts),
@@ -285,23 +315,33 @@ defmodule SymphonyElixir.RoleRunner do
       })
 
     state = if publication, do: Map.put(state, "publication", publication), else: state
+
+    state =
+      if result["decision"],
+        do: decision_checkpoint!(state, next, result, after_snapshot, issue, opts),
+        else: state
+
     save(path, state)
 
-    if next == "blocked" do
-      halt!(
-        "#{role} blocked: #{result["summary"]}; checks=#{Jason.encode!(result["checks"])}; Ledger: #{path}"
-      )
-    end
-
-    if next in ~w(done await_validation) do
-      waiting_opts = Keyword.put(opts, :waiting, next == "await_validation")
-
-      Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, waiting_opts) end).(
-        issue,
-        "Role stage preserved (#{next}); shared iterations=#{count}/#{limit(state)}; PR checks/reviews and deployment remain separate. Ledger: #{path}"
-      )
+    if state["stage"] == "await_decision" do
+      decision_hold(state, issue, opts)
     else
-      advance(path, state, workspace, issue, prompt, on_message, opts)
+      if next == "blocked" do
+        halt!(
+          "#{role} blocked: #{result["summary"]}; checks=#{Jason.encode!(result["checks"])}; Ledger: #{path}"
+        )
+      end
+
+      if next in ~w(done await_validation) do
+        waiting_opts = Keyword.put(opts, :waiting, next == "await_validation")
+
+        Keyword.get(opts, :halt, fn issue, reason -> halt_issue(issue, reason, waiting_opts) end).(
+          issue,
+          "Role stage preserved (#{next}); shared iterations=#{count}/#{limit(state)}; PR checks/reviews and deployment remain separate. Ledger: #{path}"
+        )
+      else
+        advance(path, state, workspace, issue, prompt, on_message, opts)
+      end
     end
   end
 
@@ -357,10 +397,15 @@ defmodule SymphonyElixir.RoleRunner do
     Inspect the actual HEAD/diff/files for your task; the engine recomputes and compares snapshots itself and still rejects unauthorized tree changes.
     If exact recomputation is needed, an operator must call SymphonyElixir.RoleRunner.snapshot!(workspace) using this candidate's compiled module in the same workspace; do not approximate its Erlang serialization with shell hashing.
     Prior role evidence (including independent review findings): #{Jason.encode!(state["events"])}
+    Prior operator confirmations (external operations, not human authentication): #{Jason.encode!(state["decisions"] || [])}
     Planning and review are sequential, separate sessions, not parallel delegation.
     Write a JSON result to #{result_path} before ending:
     {"status":"complete|changes_requested|blocked","summary":"bounded scope/plan or concrete findings and resolution","checks":["actual checks and results; separate mock, settings query and live calls"]}
     Only review may use changes_requested. Every result requires a nonblank summary and at least one nonblank check describing actual evidence (planning may record inspected scope/acceptance criteria). Missing/invalid evidence stops execution.
+    In role mode the RUNNER owns execution-label removal, after durable results. Never remove ready yourself, including when requesting a decision.
+    To request normal judgment waiting, return status complete (or review changes_requested) plus decision={"reason":"specific bounded question and proposed continuation"}.
+    This preserves your completed role, checks, session, snapshot and shared usage before stopping. The normal next stage is held; no policy/budget/permission expansion is authorized.
+    Use blocked for actual failure or unsupported authority, not as a substitute for a normal completed-role decision.
     Do not edit engine ledger files. An exit alone is not success evidence.
     """
   end
@@ -477,8 +522,12 @@ defmodule SymphonyElixir.RoleRunner do
     if root = launch_root(opts) do
       unless Keyword.has_key?(opts, :launch_root) or System.get_env("MOMOFLOW_ROLE_FLOW") == "1",
         do: halt!("Launch requires enabled role flow; no single-session fallback")
+
       m = read_launch_manifest!(root, opts[:repo])
-      unless m["issue"] == issue.id and inbox(opts), do: halt!("Launch scope/limit/inbox mismatch")
+
+      unless m["issue"] == issue.id and inbox(opts),
+        do: halt!("Launch scope/limit/inbox mismatch")
+
       m
     end
   end
@@ -488,22 +537,28 @@ defmodule SymphonyElixir.RoleRunner do
     stat = File.lstat!(file)
     unless stat.type == :regular and stat.size < 4096, do: halt!("Invalid launch manifest")
     m = Jason.decode!(File.read!(file))
+
     unless is_map(m) and Enum.sort(Map.keys(m)) == Enum.sort(~w(v id repo issue base limit)),
       do: halt!("Invalid launch manifest fields")
+
     unless m["v"] == 1 and m["repo"] == repo and
              is_binary(m["issue"]) and Regex.match?(~r/^[1-9][0-9]*$/, m["issue"]) and
              is_binary(m["id"]) and Regex.match?(~r/^[a-f0-9]{64}$/, m["id"]) and
              is_binary(m["base"]) and Regex.match?(~r/^[\w.\/-]+$/, m["base"]) and
              is_integer(m["limit"]) and m["limit"] in 1..3,
-      do: halt!("Launch scope/limit/inbox mismatch")
+           do: halt!("Launch scope/limit/inbox mismatch")
+
     m
   end
 
   defp launch_manifest_status(nil, _repo), do: %{status: "invalid"}
+
   defp launch_manifest_status(root, repo) do
     # Report invalid state without exposing file contents or breaking observability.
     case File.lstat(Path.join(root, "active.json")) do
-      {:error, :enoent} -> %{status: "absent"}
+      {:error, :enoent} ->
+        %{status: "absent"}
+
       _ ->
         try do
           %{status: "present", value: read_launch_manifest!(root, repo)}
@@ -515,12 +570,17 @@ defmodule SymphonyElixir.RoleRunner do
 
   defp verify_launch!(state, issue, opts) do
     current = launch_manifest!(issue, opts)
-    unless current == state["launch"], do: halt!("Launch changed/missing or legacy ledger adoption forbidden")
-    unless is_integer(limit(state)) and limit(state) in 1..3 and is_integer(state["iterations"]) and state["iterations"] <= limit(state),
-      do: halt!("Invalid persisted launch budget")
+
+    unless current == state["launch"],
+      do: halt!("Launch changed/missing or legacy ledger adoption forbidden")
+
+    unless is_integer(limit(state)) and limit(state) in 1..3 and is_integer(state["iterations"]) and
+             state["iterations"] <= limit(state),
+           do: halt!("Invalid persisted launch budget")
   end
 
   defp read_only_mount?(nil), do: false
+
   defp read_only_mount?(root) do
     File.read!("/proc/self/mountinfo")
     |> String.split("\n")
@@ -535,10 +595,14 @@ defmodule SymphonyElixir.RoleRunner do
   # Exposed by the existing read-only state endpoint: no secrets, no execution.
   def launch_status(opts \\ []) do
     settings = Config.settings!()
-    repo = case Client.resolved_repo(settings.tracker) do
-      {:ok, value} -> value
-      _ -> nil # Preserve observability when auth is unavailable; launch still fails scope validation.
-    end
+
+    repo =
+      case Client.resolved_repo(settings.tracker) do
+        {:ok, value} -> value
+        # Preserve observability when auth is unavailable; launch still fails scope validation.
+        _ -> nil
+      end
+
     %{
       contract: 1,
       source: Base.encode16(:crypto.hash(:sha256, File.read!(__ENV__.file)), case: :lower),
@@ -619,6 +683,129 @@ defmodule SymphonyElixir.RoleRunner do
       "review_thread" => review["session"]["thread_id"],
       "generation" => length(state["events"]) + 1
     })
+  end
+
+  defp decision_checkpoint!(state, next, result, snapshot, issue, opts) do
+    reason = result["decision"]["reason"]
+
+    unless is_binary(inbox(opts)) and next in ~w(build review publish await_validation) and
+             is_binary(reason) and String.trim(reason) != "" and byte_size(reason) <= 4000,
+           do: halt!("Invalid decision request or trusted inbox unavailable")
+
+    request = %{
+      "id" => Base.encode16(:crypto.strong_rand_bytes(32), case: :lower),
+      "repo" => opts[:repo],
+      "issue" => issue.id,
+      "generation" => length(state["events"]),
+      "snapshot" => snapshot,
+      "publication" => state["publication"],
+      "next" => next,
+      "limit" => limit(state),
+      "launch" => state["launch"],
+      "reason" => reason,
+      "content_hash" => Base.encode16(:crypto.hash(:sha256, reason), case: :lower)
+    }
+
+    Map.merge(state, %{"stage" => "await_decision", "decision" => request})
+  end
+
+  defp decision_hold(state, issue, opts) do
+    opts = Keyword.put(opts, :decision, state["decision"])
+
+    Keyword.get(opts, :halt, fn i, r -> halt_issue(i, r, opts) end).(
+      issue,
+      "Normal decision pending: #{Jason.encode!(state["decision"])}"
+    )
+  end
+
+  defp resume!(%{"stage" => "await_decision"} = state, workspace, issue, opts) do
+    root = inbox(opts)
+
+    unless is_binary(root) and Path.type(root) == :absolute and
+             not String.starts_with?(Path.expand(root) <> "/", Path.expand(workspace) <> "/"),
+           do: halt!("Trusted decision inbox unavailable")
+
+    file =
+      Path.join(
+        root,
+        Base.encode16(:crypto.hash(:sha256, opts[:repo] <> ":" <> issue.id), case: :lower) <>
+          ".json"
+      )
+
+    case File.lstat(file) do
+      {:error, :enoent} ->
+        state
+
+      {:ok, %{type: :regular, size: size}} when size < 65536 ->
+        r = Jason.decode!(File.read!(file))
+        d = state["decision"]
+        # Old code-failure/decision envelopes are inert, never new authority.
+        if r["kind"] != "decision" or r["request"] != d do
+          state
+        else
+          unless not state["in_flight"] and is_nil(state["active_session"]) and
+                   r["repo"] == opts[:repo] and r["issue"] == issue.id and
+                   r["id"] == d["id"] and r["action"] == "continue" and
+                   r["actor"] == "external-operator" and r["authority"] == "existing-scope" and
+                   is_binary(r["source"]) and
+                   Regex.match?(
+                     Regex.compile!(
+                       "^" <>
+                         Regex.escape(
+                           "https://github.com/" <> opts[:repo] <> "/issues/" <> issue.id
+                         ) <> "(#issuecomment-[0-9]+)?$"
+                     ),
+                     r["source"]
+                   ) and
+                   r["unresolved"] == [d["id"]] and d["generation"] == length(state["events"]) and
+                   d["limit"] == limit(state) and d["launch"] == state["launch"] and
+                   snapshot!(workspace) == d["snapshot"] and
+                   (d["next"] != "build" or state["iterations"] < limit(state)) and
+                   not Enum.any?(state["decisions"] || [], &(&1["decision_id"] == d["id"])),
+                 do: halt!("Invalid, stale, rejected or exhausted decision response")
+
+          {:ok, %{status: 200, body: current}} =
+            request("GET", issue_path(issue, opts), %{}, nil, opts)
+
+          unless current["state"] == "open" and
+                   not Enum.any?(
+                     current["labels"] || [],
+                     &(&1["name"] in ~w(momoflow:needs-decision momoflow:needs-review))
+                   ),
+                 do: halt!("Other unresolved decision/review hold")
+
+          if p = d["publication"] do
+            {:ok, %{status: 200, body: pr}} =
+              request("GET", repo_path(opts) <> "/pulls/#{p["pr"]}", %{}, nil, opts)
+
+            unless pr["state"] == "open" and pr["head"]["sha"] == p["head"] and
+                     pr["head"]["repo"]["full_name"] == opts[:repo] and
+                     pr["base"]["ref"] == p["base"] and pr["base"]["sha"] == p["base_head"] and
+                     pr["base"]["repo"]["full_name"] == opts[:repo],
+                   do: halt!("Decision PR changed")
+
+            {:ok, %{status: 200, body: labels}} =
+              request("GET", repo_path(opts) <> "/issues/#{p["pr"]}/labels", %{}, nil, opts)
+
+            unless is_list(labels) and
+                     not Enum.any?(
+                       labels,
+                       &(&1["name"] in ~w(momoflow:needs-decision momoflow:needs-review))
+                     ), do: halt!("Other unresolved PR decision/review hold")
+          end
+
+          # advance persists this consumption with count/in_flight before starting a model.
+          Map.merge(state, %{
+            "stage" => d["next"],
+            "decision" => nil,
+            "decisions" =>
+              (state["decisions"] || []) ++ [%{"decision_id" => d["id"], "response" => r}]
+          })
+        end
+
+      _ ->
+        halt!("Invalid decision envelope")
+    end
   end
 
   defp resume!(%{"stage" => "await_validation"} = state, workspace, issue, opts) do
@@ -743,14 +930,44 @@ defmodule SymphonyElixir.RoleRunner do
 
     pads = Enum.filter(comments, &String.contains?(&1["body"] || "", "<!-- momoflow:workpad -->"))
 
+    if opts[:decision] do
+      {:ok, %{status: status}} =
+        request("POST", base <> "/labels", %{}, %{"labels" => ["momoflow:needs-decision"]}, opts)
+
+      unless status in [200, 201], do: halt!("Decision label report failed")
+    end
+
     note =
-      if opts[:waiting] do
-        "\n\nHost validation pending: #{reason}\nReady removal verified. Routine host checks require no new approval or model run; only a verified host envelope may resume correction."
+      if opts[:decision] do
+        "\n\nNormal decision checkpoint: #{Jason.encode!(opts[:decision])}\nReady removal verified; role/session/checks/usage preserved. External operator confirmation within existing scope required; labels/comments are not human authentication."
       else
-        "\n\nEngine stopped (#{DateTime.to_iso8601(DateTime.utc_now())}): #{reason}\nReady removal verified. Inspect /data/log/roles before manual resumption; do not reset the ledger."
+        if opts[:waiting] do
+          "\n\nHost validation pending: #{reason}\nReady removal verified. Routine host checks require no new approval or model run; only a verified host envelope may resume correction."
+        else
+          "\n\nEngine stopped (#{DateTime.to_iso8601(DateTime.utc_now())}): #{reason}\nReady removal verified. Inspect /data/log/roles before manual resumption; do not reset the ledger."
+        end
       end
 
+    decision_marker =
+      if opts[:decision],
+        do: "<!-- momoflow:runner-decision:#{opts[:decision]["id"]} -->",
+        else: nil
+
+    note = if decision_marker, do: "\n\n" <> decision_marker <> note, else: note
+
     case pads do
+      [pad] when length(comments) < 100 and not is_nil(decision_marker) ->
+        unless String.contains?(pad["body"] || "", decision_marker) do
+          {:ok, %{status: 200}} =
+            request(
+              "PATCH",
+              repo_path(opts) <> "/issues/comments/#{pad["id"]}",
+              %{},
+              %{"body" => pad["body"] <> note},
+              opts
+            )
+        end
+
       [pad] when length(comments) < 100 ->
         path =
           repo_path(opts) <> "/issues/comments/#{pad["id"]}"
@@ -780,7 +997,7 @@ defmodule SymphonyElixir.RoleRunner do
   end
 
   defp validate_state!(state) do
-    unless state["stage"] in ~w(plan build review publish blocked done await_validation) and
+    unless state["stage"] in ~w(plan build review publish blocked done await_validation await_decision) and
              is_integer(state["iterations"]) and state["iterations"] in 0..3 and
              is_boolean(state["in_flight"]) and is_list(state["events"]) do
       halt!("Invalid ledger; manual inspection required")
@@ -788,8 +1005,25 @@ defmodule SymphonyElixir.RoleRunner do
   end
 
   defp save(path, state) do
-    File.write!(path <> ".tmp", Jason.encode!(state))
+    {:ok, file} = :file.open(String.to_charlist(path <> ".tmp"), [:write, :binary, :raw])
+
+    try do
+      :ok = :file.write(file, Jason.encode!(state))
+      :ok = :file.sync(file)
+    after
+      :file.close(file)
+    end
+
     File.rename!(path <> ".tmp", path)
+
+    {:ok, directory} =
+      :file.open(String.to_charlist(Path.dirname(path)), [:read, :raw, :directory])
+
+    try do
+      :ok = :file.sync(directory)
+    after
+      :file.close(directory)
+    end
   end
 
   defp halt!(reason), do: raise(RuntimeError, reason)

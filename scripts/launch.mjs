@@ -37,7 +37,13 @@ export async function inspect(c, io, existing = null) {
   assert(repo.full_name === c.repo && repo.archived === false && repo.disabled === false, 'Repository unavailable/scope mismatch');
   const issue = await io.api('GET', `${root}/issues/${c.issue}`);
   assert(issue.state === 'open' && !issue.pull_request && String(issue.number) === c.issue, 'Target is closed/not the explicit issue');
-  const holds = existing?.dispatched ? ['momoflow:needs-decision'] : ['momoflow:needs-decision','momoflow:needs-review'];
+  const ledger = await io.ledger();
+  let normalDecision=false;
+  if(existing?.dispatched && ledger?.stage==='await_decision') {
+    const {decisionReceipt}=await import('./decision.mjs');
+    decisionReceipt(c,ledger);normalDecision=true;
+  }
+  const holds = normalDecision ? [] : existing?.dispatched ? ['momoflow:needs-decision'] : ['momoflow:needs-decision','momoflow:needs-review'];
   assert(!issue.labels?.some(x => holds.includes(x.name)), 'Issue has unresolved hold/action');
   const branch = await io.api('GET', `${root}/branches/${encodeURIComponent(c.base)}`);
   assert(branch.name === c.base, 'Base scope mismatch');
@@ -51,7 +57,6 @@ export async function inspect(c, io, existing = null) {
     const count=row?.match(/누적 반복[^\n]*?([0-9]+)\s*\/\s*([0-9]+)/);
     assert(count && count[1]==='0' && ['1','2','3'].includes(count[2]),'Existing workpad use/unknown count requires operator handoff');
   }
-  const ledger = await io.ledger();
   assert(ledger || !await io.enrollment?.(), 'Enrolled ledger missing; operator recovery required');
   if (ledger) {
     assert(existing?.dispatched && same(ledger.launch, c.launch), 'Existing/legacy ledger cannot be adopted');
@@ -114,6 +119,7 @@ export async function launch(c, io, {preflight=false}={}) {
       if(ledger) {
         if(!intent.observed) {intent.observed=true; await io.save(intent);}
         const result=await io.reconcile();
+        if(result.decision)return result; // Unanswered request only; confirmed decisionDispatch keeps polling below.
         if(result.done) {intent.done=true;if(c.finish) intent.finishSettings=digest(c.configContents);await io.save(intent);return c.finish?{...result,finishPending:true}:result;}
       } else {
         assert(Date.now()-intent.started < 300000,'Runner ledger not created within preparation deadline; inspect polling/auth/mounts');

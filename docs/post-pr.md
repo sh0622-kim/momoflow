@@ -532,3 +532,84 @@ ledger/enrollment 및 양 서비스의 kernel/runtime/mount hash를 매 transact
 receipt 순서다. 기존 중복·crash checkpoint를 재사용한다. 원본 ledger/enrollment/launch/host,
 active_session, in_flight 및 사용 횟수는 수정하지 않는다. 후속 다른 이슈의 launch/deploy만
 동일 receipt/source/archive를 다시 검증하여 이 과거 owner를 인정할 수 있다. 자동 dispatch는 없다.
+
+## GH-34 후보: 정상 판단 대기와 같은 작업 재개
+
+이 절은 후보 계약이다. 정확한 PR head의 독립 리뷰·고정 host 검사·외부 예외 설치 전에는
+현재 운영 기능으로 취급하지 않는다. 모델·Fast·권한·공용 구현 한도는 그대로다.
+
+관찰된 GH30/32 문제는 역할이 ready를 먼저 지우면 Symphony가 worker를 종료하여 마지막
+결과 저장을 건너뛸 수 있다는 것이다. 역할 모드에서는 runner가 실행 라벨을 소유한다.
+완료한 역할은 정상 `status`와 함께 `decision: {"reason":"구체적인 질문과 기존 범위 내 다음 행동"}`을
+반환한다. runner는 설정·세션·실제 snapshot을 검증하고 결과/checks/session/사용 횟수와
+요청을 `await_decision` checkpoint에 저장·fsync·rename·디렉터리 fsync한 뒤 ready를 제거한다.
+`active_session=null`, `in_flight=false`가 정상 대기다. 결과 파일만 쓰고 완료하지 못한 역할,
+설정 불일치·결과 검증 실패·비정상 종료는 기존 interrupted/blocked 경계를 유지한다.
+역할의 `blocked`는 정상 판단 재개 계약이 아니다. 기존 ledger의 migration은 하지 않는다.
+
+요청은 repo/issue, PR 게시 전 명시적 null 또는 기존 publication, local HEAD/복합 snapshot,
+원문 내용 hash, 임의 요청 ID, event generation, 다음 역할, 원래 launch/limit에 묶인다.
+기존 역할의 결과를 완료한 뒤 다음 단계를 기다리므로 별도 세션으로 이어진다. review의
+`changes_requested` 이후 build는 공용 사용 횟수를 증가시키며 마지막 build의 review/publish는
+가능하다. publish 뒤 대기는 publication을 보존하고 해제 시 모델 없이 host 검증으로 이어진다.
+소비 이력은 ledger의 `decisions`에 남아 publication event generation을 바꾸지 않는다.
+
+### 운영자 명령과 승인 한계
+
+기존 외부 고정 checkout의 controller/config, private host 설정, launch manifest, read-only
+inbox, 전역 controller lock을 재사용한다. 새 사람 인증기는 없다. `authority.resume`가 허용한
+기존 작업 범위의 운영자 확인만 지원한다. 운영자는 원문 출처와 현재 요청을 직접 대조하고
+다른 미해결 판단이 없음을 확인해야 한다. 제품 방향·예산·모델·권한 확대 및 사람임을 증명할
+수 없는 응답을 자동 승인하지 않는다. 이런 판단은 대기를 유지하고 별도 권한 있는 판단을
+기록한다. 공유 계정 댓글·라벨·App의 자기 댓글을 사람 승인으로 추정하지 않는다.
+
+외부 운영자는 설치된 고정 checkout에서 다음 저장소 명령을 사용한다. 후보 workspace에서
+실행하거나 진행 중인 엔진을 교체하지 않는다. `operator-config.json`은 기존 launch 설정이다.
+
+```sh
+node scripts/decision.mjs /private/operator-config.json --show
+node scripts/decision.mjs /private/operator-config.json --continue REQUEST_ID --source https://github.com/OWNER/REPO/issues/NUMBER#issuecomment-COMMENT_ID --only-request
+node scripts/decision.mjs /private/operator-config.json --reject REQUEST_ID --source https://github.com/OWNER/REPO/issues/NUMBER#issuecomment-COMMENT_ID --only-request
+node scripts/launch.mjs /private/operator-config.json
+```
+
+`--show`는 설치/현재 scope를 조회하고 ledger와 요청을 출력한다. ready/inbox/ledger를 쓰지
+않는다. `--only-request`는 해당 요청 하나만 미해결이라는 **외부 운영자의 확인**이며 자동
+인증 결과가 아니다. source는 같은 issue 본문 또는 원문 결정 comment URL이다. URL 문자열을
+검사한 사실을 사람 작성·승인 검증으로 보고하지 않는다. 반려는 대기를 유지하며, 같은 요청의
+나중 continue로 뒤집지 않는다. 정책 변경을 이 명령으로 우회할 수 없다.
+
+launch는 검증된 정상 대기에서 blocker를 만들지 않고 소유 lock을 반환한다. 운영자는 같은
+launch intent를 계속 사용한다. decision 명령은 worker/retry 해제, 현재 issue/PR/head와 다른
+review/PR 판단 라벨, 위임·manifest·잔여 예산을 재조회한 뒤 원자 host journal과 inbox를 쓴다.
+ready 부여 전 재확인하며 runner도 같은 snapshot/PR/요청/예산을 검사한다. 중복·오래된 응답은
+새 실행을 만들지 않는다. dispatch 응답 유실·중간 실패는 prepared/dispatching 근거로 멈추며
+자동 재전송하지 않는다. 실제 crash 복구와 임의 판단 인증은 여전히 운영자의 영역이다.
+
+확인된 `dispatched` journal과 현재 요청이 일치하면 claim 전 launch/reconcile은 ready를
+유지하고 기존 polling과 소유 lock을 유지하여 runner 소비·worker 진행·이후 host 검증을 감시한다.
+미응답 판단 요청에서만 lock을 반환하며 새 판단 요청이 생기면 다시 반환한다.
+ready를 다시 부여하거나 판단 라벨을 되살리지 않는다.
+현재 scope·권한·다른 미해결 요청은 다시 검사하며 신호가 사라졌거나 바뀌면 자동 재부여 없이
+근거 확인을 요구한다. checkpoint 저장 후 보고가 생략되어 판단 라벨이 없는 경우에도 계속할 수
+있다. 제거 중 404는 최신 조회에서 부재가 확인될 때만 허용하며 다른 HTTP 오류는 차단한다.
+
+### 재사용 근거와 관찰
+
+| 경로 | 보존하는 근거 |
+| --- | --- |
+| `/data/log/roles/<repo:issue hash>.json` | role events/result/checks/session/실제 설정, snapshot, iterations, decision, 소비한 decisions |
+| `<stateRoot>/<scope hash>/decision-<request ID>.json` | 외부 operator/source/action/issue/head, prepared·dispatching·dispatched 또는 rejected |
+| 같은 디렉터리의 `decision-evidence-<hash>.json` 및 기존 `evidence-<hash>.json` | 정상 대기와 외부 확인의 원본 입력/결과 |
+| 기존 단일 workpad의 decision 구간 | 요청/이유/대상, 운영자 확인 출처; 반복 append 대신 같은 구간 갱신 |
+
+`--show` 출력과 위 원본을 설치 전후 workpad 비교의 source로 사용한다. 대화 보조자가 이번용
+기능 코드나 성공 receipt를 수작업으로 만들 필요가 없다. 기록은 actor/source/action/issue/head/result로
+비교하며 초기 작업 승인·정상 사용자 판단과 구현/운영 구제를 분리한다. 내부 Sol/Astra 세션은
+engine receipt로, 외부 최초 실행·host 검사·설치는 외부 운영으로 기록한다.
+
+회귀는 `sh scripts/test-role-flow.sh`, `node scripts/post-pr.test.mjs`에 포함한다. 실제 candidate
+RoleRunner와 Node subprocess 사이에는 모의 GitHub 효과를 사용한다. 모듈/프로세스 검사 통과는
+실제 모델·운영 대기 발생·설치 또는 외부 개입 감소 증거가 아니다. 새 경로가 자연 발생하지
+않으면 감소 **미관찰**로 남긴다. 고정 host의 Docker 검사·독립 리뷰·예외 설치와 실제 업무 관찰은
+후속 단계다. 검증/설치 보조 일반화, 상태 감시·완료 기록, 범용 crash 복구는 이번 범위 밖이다.

@@ -861,6 +861,228 @@ defmodule RoleFlowTest do
     {exec, [inbox_root: inbox, request_fun: transport], inbox}
   end
 
+  defp waiting_executor(exec, target, verdict \\ "complete") do
+    fn w, i, role, prompt, cb ->
+      {:ok, session} = exec.(w, i, role, prompt, cb)
+      if role == target do
+        file = Path.join(w, ".momoflow-role-result.json")
+        result = Jason.decode!(File.read!(file))
+        File.write!(file, Jason.encode!(Map.merge(result, %{"status" => verdict, "decision" => %{"reason" => "Confirm same-task continuation"}})))
+      end
+      {:ok, Map.put(session, :usage, %{total_tokens: 123})}
+    end
+  end
+
+  defp decision_transport(opts) do
+    old = opts[:request_fun]
+    Keyword.put(opts, :request_fun, fn method, path, params, body, config ->
+      cond do
+        method == "GET" and String.ends_with?(path, "/issues/1") ->
+          {:ok, %{status: 200, body: %{"state" => "open", "labels" => [%{"name" => "momoflow:ready"}]}}}
+        method == "GET" and String.ends_with?(path, "/issues/2/labels") ->
+          {:ok, %{status: 200, body: []}}
+        true -> old.(method, path, params, body, config)
+      end
+    end)
+  end
+
+  defp decision_exchange(c, inbox) do
+    [file] = Path.wildcard(Path.join(c.root, "ledger/*.json"))
+    {output, 0} = System.cmd("node", [Path.join(__DIR__, "decision-fixture.mjs"), file, inbox, Path.join(c.root, "host")], stderr_to_stdout: true)
+    assert output =~ "dispatched"
+  end
+
+  for target <- ~w(plan build review publish) do
+    @decision_role target
+    test "normal #{@decision_role} decision is durable before stop and resumes same task via Node host", c do
+      {exec, opts, inbox} = connected(c)
+      opts = decision_transport(opts)
+      run(c, waiting_executor(exec, @decision_role), opts)
+      before = ledger(c)
+      assert before["stage"] == "await_decision"
+      refute before["in_flight"]
+      assert is_nil(before["active_session"])
+      assert List.last(before["events"])["session"]["usage"]["total_tokens"] == 123
+      assert before["decision"]["generation"] == length(before["events"])
+      # Restart without envelope only finishes waiting; no paid stage or count reset.
+      run(c, fn _, _, _, _, _ -> flunk("Waiting must not call a model") end, opts)
+      assert ledger(c) == before
+      decision_exchange(c, inbox)
+      run(c, exec, opts)
+      after_state = ledger(c)
+      assert after_state["stage"] == "await_validation"
+      assert after_state["iterations"] == 1
+      assert length(after_state["decisions"]) == 1
+      assert Enum.take(after_state["events"], length(before["events"])) == before["events"]
+      assert after_state["publication"]["generation"] == length(after_state["events"])
+    end
+  end
+
+  for fault <- ~w(duplicate-generation reject actor source snapshot issue-hold pr-head pr-hold) do
+    @decision_fault fault
+    test "runner decision consumption rechecks #{@decision_fault} without model or budget reset", c do
+      {exec, opts, inbox} = connected(c)
+      opts = decision_transport(opts)
+      # Publish provides a real verified PR receipt for PR-specific guards.
+      run(c, waiting_executor(exec, "publish"), opts)
+      before = ledger(c)
+      decision_exchange(c, inbox)
+      [file] = Path.wildcard(Path.join(inbox, "*.json"))
+      r = Jason.decode!(File.read!(file))
+      fault = @decision_fault
+      r = case fault do
+        "duplicate-generation" -> put_in(r, ["request", "generation"], 0)
+        "reject" -> Map.put(r, "action", "reject")
+        "actor" -> Map.put(r, "actor", "shared-account-comment")
+        "source" -> Map.put(r, "source", "https://github.com/fixture/repo/issues/10")
+        _ -> r
+      end
+      File.write!(file, Jason.encode!(r))
+      if fault == "snapshot", do: File.write!(Path.join(c.workspace, "stale"), "changed")
+      old = opts[:request_fun]
+      transport = fn method, path, params, body, config ->
+        cond do
+          fault == "issue-hold" and path == "/repos/fixture/repo/issues/1" ->
+            {:ok, %{status: 200, body: %{"state" => "open", "labels" => [%{"name" => "momoflow:needs-decision"}]}}}
+          fault == "pr-hold" and path == "/repos/fixture/repo/issues/2/labels" ->
+            {:ok, %{status: 200, body: [%{"name" => "momoflow:needs-review"}]}}
+          fault == "pr-head" and path == "/repos/fixture/repo/pulls/2" ->
+            {:ok, %{status: 200, body: %{"state" => "open", "head" => %{"sha" => String.duplicate("f", 40)}}}}
+          true -> old.(method, path, params, body, config)
+        end
+      end
+      run(c, fn _, _, _, _, _ -> flunk("Invalid response cannot run model") end, Keyword.put(opts, :request_fun, transport))
+      after_state = ledger(c)
+      assert after_state["stage"] == "await_decision"
+      assert after_state["events"] == before["events"]
+      assert after_state["iterations"] == before["iterations"]
+      assert after_state["decision"] == before["decision"]
+      refute after_state["in_flight"]
+    end
+  end
+
+  test "decision correction consumes remaining build once, last review/publish allowed", c do
+    {exec, opts, inbox} = connected(c)
+    {launch_opts, _, _} = enrolled(c, 2)
+    opts = Keyword.merge(opts, launch_opts) |> decision_transport()
+    run(c, waiting_executor(exec, "review", "changes_requested"), opts)
+    assert ledger(c)["iterations"] == 1
+    decision_exchange(c, inbox)
+    run(c, exec, opts)
+    assert ledger(c)["iterations"] == 2
+    assert ledger(c)["stage"] == "await_validation"
+    # Retained decision envelope cannot be interpreted as a new code-failure correction.
+    run(c, fn _, _, _, _, _ -> flunk("No stale replay") end, opts)
+    assert ledger(c)["iterations"] == 2
+  end
+
+  test "exhausted decision correction remains held with original usage", c do
+    {exec, opts, inbox} = connected(c)
+    {launch_opts, _, _} = enrolled(c, 1)
+    opts = Keyword.merge(opts, launch_opts) |> decision_transport()
+    run(c, waiting_executor(exec, "review", "changes_requested"), opts)
+    [file] = Path.wildcard(Path.join(c.root, "ledger/*.json"))
+    {output, status} = System.cmd("node", [Path.join(__DIR__, "decision-fixture.mjs"), file, inbox, Path.join(c.root, "host")], stderr_to_stdout: true)
+    assert status != 0
+    assert output =~ "budget exhausted"
+    assert ledger(c)["stage"] == "await_decision"
+    assert ledger(c)["iterations"] == 1
+  end
+
+  test "process kill before checkpoint remains in-flight; result file alone is not a checkpoint", c do
+    {exec, opts, _} = connected(c)
+    parent = self()
+    worker = spawn(fn ->
+      run(c, fn w, i, role, prompt, cb ->
+        waiting_executor(exec, "plan").(w, i, role, prompt, cb)
+        send(parent, :result_written)
+        receive do :never -> :ok end
+      end, opts)
+    end)
+    monitor = Process.monitor(worker)
+    assert_receive :result_written, 5000
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+    assert ledger(c)["in_flight"]
+    assert ledger(c)["active_session"]["thread_id"]
+    assert ledger(c)["events"] == []
+    run(c, fn _, _, _, _, _ -> flunk("Must not recover unfinished role") end, opts)
+    assert ledger(c)["stage"] == "blocked"
+  end
+
+  test "actual Orchestrator label reconciliation stops worker only after decision checkpoint", c do
+    alias SymphonyElixir.Orchestrator, as: O
+    {exec, opts, _} = connected(c)
+    parent = self()
+    # Model GitHub removal succeeds, but the poll kills the worker before remote reporting.
+    transport = fn method, path, _, _, _ ->
+      if method == "DELETE" and String.ends_with?(path, "/labels/momoflow%3Aready") do
+        send(parent, :ready_removed)
+        receive do :never -> :ok end
+      else
+        flunk("Unexpected effect before ready removal")
+      end
+    end
+    c_without_halt = %{c | opts: Keyword.delete(c.opts, :halt)}
+    worker = spawn(fn -> run(c_without_halt, waiting_executor(exec, "plan"), Keyword.put(opts, :request_fun, transport)) end)
+    monitor = Process.monitor(worker)
+    on_exit(fn -> if Process.alive?(worker), do: Process.exit(worker, :kill) end)
+    assert_receive :ready_removed, 5000
+    before = ledger(c)
+    supervisor = start_supervised!(Task.Supervisor)
+    issue = struct(SymphonyElixir.Tracker.Issue, id: "1", identifier: "GH-1", title: "fixture", state: "open", labels: [], dispatchable: true)
+    state = struct(O.State, codex_totals: %{}, task_supervisor: supervisor, claimed: MapSet.new(["1"]), running: %{"1" => %{pid: worker, ref: make_ref(), identifier: "GH-1", issue: issue, started_at: DateTime.utc_now()}})
+    released = O.reconcile_issue_states_for_test([issue], state)
+    assert released.running == %{}
+    assert released.claimed == MapSet.new()
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :shutdown}
+    run(c, fn _, _, _, _, _ -> flunk("No model during hold cleanup") end, opts)
+    assert ledger(c) == before
+    assert before["stage"] == "await_decision"
+    refute before["in_flight"]
+    assert is_nil(before["active_session"])
+  end
+
+  test "decision consumption and next build entry persist together before executor crash", c do
+    {exec, opts, inbox} = connected(c)
+    opts = decision_transport(opts)
+    run(c, waiting_executor(exec, "review", "changes_requested"), opts)
+    decision_exchange(c, inbox)
+    parent = self()
+    worker = spawn(fn ->
+      run(c, fn _, _, role, _, _ ->
+        send(parent, {:entered, role})
+        receive do :never -> :ok end
+      end, opts)
+    end)
+    monitor = Process.monitor(worker)
+    assert_receive {:entered, "build"}, 5000
+    assert ledger(c)["iterations"] == 2
+    assert length(ledger(c)["decisions"]) == 1
+    assert ledger(c)["in_flight"]
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+    run(c, fn _, _, _, _, _ -> flunk("Consumption cannot repeat build") end, opts)
+    assert ledger(c)["iterations"] == 2
+    assert length(ledger(c)["decisions"]) == 1
+  end
+
+  test "label/report failure after checkpoint never destroys normal decision evidence", c do
+    {exec, opts, _} = connected(c)
+    parent = self()
+    failing = Keyword.put(opts, :halt, fn _, _ ->
+      send(parent, :halt_called)
+      if Process.get(:halt_failed), do: :ok, else: (Process.put(:halt_failed, true); raise "report unavailable")
+    end)
+    run(c, waiting_executor(exec, "plan"), failing)
+    state = ledger(c)
+    assert state["stage"] == "await_decision"
+    refute state["in_flight"]
+    assert length(state["events"]) == 1
+    assert state["reason"] == "report unavailable"
+    assert_receive :halt_called
+  end
+
   defp expected_publication_scope(prompt) do
     [_, json] = Regex.run(~r/Engine-owned expected publication scope \(JSON\): ([^\n]+)/, prompt)
     Jason.decode!(json)
