@@ -5,7 +5,7 @@ import {mkdtemp,mkdir,readFile,writeFile,rm,readdir,lstat,symlink} from 'node:fs
 import {join} from 'node:path';
 import {fixture} from './post-pr-fixture.mjs';
 import {atomic,digest,keyFor,withControllerLock} from './post-pr.mjs';
-import {reconcileExternal,verifiedExternalReceipt,foreignOwners,observedWorkersIdle,observeReconciliationWorkers,verifyReconciliationOperator} from './reconcile-external.mjs';
+import {reconcileExternal,verifiedExternalReceipt,foreignOwners,observedWorkersIdle,observeReconciliationWorkers,verifyReconciliationOperator,historicalReceiptEvidence} from './reconcile-external.mjs';
 import {controllersIdle,deploymentOwnersIdle,runtimeOwnersIdle} from './deploy.mjs';
 import {inspect,launchConfig} from './launch.mjs';
 const hex=n=>String(n).repeat(64),sha=n=>String(n).repeat(40);
@@ -153,7 +153,7 @@ function operatorFixture() {
   assert.equal(docker,f.docker);assert.deepEqual(containers,[engine,operator]);
   // Docker parsing returns distinct objects, as it does for the real adapter.
   return {host:f.context.host,mounted:new Map(containers.flatMap(x=>x.Mounts.map(m=>[m,f.context.mounted.get([engine,operator].flatMap(x=>x.Mounts).find(old=>old.Destination===m.Destination && old.Source===m.Source && old.RW===m.RW))]))) };
- },canonical:async path=>{assert.equal(path,'/var/run/docker.sock');return '/run/docker.sock';}});
+ },historicalEvidence:async()=>f.historical || [],canonical:async path=>{assert.equal(path,'/var/run/docker.sock');return '/run/docker.sock';}});
  return f;
 }
 test('worker Docker adapter requests PID column and validates engine before and after observation',async()=>{
@@ -313,4 +313,46 @@ for(const [name,change] of [
  ['build self-review',async f=>{const r=JSON.parse(await readFile(f.paths.review));r.session='external-build';await f.pin('review',r);}],
 ])test('controller profile blocks '+name+' without effects',async()=>{
  const f=await controllerSetup();try {await change(f);const before=await snapshot(f.root);await assert.rejects(f.run());assert.deepEqual(await snapshot(f.root),before);}finally{await f.clean();}
+});
+
+async function extendedControllerSetup() {
+ const f=await controllerSetup(),c=f.c;c.externalIterations=2;c.externalBudget={externalLimit:2,totalLimit:4};c.authority.externalBudget=true;
+ await f.pin('authorization',{kind:'controller-external-budget-v1',profile:c.profile,repo:c.repo,issue:c.issue,pr:c.pr,originalIterations:2,originalLimit:3,externalLimit:2,totalLimit:4,source:'explicit-user-request',userRequest:'Complete this recovery with the necessary additional scoped budget.',operator:'test-operator',originalHashes:Object.fromEntries(['ledger','publishArtifact','launchJournal','manifest'].map(k=>[k,c.evidence[k].hash]))});
+ const recovery=JSON.parse(await readFile(f.paths.recovery));recovery.externalUsed=2;recovery.totalUsed=4;await f.pin('recovery',recovery);return f;
+}
+test('explicit scoped external allocation preserves original2of3 while recording actual total4',async()=>{
+ const f=await extendedControllerSetup();try {
+  const ledger=await readFile(f.paths.ledger);assert.equal((await reconcileExternal(f.c,f.io,{check:true})).status,'eligible');await f.run();
+  assert.deepEqual(await readFile(f.paths.ledger),ledger);const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));
+  assert.equal(r.binding.originalIterations,2);assert.equal(r.binding.originalLimit,3);assert.equal(r.binding.externalIterations,2);assert.equal(r.binding.externalBudget.totalLimit,4);
+  assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);await f.run();
+ }finally{await f.clean();}
+});
+for(const [name,change] of [
+ ['missing config authority',f=>{delete f.c.authority.externalBudget;}],
+ ['allocation exceeded',f=>{f.c.externalIterations=3;}],
+ ['unbounded allocation',f=>{f.c.externalBudget.externalLimit=Infinity;}],
+ ['allocation total mismatch',f=>{f.c.externalBudget.totalLimit=5;}],
+ ['wrong authorization issue',async f=>{const a=JSON.parse(await readFile(f.paths.authorization));a.issue='999';await f.pin('authorization',a);}],
+ ['wrong original bytes',async f=>{const a=JSON.parse(await readFile(f.paths.authorization));a.originalHashes.ledger=hex(9);await f.pin('authorization',a);}],
+ ['missing user authority',async f=>{const a=JSON.parse(await readFile(f.paths.authorization));a.source='label';await f.pin('authorization',a);}],
+ ['wrong authorized allocation',async f=>{const a=JSON.parse(await readFile(f.paths.authorization));a.externalLimit=3;await f.pin('authorization',a);}],
+ ['false external used count',async f=>{const a=JSON.parse(await readFile(f.paths.recovery));a.externalUsed=1;await f.pin('recovery',a);}],
+])test('external budget rejects '+name+' before effects',async()=>{
+ const f=await extendedControllerSetup();try{await change(f);const before=await snapshot(f.root);await assert.rejects(f.run());assert.deepEqual(await snapshot(f.root),before);}finally{await f.clean();}
+});
+
+test('historical helper RO source allowlist derives only from fully verified receipt and archive bytes',async()=>{
+ const f=await setup();try {
+  await f.run();const c={...f.c,issue:'24'};
+  assert.deepEqual(await historicalReceiptEvidence(c),[f.c.evidence.recovery,f.c.evidence.validation].sort((a,b)=>a.path.localeCompare(b.path)));
+  await writeFile(f.paths.recovery,'stale source');await assert.rejects(historicalReceiptEvidence(c));
+ }finally{await f.clean();}
+});
+test('helper historical source mounts retain exact Source, RO and filesystem proof',async()=>{
+ const f=operatorFixture(),path='/historical/recovery.json',m={Type:'bind',Source:path,Destination:path,RW:false};
+ f.historical=[{path,hash:hex(1)}];f.operator.Mounts.push(m);f.context.mounted.set(m,{identity:path});await f.verify();
+ m.RW=true;await assert.rejects(f.verify(),/source\/authority/);m.RW=false;
+ m.Source='/copy';await assert.rejects(f.verify(),/source\/authority/);m.Source=path;
+ f.context.mounted.set(m,{identity:'/copied-object'});await assert.rejects(f.verify(),/correspondence/);
 });

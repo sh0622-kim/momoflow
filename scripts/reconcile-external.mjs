@@ -10,7 +10,13 @@ const need=(v,m)=>{if(!v)throw Error(m);};
 const hex=v=>typeof v==='string' && /^[a-f0-9]{64}$/.test(v);
 const sha=v=>typeof v==='string' && /^[a-f0-9]{40}$/.test(v);
 const controllerV2=c=>c.profile==='controller-only-v2';
-const evidenceNames=c=>['ledger','enrollment','manifest','launchJournal','controllerJournal','gate','recovery','validation',...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest']:[])];
+const extendedBudget=c=>controllerV2(c) && c.originalIterations+c.externalIterations>c.originalLimit;
+function controllerBudget(c) {
+ if(!extendedBudget(c))return c.externalBudget===undefined;
+ const b=c.externalBudget;
+ return b && same(Object.keys(b).sort(),['externalLimit','totalLimit']) && Number.isSafeInteger(b.externalLimit) && b.externalLimit>=c.externalIterations && Number.isSafeInteger(b.totalLimit) && b.totalLimit===c.originalIterations+b.externalLimit;
+}
+const evidenceNames=c=>['ledger','enrollment','manifest','launchJournal','controllerJournal','gate','recovery','validation',...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest',...(extendedBudget(c)?['authorization']:[])]:[])];
 const optional=async p=>{try{return await json(p);}catch(e){if(e.code==='ENOENT')return null;throw e;}};
 async function privatePath(path,directory=false) {
  need(typeof path==='string' && resolve(path)===path && await realpath(path)===path,'Private canonical evidence path required');
@@ -34,23 +40,27 @@ export function reconciliationConfig(c) {
  need(Number.isSafeInteger(c.pr) && c.pr>0 && [c.head,c.tree,c.merge].every(sha),'Exact external PR/head/tree/merge required');
  need(Number.isInteger(c.originalIterations) && c.originalIterations>=1 && c.originalIterations<=3 && Number.isInteger(c.externalIterations) && c.externalIterations>=1,'Separate original/external iteration history required');
  need(hex(c.engineContainer) && /^sha256:[a-f0-9]{64}$/.test(c.engineImage || '') && typeof c.productionProject==='string','Pinned engine worker identity required');
- if(controllerV2(c))need(c.originalIterations===2 && c.originalLimit===3 && c.externalIterations===1 && c.originalIterations+c.externalIterations<=c.originalLimit && c.controllerVersion===c.merge && c.controllerTree===c.tree && typeof c.dataVolume==='string' && c.dataVolume.length>0,'Controller-only installed version/shared budget mismatch');
+ if(controllerV2(c))need(c.originalIterations===2 && c.originalLimit===3 && Number.isSafeInteger(c.externalIterations) && c.externalIterations>=1 && controllerBudget(c) && (!extendedBudget(c) || c.authority.externalBudget===true) && c.controllerVersion===c.merge && c.controllerTree===c.tree && typeof c.dataVolume==='string' && c.dataVolume.length>0,'Controller-only installed version/shared budget mismatch');
  const p=paths(c),names=evidenceNames(c);
  need(c.evidence && same(Object.keys(c.evidence).sort(),names.sort()),'Complete exact reconciliation evidence required');
  for(const name of names) {const ref=c.evidence[name];need(ref && (name==='controllerJournal'?ref.hash===null || hex(ref.hash):hex(ref.hash)),'Evidence hash required');need(typeof ref.path==='string' && resolve(ref.path)===ref.path,'Absolute evidence path required');if(p[name])need(ref.path===p[name],'Evidence path/scope mismatch');}
  return c;
 }
 function binding(c) {
- return {v:controllerV2(c)?2:1,...(controllerV2(c)?{profile:c.profile,originalLimit:c.originalLimit,controllerTree:c.controllerTree,dataVolume:c.dataVolume}:{}),repo:c.repo,issue:c.issue,base:c.base,pr:c.pr,head:c.head,tree:c.tree,merge:c.merge,originalIterations:c.originalIterations,externalIterations:c.externalIterations,engineContainer:c.engineContainer,engineImage:c.engineImage,runnerSource:c.runnerSource,...(c.configurationHash?{configurationHash:c.configurationHash}:{}),evidence:c.evidence};
+ return {v:controllerV2(c)?2:1,...(controllerV2(c)?{profile:c.profile,originalLimit:c.originalLimit,controllerTree:c.controllerTree,dataVolume:c.dataVolume,...(c.externalBudget?{externalBudget:c.externalBudget}:{})}:{}),repo:c.repo,issue:c.issue,base:c.base,pr:c.pr,head:c.head,tree:c.tree,merge:c.merge,originalIterations:c.originalIterations,externalIterations:c.externalIterations,engineContainer:c.engineContainer,engineImage:c.engineImage,runnerSource:c.runnerSource,...(c.configurationHash?{configurationHash:c.configurationHash}:{}),evidence:c.evidence};
 }
 function validateControllerCompletion(b,ledger,data) {
  const artifact=JSON.parse(data.publishArtifact),attempt=JSON.parse(data.recovery),review=JSON.parse(data.review),tests=JSON.parse(data.tests),install=JSON.parse(data.validation),ownership=JSON.parse(data.ownership),request=JSON.parse(data.ownershipRequest);
  const scoped=x=>x.repo===b.repo && x.issue===b.issue && x.pr===b.pr && x.head===b.head && x.tree===b.tree;
- need(b.v===2 && controllerV2(b) && b.originalIterations===2 && b.originalLimit===3 && b.externalIterations===1 && b.originalIterations+b.externalIterations<=b.originalLimit && ledger.launch.limit===b.originalLimit && ledger.iterations===b.originalIterations,'Controller-only shared attempt history mismatch');
+ need(b.v===2 && controllerV2(b) && b.originalIterations===2 && b.originalLimit===3 && Number.isSafeInteger(b.externalIterations) && b.externalIterations>=1 && controllerBudget(b) && ledger.launch.limit===b.originalLimit && ledger.iterations===b.originalIterations,'Controller-only shared attempt history mismatch');
  need(ledger.stage==='blocked' && ledger.in_flight===true && ledger.active_session && ledger.reason==='Missing exact reviewed publication' && ledger.events?.at(-1)?.role==='review' && ledger.events.at(-1).result?.status==='complete','Original blocked publish failure required');
+ if(extendedBudget(b)) {
+  const a=JSON.parse(data.authorization);
+  need(a.kind==='controller-external-budget-v1' && a.profile===b.profile && a.repo===b.repo && a.issue===b.issue && a.pr===b.pr && a.originalIterations===b.originalIterations && a.originalLimit===b.originalLimit && a.externalLimit===b.externalBudget.externalLimit && a.totalLimit===b.externalBudget.totalLimit && a.source==='explicit-user-request' && typeof a.userRequest==='string' && a.userRequest.trim().length>0 && typeof a.operator==='string' && a.operator.trim().length>0 && ['ledger','publishArtifact','launchJournal','manifest'].every(k=>a.originalHashes?.[k]===b.evidence[k].hash),'Explicit scoped external budget authorization required');
+ }
  const p=artifact.publication;
  need(artifact.status==='complete' && p?.repo===b.repo && p.issue===Number(b.issue) && p.pr===b.pr && p.base===b.base && sha(p.head),'Original numeric publication artifact required');
- need(scoped(attempt) && attempt.kind==='controller-external-attempt-v2' && attempt.status==='completed' && attempt.originalUsed===2 && attempt.limit===3 && attempt.externalUsed===1 && attempt.totalUsed===3 && attempt.originalHead===p.head && typeof attempt.buildSession==='string' && attempt.buildSession.length>0 && ['ledger','publishArtifact','launchJournal','manifest'].every(k=>attempt.originalHashes?.[k]===b.evidence[k].hash),'External controller attempt/original hashes mismatch');
+ need(scoped(attempt) && attempt.kind==='controller-external-attempt-v2' && attempt.status==='completed' && attempt.originalUsed===2 && attempt.limit===3 && attempt.externalUsed===b.externalIterations && attempt.totalUsed===b.originalIterations+b.externalIterations && attempt.originalHead===p.head && typeof attempt.buildSession==='string' && attempt.buildSession.length>0 && ['ledger','publishArtifact','launchJournal','manifest'].every(k=>attempt.originalHashes?.[k]===b.evidence[k].hash),'External controller attempt/original hashes mismatch');
  need(scoped(review) && review.kind==='controller-external-review-v2' && review.status==='approved' && review.model==='gpt-6-astra' && review.reasoning==='high' && review.fast===false && typeof review.session==='string' && review.session.length>0 && review.session!==attempt.buildSession,'Separate exact-head external review required');
  need(scoped(tests) && tests.kind==='controller-external-tests-v2' && tests.status==='passed' && Number.isInteger(tests.tests) && tests.tests>=356 && tests.failures===0 && tests.skipped===0 && ['node','syntax','diff'].every(name=>tests.checks?.filter(x=>x.name===name && x.exit===0).length===1 && hex(tests.logHashes?.[name])),'Exact-head external test evidence required');
  need(scoped(install) && install.kind==='controller-install-v2' && install.status==='installed' && install.commit===b.merge && install.controllerVersion===b.merge && install.controllerTree===b.tree && b.controllerTree===b.tree && install.engineUnchanged===true && install.engineContainer===b.engineContainer && install.engineImage===b.engineImage && install.ownershipHash===b.evidence.ownership.hash,'Pinned controller-only installation required');
@@ -255,9 +265,26 @@ export async function observeReconciliationWorkers(c,docker) {
  const idle=observedWorkersIdle(await docker(['top',c.engineContainer,'-eo','pid,comm']));
  engineIdentity(c,JSON.parse(await docker(['inspect',c.engineContainer]))[0]);return idle;
 }
+// Only immutable external source refs of already verified historical receipts
+// can add RO helper mounts. Source files remain live-byte checked, never replaced
+// with archived copies; no caller-provided generic mount allowlist exists.
+export async function historicalReceiptEvidence(c) {
+ const refs=new Map();
+ for(const entry of await readdir(c.stateRoot,{withFileTypes:true})) {
+  need(!entry.isSymbolicLink(),'Unknown historical owner path');
+  if(!entry.isDirectory() || entry.name===keyFor(c))continue;
+  const r=await optional(join(c.stateRoot,entry.name,'external-reconciliation.json'));if(!r)continue;
+  need(hex(entry.name) && await verifiedExternalReceipt(c,entry.name),'Invalid historical external receipt');
+  for(const name of evidenceNames(r.binding).filter(n=>!['ledger','enrollment','manifest','launchJournal','controllerJournal','gate'].includes(n))) {
+   const ref=r.binding.evidence[name],previous=refs.get(ref.path);
+   need(!previous || previous.hash===ref.hash,'Conflicting historical external evidence');refs.set(ref.path,ref);
+  }
+ }
+ return [...refs.values()].sort((a,b)=>a.path.localeCompare(b.path));
+}
 // Adapter for the existing external named-volume operator. The coding engine is
 // never an operator, even if it can read a candidate copy of these scripts.
-export async function verifyReconciliationOperator(c,{docker,containerized,hostname,contextFor=mountContext,canonical=realpath}) {
+export async function verifyReconciliationOperator(c,{docker,containerized,hostname,contextFor=mountContext,canonical=realpath,historicalEvidence=historicalReceiptEvidence}) {
  if(!containerized)return;
  need(hex(c.operatorContainer) && c.operatorContainer!==c.engineContainer && /^sha256:[a-f0-9]{64}$/.test(c.operatorImage || '') && /^[1-9][0-9]*$/.test(c.operatorSocketGroup || ''),'Explicit independent operator helper required');
  const inspect=async id=>JSON.parse(await docker(['inspect',id]))[0];
@@ -268,7 +295,11 @@ export async function verifyReconciliationOperator(c,{docker,containerized,hostn
  const image=await inspect(c.operatorImage);
  need(image?.Id===c.operatorImage && same([...(operator.Config.Env || [])].sort(),[...(image.Config?.Env || [])].sort()),'Operator image environment overridden');
  need(c.ledgerRoot==='/engine-data/log/roles' && c.tokenFile==='/run/momoflow-auth/token.json','Live operator ledger/auth paths required');
- const binds=[[c.trustedRoot,false],[dirname(c.configFile),false],[c.stateRoot,true],[c.inboxRoot,true],[c.launchRoot,true],[c.gateRoot,true],['/tmp',true],['/var/run/docker.sock',true],[c.evidence.recovery.path,false],[c.evidence.validation.path,false],...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest'].map(k=>[c.evidence[k].path,false]):[])];
+ const binds=[[c.trustedRoot,false],[dirname(c.configFile),false],[c.stateRoot,true],[c.inboxRoot,true],[c.launchRoot,true],[c.gateRoot,true],['/tmp',true],['/var/run/docker.sock',true],[c.evidence.recovery.path,false],[c.evidence.validation.path,false],...(controllerV2(c)?['publishArtifact','review','tests','ownership','ownershipRequest',...(extendedBudget(c)?['authorization']:[])].map(k=>[c.evidence[k].path,false]):[])];
+ for(const ref of await historicalEvidence(c)) {
+  const existing=binds.find(([path])=>path===ref.path);
+  need(!existing || existing[1]===false,'Historical evidence must be read-only');if(!existing)binds.push([ref.path,false]);
+ }
  need(new Set(binds.map(([path])=>path)).size===binds.length,'Overlapping operator mount destinations');
  const mounts=operator.Mounts;
  need(Array.isArray(mounts) && mounts.length===binds.length+2 && new Set(mounts.map(m=>m.Destination)).size===mounts.length,'Unexpected operator mounts');

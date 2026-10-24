@@ -372,3 +372,13 @@ test('current-only ownership config cannot authorize deployment or substitute pr
  assert.equal(deploymentConfig(c,{ownership:true}),c);assert.throws(()=>deploymentConfig(c),/authority/);
  for(const change of [x=>x.authority.observe=false,x=>x.target=x.current,x=>x.previous=x.current,x=>x.current.authImage='latest',x=>x.current.files={},x=>x.fixtureMode='credential-free-v1']) {const x=structuredClone(c);change(x);assert.throws(()=>deploymentConfig(x,{ownership:true}));}
 });
+
+test('ordinary image missing Entrypoint matches Docker null without accepting argv drift',async()=>{
+ const x=await composeFixture();try {
+  for(const service of ['symphony','github-auth'])delete x.images[x.b.inspect[service].image].Config.Entrypoint;
+  await x.persist();await bundleFiles(x.c,x.b,x.docker);
+  x.b.inspect.symphony.entrypoint=[];await assert.rejects(bundleFiles(x.c,x.b,x.docker),/runtime contract/);
+  x.doc.services.symphony.entrypoint=[];await x.persist();await bundleFiles(x.c,x.b,x.docker);
+  x.b.inspect.symphony.entrypoint=['unexpected'];await assert.rejects(bundleFiles(x.c,x.b,x.docker),/runtime contract/);
+ } finally {await rm(x.root,{recursive:true,force:true});}
+});

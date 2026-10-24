@@ -307,7 +307,7 @@ export function composeIdentity(c,b,doc,images,profiles={}, {fixture=false}={}) 
     }));
     const expected=b.inspect[service];
     // Docker normalizes no-new-privileges:true to no-new-privileges.
-    const identity={image:image.Id,user:s.user ?? base.User,entrypoint:fixture?(s.entrypoint ?? base.Entrypoint ?? null):(s.entrypoint ?? base.Entrypoint),
+    const identity={image:image.Id,user:s.user ?? base.User,entrypoint:s.entrypoint ?? base.Entrypoint ?? null,
       command:s.command ?? (s.entrypoint?.length?null:base.Cmd),mounts,privileged:s.privileged ?? false,
       capAdd:s.cap_add?.length?s.cap_add:null,capDrop:s.cap_drop?.length?s.cap_drop:null,
       securityOpt,networkMode:network,readonly:s.read_only ?? false,ports,

@@ -405,3 +405,28 @@ filesystem/runtime hash를 다시 읽어 host proof와 비교한다. key 내용�
 계속 차단한다. 기존 archive/fence/manifest 퇴역/idempotent retry 경로를 사용하며 원본 실행의
 성공·예산 초기화·자동 ready/dispatch를 만들지 않는다. 완료 receipt는 보존된 근거를 검사하는
 역사 기록이므로 이후 무관한 정상 engine/controller upgrade나 다른 manifest를 금지하지 않는다.
+
+원본 한도를 초과한 **이 case의 외부 복구**는 원본 ledger 한도를 수정하지 않는다. 명시적
+사용자 요청에 따라 운영자가 private config에 `authority.externalBudget:true`와
+`externalBudget:{externalLimit:2,totalLimit:4}`를 고정하면 `externalIterations:2`를 기록할 수
+있다. originalIterations 2/originalLimit 3은 계속 불변이다. 외부 사용량은 할당 이하이고
+할당된 totalLimit은 originalIterations + externalLimit과 정확히 같아야 한다. 무한/비정수
+한도나 근거 없는 추가 시도는 거부한다. 최초 v2의 2+1≤3 경우는 이 확장 없이 그대로 검증한다.
+
+확장에는 추가 `evidence.authorization` 원본 파일을 같은 absolute 경로로 helper에 RO
+연결해야 한다. 해당 record는 `kind:controller-external-budget-v1`,
+`profile:controller-only-v2`, 정확한 repo/string issue/pr, originalIterations/originalLimit,
+externalLimit/totalLimit, `source:explicit-user-request`, 비어 있지 않은 실제 `userRequest`와
+기록한 `operator`, originalHashes(ledger/publishArtifact/launchJournal/manifest)를 포함한다.
+label/comment나 공유 credential 자체는 사용자 승인 증거가 아니다. 이 record는 운영자가
+확인한 구체적 요청과 할당을 보존하며 새 issue의 예산이나 일반 runner 정책을 바꾸지 않는다.
+recovery record의 externalUsed/totalUsed에는 실제 외부 시도 수와 실제 합계(현재 2/4)를
+기록한다. authorization도 immutable archive/receipt 및 매 transaction 재검사에 포함된다.
+
+과거 receipt가 참조하는 외부 근거도 helper에서 원본 경로로 읽을 수 있어야 한다. 예를 들어
+GH20의 recovery-status와 원본 deployment validation 파일은 각각 exact absolute path의 RO
+bind로 연결한다. 허용 경로는 설정의 임의 추가 mount 목록이 아니라 **검증을 통과한 과거
+receipt/archive/current original bytes**의 외부 evidence ref에서만 도출한다. 해당 파일의
+현재 바이트 hash도 계속 재검사한다. exact Docker Source·RO·filesystem 대응을 모두 확인하며
+광범위한 `.data` mount, 다른 경로에 복사한 파일 또는 archive를 source 대신 쓰는 방식은
+허용하지 않는다. 실제 current ledger/enrollment와 journal 등의 기존 mount 계약은 유지한다.
