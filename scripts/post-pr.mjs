@@ -199,6 +199,10 @@ export async function reconcile(c, io) {
   assert(Array.isArray(engineState.running) && Array.isArray(engineState.retrying), 'Unknown engine state');
   if (engineState.running.length || engineState.retrying.length) return { waiting: 'Symphony worker/claim release' };
   const ledger = await io.ledger();
+  if (ledger.stage === 'await_decision') {
+    const {holdDecision} = await import('./decision.mjs');
+    return holdDecision(c,io,ledger);
+  }
   if (ledger.stage !== 'await_validation' && !['blocked', 'done'].includes(ledger.stage)) return { waiting: 'Role flow progress' };
   const p = receipt(c, ledger);
   let journal = await io.load();

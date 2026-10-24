@@ -550,9 +550,12 @@ for(const [name,change] of [
 // config, original evidence, permissions and source imports are real. No Docker.
 test('real CLI module lifecycle completes ownership dependency and read-only check',async()=>{
  const f=await controllerSetup();try {
-  const {stat}=await import('node:fs/promises'),{fileURLToPath}=await import('node:url');
+  const {stat,cp}=await import('node:fs/promises'),{fileURLToPath}=await import('node:url');
   const {runtimeIdentity}=await import('./deploy.mjs'),{command}=await import('./post-pr-docker.mjs');
-  const c=f.c;c.trustedRoot=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');c.verifyMs=1000;
+  const c=f.c,sourceRoot=fileURLToPath(new URL('..',import.meta.url)).replace(/\/$/,'');
+  c.trustedRoot=join(f.root,'controller');await mkdir(c.trustedRoot);
+  for(const dir of ['scripts','engine'])await cp(join(sourceRoot,dir),join(c.trustedRoot,dir),{recursive:true});
+  c.verifyMs=1000;
   c.runnerSource=digest(await readFile(join(c.trustedRoot,'engine/role_runner.ex')));
   await writeFile(c.tokenFile,JSON.stringify({token:'simulated-test-token',expires_at:new Date(Date.now()+3600000).toISOString()}),{mode:0o600});
   const data=join(f.root,'data'),auth=join(f.root,'auth');await mkdir(data);await mkdir(auth);

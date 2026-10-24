@@ -99,6 +99,11 @@ The default budget is three implementation/validation/review iterations for this
 across all retries and continuations. A smaller issue budget takes precedence. Read the
 workpad before every continuation; do not reset the count. Stop early when the goal is met.
 
+In role mode, return a structured decision result or blocked result and let the runner persist
+it before removing ready; do not mutate execution labels inside a role. The runner owns the
+verified label removal and stop reporting. The following removal instruction applies to the
+legacy single-session path.
+
 On exhausted budget, repeated failure with no new evidence, missing authority, or an ambiguous
 product decision, preserve the work, record a specific blocker, and remove momoflow:ready
 using github_api. Leave the issue open. Do not loop on an unresolved blocker or simply return

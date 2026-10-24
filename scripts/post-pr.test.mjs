@@ -345,3 +345,5 @@ await import('./reconcile-external.test.mjs');
 // Deployment regressions are part of the same pinned exact-head host suite.
 await import('./deploy.test.mjs');
 await import('./finish.test.mjs');
+
+import "./decision.test.mjs";

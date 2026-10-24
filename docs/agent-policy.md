@@ -79,7 +79,8 @@ HEAD/diff를 기록한다. 실패·중단·예산 소진·완료 ledger는 자�
 
 기획·검토·게시는 HEAD/diff 변경을 발견하면 차단한다. 이는 사후 변경 감지이며 읽기 전용
 샌드박스나 GitHub 권한 분리가 아니다. 승인·네트워크 경계는 기존 설정 그대로다.
-실행 중단 시 active session과 in-flight 표시를 보존한다. 자동 checkpoint 복구나 범용 PR 리뷰
+실제 실행 중단 시 active session과 in-flight 표시를 보존한다. GH-34 후보의 정상 판단 대기는
+[별도 checkpoint 계약](post-pr.md#gh-34-후보-정상-판단-대기와-같은-작업-재개)을 따르며 설치 전 운영 보장이 아니다. 자동 checkpoint 복구나 범용 PR 리뷰
 이벤트 재개는 구현하지 않았다. 선택적 host inbox 수정 재개는 아래 운영 계약에 한정된다.
 운영자는 ledger·workpad·PR head와 남은 예산을 확인한 후
 명시적인 수동 복구를 결정하며 ledger 삭제로 예산을 초기화하지 않는다.
