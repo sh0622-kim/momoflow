@@ -356,3 +356,61 @@ test('helper historical source mounts retain exact Source, RO and filesystem pro
  m.Source='/copy';await assert.rejects(f.verify(),/source\/authority/);m.Source=path;
  f.context.mounted.set(m,{identity:'/copied-object'});await assert.rejects(f.verify(),/correspondence/);
 });
+
+// Observed original GH24 orders: active.json v/id/repo/issue/base/limit;
+// ledger.launch base/id/issue/limit/repo/v. They are equal objects, different JSON.
+test('original manifest proof survives the exact real ledger key-order difference',async()=>{
+ const f=await controllerSetup();try {
+  assert.deepEqual(Object.keys(f.manifest),['v','id','repo','issue','base','limit']);
+  f.ledger.launch=Object.fromEntries(Object.entries(f.manifest).sort(([a],[b])=>a.localeCompare(b)));
+  assert.deepEqual(Object.keys(f.ledger.launch),['base','id','issue','limit','repo','v']);
+  assert.notEqual(digest(f.manifest),digest(f.ledger.launch));assert.deepEqual(f.manifest,f.ledger.launch);
+  await f.pin('ledger',f.ledger);
+  const r=JSON.parse(await readFile(f.paths.recovery));r.originalHashes.ledger=f.c.evidence.ledger.hash;await f.pin('recovery',r);
+  const o=JSON.parse(await readFile(f.paths.ownership));o.ledgerHashes[0].ledgerHash=f.c.evidence.ledger.hash;await f.pin('ownership',o);
+  const v=JSON.parse(await readFile(f.paths.validation));v.ownershipHash=f.c.evidence.ownership.hash;await f.pin('validation',v);
+  const originals=await Promise.all(['ledger','manifest'].map(k=>readFile(f.paths[k])));
+  assert.equal((await reconcileExternal(f.c,f.io,{check:true})).status,'eligible');await f.run();
+  assert.deepEqual(await readFile(f.paths.ledger),originals[0]);assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
+  const receipt=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));assert.deepEqual(await readFile(join(receipt.archive,'manifest')),originals[1]);
+ }finally{await f.clean();}
+});
+test('original manifest content differences remain rejected before effects',async()=>{
+ const f=await controllerSetup();try {
+  f.ledger.launch={...f.manifest,id:hex(9)};await f.pin('ledger',f.ledger);const before=await snapshot(f.root);
+  await assert.rejects(f.run(),/Exact interrupted runner history/);assert.deepEqual(await snapshot(f.root),before);
+ }finally{await f.clean();}
+});
+async function correctiveControllerSetup() {
+ const f=await extendedControllerSetup(),c=f.c,originalPr=c.pr,api=f.io.api;
+ Object.assign(c,{originalPr,pr:27,head:sha(6),tree:sha(7),merge:sha(8),controllerVersion:sha(8),controllerTree:sha(7),externalIterations:3,externalBudget:{externalLimit:3,totalLimit:5}});
+ f.io.api=(method,path)=>api(method,path.replace('/pulls/27','/pulls/21'));
+ for(const name of ['recovery','review','tests','validation']) {
+  const record=JSON.parse(await readFile(f.paths[name]));Object.assign(record,{pr:c.pr,head:c.head,tree:c.tree});
+  if(name==='recovery')Object.assign(record,{originalPr,externalUsed:3,totalUsed:5});
+  if(name==='validation')Object.assign(record,{commit:c.merge,controllerVersion:c.merge,controllerTree:c.tree});
+  await f.pin(name,record);
+ }
+ const request=JSON.parse(await readFile(f.paths.ownershipRequest));request.controllerVersion=c.merge;await f.pin('ownershipRequest',request);
+ const proof=JSON.parse(await readFile(f.paths.ownership));Object.assign(proof,{pr:c.pr,head:c.head,tree:c.tree,controllerVersion:c.merge,sourceRequest:c.evidence.ownershipRequest});await f.pin('ownership',proof);
+ const install=JSON.parse(await readFile(f.paths.validation));install.ownershipHash=c.evidence.ownership.hash;await f.pin('validation',install);
+ const auth=JSON.parse(await readFile(f.paths.authorization));Object.assign(auth,{pr:c.pr,originalPr,externalLimit:3,totalLimit:5});await f.pin('authorization',auth);
+ return f;
+}
+test('corrective PR completion binds final reviewed and installed scope separately from original publication',async()=>{
+ const f=await correctiveControllerSetup();try {
+  const artifact=await readFile(f.paths.publishArtifact);await f.run();const r=JSON.parse(await readFile(join(f.dir,'external-reconciliation.json')));
+  assert.equal(r.binding.originalPr,21);assert.equal(r.binding.pr,27);assert.equal(r.binding.externalIterations,3);assert.equal(r.binding.externalBudget.totalLimit,5);
+  assert.deepEqual(await readFile(f.paths.publishArtifact),artifact);assert.equal(JSON.parse(artifact).publication.pr,21);
+  assert.equal(await verifiedExternalReceipt(f.c,keyFor(f.c)),true);
+ }finally{await f.clean();}
+});
+for(const [name,change] of [
+ ['wrong original PR',f=>{f.c.originalPr=22;}],['missing original PR',f=>{delete f.c.originalPr;}],
+ ['wrong attempt original PR',async f=>{const r=JSON.parse(await readFile(f.paths.recovery));r.originalPr=22;await f.pin('recovery',r);}],
+ ['wrong authorization original PR',async f=>{const r=JSON.parse(await readFile(f.paths.authorization));r.originalPr=22;await f.pin('authorization',r);}],
+ ['review of original instead of final PR',async f=>{const r=JSON.parse(await readFile(f.paths.review));r.pr=f.c.originalPr;await f.pin('review',r);}],
+ ['installation of original instead of corrective merge',async f=>{const r=JSON.parse(await readFile(f.paths.validation));r.commit=sha(3);await f.pin('validation',r);}],
+])test('corrective completion rejects '+name+' before effects',async()=>{
+ const f=await correctiveControllerSetup();try{await change(f);const before=await snapshot(f.root);await assert.rejects(f.run());assert.deepEqual(await snapshot(f.root),before);}finally{await f.clean();}
+});
