@@ -430,3 +430,18 @@ receipt/archive/current original bytes**의 외부 evidence ref에서만 도출�
 현재 바이트 hash도 계속 재검사한다. exact Docker Source·RO·filesystem 대응을 모두 확인하며
 광범위한 `.data` mount, 다른 경로에 복사한 파일 또는 archive를 source 대신 쓰는 방식은
 허용하지 않는다. 실제 current ledger/enrollment와 journal 등의 기존 mount 계약은 유지한다.
+
+원래 publication PR이 이미 병합된 뒤 같은 recovery의 별도 corrective PR이 필요하면 v2에
+`originalPr`을 명시한다. 예: originalPr 25, `pr`은 새 corrective PR 번호다. 원본 numeric
+publication artifact는 originalPr와 기존 originalHead 그대로 보존한다. recovery와 budget
+authorization에도 originalPr을 기록하되, 두 record의 `pr` 및 review/tests/install의
+pr/head/tree/merge는 **최종 corrective PR**과 정확히 일치해야 한다. 최종 controller 설치도
+해당 corrective merge/tree여야 한다. originalPr을 생략한 기존 동일-PR v2는 pr을 원본 번호로
+사용한다. 이 구분은 원본 PR을 재발행하거나 기존 artifact를 바꾸지 않는다. 현재 할당은
+original 2/3 + external 3, 실제 합계 5이며 externalLimit 3/totalLimit 5를 별도 승인 근거에
+고정한다.
+
+live ownership의 manifestContract는 보존한 원본 manifest를 parse한 object의 digest와
+대조한다. ledger.launch와 원본 manifest의 내용은 구조적으로 같아야 하지만 JSON key
+삽입 순서는 달라도 된다. 원본 파일 바이트 hash와 archive는 계속 각각 검증하며, global
+digest 규칙을 바꾸거나 ledger/manifest를 재직렬화해서 원본을 대체하지 않는다.
