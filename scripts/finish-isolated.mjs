@@ -8,7 +8,7 @@ import { json, atomic, digest, keyFor } from './post-pr.mjs';
 import { connectedFixtureCompletion, runtimeOwnersIdle } from './deploy.mjs';
 import { finish, completionPorts } from './finish.mjs';
 const need=(v,m)=>{if(!v)throw Error(m);};
-export async function isolatedCompletion(planFile) {
+export async function isolatedCompletion(planFile,{fixtureAuthorization=async()=>{},isolatedStop=false}={}) {
  const bytes=await readFile(planFile),plan=JSON.parse(bytes);
  const st=await lstat(planFile);need(st.isFile() && !st.isSymbolicLink() && !(st.mode&0o022) && await realpath(planFile)===planFile && !planFile.startsWith('/data/workspaces/'),'Private canonical host plan required');
  need(same(Object.keys(plan).sort(),['authority','kind','launch','request']) && plan.kind==='isolated-completion-v1' && same(plan.authority,{finish:true,retire:true}),'Explicit isolated-only finish/retire authority required');
@@ -18,7 +18,7 @@ export async function isolatedCompletion(planFile) {
  const c={...request,launch:plan.launch,configContents:plan};
  const dir=join(c.stateRoot,keyFor(c)),journalFile=join(dir,'isolated-completion.json');
  return connectedFixtureCompletion(request,requestFile,{status:'present',value:plan.launch},async ports=>{
-  const authorize=async()=>{need(same(await readFile(planFile),bytes),'Isolated completion plan changed');await ports.authorize();await ports.isolation();};
+  const authorize=async()=>{await fixtureAuthorization();need(same(await readFile(planFile),bytes),'Isolated completion plan changed');await ports.authorize();await ports.isolation();};
   await authorize();
   const saved=await (async()=>{try{return await json(journalFile);}catch(e){if(e.code==='ENOENT')return null;throw e;}})();
   if(!saved) {
@@ -44,7 +44,7 @@ export async function isolatedCompletion(planFile) {
   need(result.phase==='complete','Isolated completion did not finish');
   const report={kind:plan.kind,phase:result.phase,source:request.fixtureSource,deploymentId:request.deploymentId,previous:request.previous.commit,target:request.target.commit,image:request.target.image,journal:journalFile,archive:result.archive,auth:'not-exercised',model:'not-exercised',githubGate:'not-exercised',effects:'isolated Docker deployment and exact synthetic manifest retirement'};
   await atomic(join(dir,'isolated-completion-result.json'),report);return report;
- });
+ },{fixtureAuthorization,isolatedStop});
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
  try {need(process.argv.length===3,'Usage: node scripts/finish-isolated.mjs /operator/isolated-plan.json');writeSync(1,JSON.stringify(await isolatedCompletion(resolve(process.argv[2])))+'\n');}

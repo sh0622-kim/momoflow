@@ -334,3 +334,52 @@ helper의 secret parent 노출 거부를 확인한다. 로컬 회귀의 Docker/H
 외부 운영자는 새 exact PR head의 독립 bridge helper에서 키/secret parent mount 없이
 full `--ownership-check`를 실행하고, 이 문서의 격리 finish lifecycle과 함께 PR에 기록한다.
 고정 host proof 생성/설정 계약은 [배포 문서](deployment.md#gh-30-후보-최초-launch에-묶는-정상-마무리)를 따른다.
+
+## GH-40 후보: 예외 준비·승인 계약의 격리 검증
+
+이 항목은 외부 고정 host의 **새 격리 설치**에서 실행한다. 운영 요청/승인을 재사용하지
+않는다. 위 GH-30 completion plan과 installer의 첫 A→B request를 준비한 뒤 아래 plan을
+operator private 파일로 둔다. 성공과 실패 실험은 각각 새 project/volume/port/ID를 사용한다.
+
+```json
+{
+  "kind": "isolated-exceptional-v1",
+  "completionPlan": "/operator/fresh-test/finish-plan.json",
+  "fault": "none"
+}
+```
+
+```sh
+node /operator/momoflow/scripts/exceptional-isolated.mjs prepare /operator/fresh-test/exception-plan.json
+node /operator/momoflow/scripts/exceptional-isolated.mjs respond /operator/fresh-test/exceptional-fixture-ID/prepared.json /operator/fresh-test/synthetic-response.json
+node /operator/momoflow/scripts/exceptional-isolated.mjs execute /operator/fresh-test/exceptional-fixture-ID/prepared.json
+node /operator/momoflow/scripts/exceptional-isolated.mjs execute /operator/fresh-test/exceptional-fixture-ID/prepared.json
+```
+
+응답은 [운영 응답 형식](deployment.md#선언형-준비와-정확한-응답)과 같은 고정 필드를 사용하되
+이 fixture가 반환한 digest/scope 및 `https://github.com/smoke/fixture/issues/ISSUE`를 사용한다.
+이는 합성 external-operator 응답이며 사용자 판단·사람 인증·GitHub 권한을 검증하지 않는다.
+실험 결과는 `humanApproval/auth/githubGate/model=not-exercised`로 구분한다. production
+exceptional CLI는 fixture request를 거부하며 이 fixture는 운영 receipt를 만들지 않는다.
+
+준비는 기존 plan/request 및 별도 synthetic-excluded 파일만 pin하고 gate/배포/manifest를
+건드리지 않는다. 실행은 기존 isolatedCompletion의 실제 Docker A→B, backup·pause/drain,
+빈 live owner/credential-free/internal network·원본 manifest 보존·퇴역·absent/재개 검증을
+사용하며 같은 승인 재검사를 forward 경계에 연결한다. 임의 셸 hook은 없다. 반복 호출 전후
+container ID·gate hash·archive 바이트가 같고 original plan/request/synthetic-excluded가 그대로인지
+확인한다. prepare만 호출한 시점의 gate/container/manifest 불변도 별도 기록한다.
+
+실패 실험은 다른 fresh 설치에서 `fault="stop-isolated-candidate"`로 준비한다. 이 고정 값만
+기존 격리 integration fault를 선택해 후보 컨테이너를 stop한다. verify 실패 → 이전 image/config
+rollback·검증을 통과해야 하며, CLI 종료값은 실패이고 completion은 blocked/manifest present,
+배포 journal은 rolled_back이어야 한다. 같은 요청 재호출은 배포/퇴역을 반복하지 않아야 한다.
+rollback 자체 실패는 paused·journal 보존을 확인하며 운영 환경에는 장애를 주입하지 않는다.
+
+증거는 exact 설치 HEAD, prepare digest·승인 receipt hash, 원본 바이트 hash 비교, 배포/마무리
+journal·archive, 실제 이미지/config/admission/manifest 상태, 성공 중복 호출 전후 관찰, 실패→rollback
+결과를 PR에 남긴다. 별도 승인 거부/철회/기한 초과와 concurrent response/controller lock 회귀는
+고정 Node 검사에 포함한다. 실제 Docker 검증이 없으면 이 절의 성공/복구는 미실행이다.
+
+GH-40 build 환경에는 Docker CLI가 없으므로 이 실험과 exact-head host config/build/sandbox/
+readiness 검사는 미실행이다. 로컬 실제 subprocess/files/locks + 모의 GitHub/배포 검사를
+이 항목의 실 Docker 또는 실제 운영 승인·배포 관측으로 표시하지 않는다.

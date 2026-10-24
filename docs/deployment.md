@@ -441,3 +441,155 @@ GH36의 정상 예산 소진 원본은 [외부 완료 v4](post-pr.md#gh-36-후�
 prepare/check/apply/duplicate로 별도 처리한다. 새 controller를 먼저 설치하되 reconciliation
 동안 old engine/auth는 유지한다. receipt와 공통 ownership preflight를 확인한 뒤에만 승인된
 새 이미지 배포로 진행한다. 코드 완료·owner 퇴역은 이슈의 자연 발생 운영 관찰 완료와 구분한다.
+
+## GH-40 후보: 준비된 예외 배포와 마무리
+
+`scripts/exceptional.mjs`는 별도 설치한 외부 호스트 명령이다. 일반 `deploy/finish`의
+제외 조건·검사 하한을 유지한다. `exceptional=true` 우회 입력은 계속 거부한다.
+현재 후보의 로컬 검사는 GitHub/Docker 효과를 모의했다. 실 Docker, exact PR head의
+고정 호스트 검증, 최초 설치, 실제 사용자 승인 연결·운영 적용은 각각 별도 증거가 필요하다.
+
+지원 경로는 코드의 `classifyChanges()`에 고정한다. admission/work-status 엔진·패치,
+명시한 deploy/finish/launch/decision/exceptional/work-status/reconcile 호스트 파일과 해당
+회귀 검사, 정책 문서 이외의 일반 문서만 지원한다. rename, 알 수 없는 파일/상태,
+`engine/role_runner.ex`, `role-flow.patch`, WORKFLOW, 인증·Compose·Dockerfile·security,
+검사 실행기/스모크, 권한·예산·모델·정책 문서는 경로와 이유를 출력하고 차단한다.
+따라서 모든 엔진/호스트 변경을 지원하는 것이 아니다. 지원 파일에서도 인증·권한·역할
+정책·데이터·기존 검사 기준 유지의 독립 리뷰와 운영자 확인이 필요하며, 경로 분류만으로
+의미적 안전성을 증명했다고 하지 않는다. 이 조건을 만족하지 않으면 별도 정책 작업이다.
+
+### 고정 호스트 최초 설치
+
+기존 launch 설정의 `trustedRoot`는 engine의 쓰기 가능한 mount 밖에 있는 operator 전용
+canonical checkout이어야 한다. 새 controller 코드는 그 고정 위치에 **외부 운영자가**
+설치한다. 실행 중 controller/watch를 종료하고 controller/deployment/launch lock 및 소유권을
+확인한 뒤, 별도 리뷰와 고정 host 검증을 마친 exact commit을 설치한다. 남은 lock을 삭제해
+소유권을 추정하지 않는다. 기존 engine/auth는 계속 유지한다. 이전 controller commit도
+기록하며 engine rollback bundle과 controller 설치 rollback을 혼동하지 않는다.
+
+```sh
+# 외부 운영자; EXACT_REVIEWED_HOST_VALIDATED_COMMIT은 실제 40자리 SHA로 고정
+# 기존 controller 소유권이 해제된 뒤 기존 trustedRoot에서 실행
+git -C /operator/momoflow checkout --detach EXACT_REVIEWED_HOST_VALIDATED_COMMIT
+git -C /operator/momoflow rev-parse HEAD
+git --no-optional-locks -C /operator/momoflow status --porcelain --untracked-files=all
+```
+
+출력 HEAD가 설치 대상과 같고 status가 비어야 한다. 코딩 세션에는 Docker 권한을 주거나
+현재 엔진을 교체하지 않는다. 준비/실행 때도 `verifyInstall`이 모듈의 실제 경로와 clean
+HEAD를 재검사한다. 기존 launch config의 controllerVersion, host journal/검증 producer는
+고쳐 쓰지 않는다. 아래 별도 plan의 설치 버전과 원래 validationOrigin을 각각 보존한다.
+이 bootstrap 설치는 외부 초기설정 1작업으로 기록하며 무개입이라고 표현하지 않는다.
+
+### 선언형 준비와 정확한 응답
+
+기존 `finish`가 남긴 `completion.json.phase=excluded` 및 원본 launch/ledger/enrollment/
+confirmed host merge/evidence가 있어야 한다. config는 그 launch를 위임한 **기존 파일**이다.
+plan/response/prepared는 checkout과 candidate 밖의 operator 전용 파일이다. JSON의 필드
+이름은 고정이며 임의 hook/명령을 받지 않는다.
+
+```json
+{
+  "v": 1,
+  "kind": "exceptional-completion-v1",
+  "config": "/operator/requests/original-launch.json",
+  "controllerVersion": "<설치한 exact commit>",
+  "validationOrigin": "<원래 host 검증 producer commit>",
+  "unchanged": {"auth": true, "permissions": true, "rolePolicy": true, "data": true, "checks": true}
+}
+```
+
+```sh
+node /operator/momoflow/scripts/exceptional.mjs prepare /operator/requests/exception-plan.json
+node /operator/momoflow/scripts/exceptional.mjs show /operator/state/ISSUE_KEY/exceptional-ID/prepared.json
+```
+
+준비는 GitHub fresh gate, 테스트 로그 hash/producer·독립 role review와 exact
+repo/issue/PR/head/tree/merge/tested image·이전/대상 bundle·원본 파일의 바이트 해시·설치 버전·
+검증 producer·제외 경로/이유·복구 계획을 보존하고 같은 workpad/PR에 검토 대기를 표시한다.
+대상 runnerSource는 merge의 실제 바이트에서 구한다. 준비는 gate pause, backup, 배포,
+manifest 변경을 하지 않는다. controller lock과 operator 준비 파일·GitHub 표시만 쓴다.
+원본 excluded completion 및 launch/ledger/enrollment/host 기록은 수정하지 않는다.
+
+trusted operator는 자료를 확인한 사용자의 **이 특정 대상·범위** 판단을 확인하고 아래 응답을
+입력한다. GH-40 실행 위임은 미래 배포 승인이 아니다. 기존 decision CLI처럼 이 경계는
+운영자 확인이며 URL/라벨/공유 계정 댓글/App 자체 응답으로 사람을 인증하지 않는다.
+`prepared`는 prepare 출력의 전체 digest, `scope`는 show의 배열과 정확히 같아야 한다.
+시각은 ISO UTC, 기한은 응답 시각 뒤 최대 24시간이다.
+
+```json
+{
+  "prepared": "<prepare가 반환한 digest>",
+  "scope": ["deploy-tested-image", "verify-or-rollback", "archive-retire-exact-manifest", "resume-admission", "report-and-close"],
+  "actor": "external-operator",
+  "authority": "existing-scope",
+  "source": "https://github.com/OWNER/REPO/issues/ISSUE#issuecomment-COMMENT",
+  "action": "approve",
+  "at": "<응답 시각>",
+  "expiresAt": "<만료 시각>"
+}
+```
+
+```sh
+node /operator/momoflow/scripts/exceptional.mjs respond /operator/state/ISSUE_KEY/exceptional-ID/prepared.json /operator/requests/response.json
+node /operator/momoflow/scripts/exceptional.mjs execute /operator/state/ISSUE_KEY/exceptional-ID/prepared.json
+```
+
+반려는 `action=reject`, 철회는 같은 digest/scope에 `action=revoke`다. 같은 응답은 기록을
+재조회하며, 승인 교체·반려 뒤 재승인·철회 뒤 재승인을 허용하지 않는다. 철회는 별도
+response lock을 사용하므로 실행 중 deployment/controller lock 때문에 차단되지 않는다.
+이미 시작된 외부 효과를 취소했다고 주장하지 않으며 다음 forward 경계에서 멈춘다.
+배포 후 철회/만료는 복원·검증을 막지 않지만 접수 재개 권한이 없으면 paused로 남긴다.
+
+느린 fresh GitHub 검증이 끝난 뒤와 durable forward intent 저장 뒤에도 현재 승인을
+다시 확인한다. 대상/롤백/퇴역 후 접수 재개 직전 철회·만료는 재개를 막으며,
+이미 필요한 fence·이전 이미지 복원·검증은 승인 철회와 분리해 수행한다.
+
+### 실행, 실패와 보고 재시도
+
+기존 deployment.lock → controller.lock 아래에서 원본/설치/승인 및 fresh GitHub gate를
+재검사한다. 기존 deploy의 설정·이미지 대조, pause ack·bounded drain·전체 live owner 검사,
+백업, tested image 교체, Codex login/GitHub token-file 읽기·대시보드·상태 검증·롤백을 재사용한다.
+성공 뒤 같은 잠금에서 finish의 재접수 중지·drain·owner 검사·exact manifest 바이트 archive와
+fsync·정확한 active.json 퇴역·live absent·재개 검증을 수행한다. 철회돼도 필요한 안전 fence는
+수행한다. rollback 성공은 대상 성공이 아니며 manifest와 실패 기록을 남긴다.
+
+`stateRoot/ISSUE_KEY/exceptional-ID/` 아래 prepared/request, immutable response 이력과 현재
+approval, 별도 completion, exact manifest archive, report가 남고 deploymentRoot/ID에는
+기존 배포 journal/event/backup이 남는다. completion은 승인 receipt hash에 연결한다.
+중간/불확실한 효과와 rollback 실패는 자동 재실행하지 않으며 lock을 훔치지 않는다.
+성공한 같은 execute 재호출은 fresh 근거와 현재 runtime/owners를 검증하고 보고만 재시도한다.
+기존 성공을 근거 없이 현재 성공으로 표시하지 않고 recheck 차단을 남긴다. 이미 완료한 효과의
+보고에는 원래 승인 receipt를 검증한다. 이미 수행한 효과의 보고는 만료 후에도 가능하지만,
+아직 남은 issue close에는 유효한 현재 승인이 필요하다. 만료/철회됐다면 보고를 보존하고
+운영자 복구 판단으로 남기며 자동 재승인하지 않는다.
+
+prepare/respond 재호출의 표시는 별도 report lock 안에서 현재 decision과 completion
+journal로 결정한다. 승인·반려·철회 및 완료 결과를 대기 상태로 되돌리지 않는다.
+종료 관측 receipt와 실행 결과는 decision receipt와 분리해 보존한다. report lock 충돌은
+다른 보고를 덮어쓰지 않고 실패하며 같은 명령으로 보고만 재시도한다. response lock은
+독립이므로 느린 보고 중에도 철회 접수는 가능하다. 중단된 report lock은 소유자와 기록을
+외부 운영자가 확인하기 전 자동으로 훔치거나 지우지 않는다.
+
+같은 workpad의 이 ID section과 PR comment를 보존한 뒤에만 이슈를 닫는다. 보고 실패는
+완료 journal을 지우지 않으며 같은 execute로 재검증/보고한다. 표시용 기존 status를 갱신하되
+원본 completion/launch/ledger/enrollment/host 기록은 유지한다. 이 ID의 판단 section을 해결로
+표시하고 공유 `needs-decision` 라벨은 보수적으로 남긴다. 다른 요청의 라벨을 삭제하지 않으며
+범용 라벨 정리를 구현했다고 하지 않는다. 후속 자동 실행은 없다.
+
+### 개입 계수와 미관찰 경계
+
+각 실제 적용 기록은 #38과 같은 범위에서 다음 항목을 구분한다. 내부 역할 세션/누적 build는
+runner 기록을 사용하며 종료 결과만으로 검사 성공을 세지 않는다.
+
+| 주체 | 분리해 기록할 수치 |
+| --- | --- |
+| 사용자 | 최초 지시, 추가 배포 지시/판단/승인, 재촉 |
+| 대화 보조자 | 초기설정, 수동 운영/복구/마무리, 신규 운영 절차 코드 작업 수·파일 수 |
+| 외부 구현 | 기능 구현/에이전트 수; 외부 helper 작성도 여기에 숨기지 않음 |
+| 내부 자동 | 역할 세션·누적 반복, 준비/승인 처리/배포/검증/롤백/퇴역/보고 결과 |
+
+재사용 CLI 호출·선언형 plan/response 입력은 운영 행동이며 신규 절차 코드 작성과 별개다.
+읽기 모니터링/진행 알림은 운영 개입·사용자 지시로 세지 않는다. 실제 설치/승인·배포·복구·
+마무리 관측 전에는 운영코드0/수동복구0 달성이나 감소율을 주장하지 않는다. 실험의 합성 승인을
+사용자 승인 연결로 세지 않는다. 격리 검증 명령과 증거 요구는 [fixture 문서](deployment-fixture.md#gh-40-후보-예외-준비승인-계약의-격리-검증)에 둔다.

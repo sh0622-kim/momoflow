@@ -6,7 +6,7 @@ import { finishConfig, prepareCompletion } from './finish.mjs';
 import { fixture } from './post-pr-fixture.mjs';
 import { digest } from './post-pr.mjs';
 import { fileURLToPath } from 'node:url';
-for(const scenario of ['normal','duplicate','drift','authority','foreign','owner','unknown','failed','rollback','drain','lock','race','ledger-changed']) test(`finish separate module process: ${scenario} (mock external effects)`,async()=>{
+for(const scenario of ['normal','duplicate','drift','authority','foreign','owner','unknown','failed','rollback','drain','lock','race','ledger-changed','revoke-retirement','revoke-resume','expire-resume','report-retry','after-retire']) test(`finish separate module process: ${scenario} (mock external effects)`,async()=>{
  const r=await command(process.execPath,[fileURLToPath(new URL('./finish-process-fixture.mjs',import.meta.url)),scenario],{timeout:15000});
  assert.equal(r.exit,0,r.output.toString());const row=JSON.parse(r.output);assert.equal(row.scenario,scenario);assert.equal(row.evidenceKind,'mock-external-real-subprocess-files-locks');
 });
